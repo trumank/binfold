@@ -1,6 +1,6 @@
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use sha1::{Digest, Sha1};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 const FUNCTION_NAMESPACE: &str = "0192a179-61ac-7cef-88ed-012296e9492f";
 const BASIC_BLOCK_NAMESPACE: &str = "0192a178-7a5f-7936-8653-3cbaa7d6afe7";
@@ -55,23 +55,137 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> String {
 }
 
 fn identify_basic_blocks(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, u64> {
+    // First pass: decode all instructions and build instruction map
     let mut decoder = Decoder::with_ip(64, raw_bytes, base, DecoderOptions::NONE);
-
-    let mut basic_blocks = BTreeMap::new();
-    let mut current_block_start = base;
+    let mut instructions = BTreeMap::new();
 
     while decoder.can_decode() {
+        let start = decoder.ip();
         let instruction = decoder.decode();
-        let is_block_end = instruction.flow_control() == FlowControl::ConditionalBranch;
+        let end = decoder.ip();
+        instructions.insert(start, (instruction, end));
+    }
 
-        if is_block_end || !decoder.can_decode() {
-            let ip = decoder.ip();
-            basic_blocks.insert(current_block_start, ip);
-            current_block_start = ip;
+    // Build control flow graph edges
+    let mut incoming_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
+    let mut outgoing_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
+
+    // Walk instructions starting from entry point
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(base);
+
+    while let Some(addr) = queue.pop_front() {
+        if visited.contains(&addr) {
+            continue;
+        }
+        visited.insert(addr);
+
+        if let Some((instruction, next_addr)) = instructions.get(&addr).cloned() {
+            match instruction.flow_control() {
+                FlowControl::Next => {
+                    // Regular instruction - edge to next
+                    outgoing_edges.entry(addr).or_default().insert(next_addr);
+                    incoming_edges.entry(next_addr).or_default().insert(addr);
+                    queue.push_back(next_addr);
+                }
+                FlowControl::UnconditionalBranch => {
+                    // Unconditional jump - edge to target only
+                    if let Some(target) = get_branch_target(&instruction) {
+                        outgoing_edges.entry(addr).or_default().insert(target);
+                        incoming_edges.entry(target).or_default().insert(addr);
+                        queue.push_back(target);
+                    }
+                }
+                FlowControl::ConditionalBranch => {
+                    // Conditional jump - edges to both next and target
+                    outgoing_edges.entry(addr).or_default().insert(next_addr);
+                    incoming_edges.entry(next_addr).or_default().insert(addr);
+                    queue.push_back(next_addr);
+
+                    if let Some(target) = get_branch_target(&instruction) {
+                        outgoing_edges.entry(addr).or_default().insert(target);
+                        incoming_edges.entry(target).or_default().insert(addr);
+                        queue.push_back(target);
+                    }
+                }
+                FlowControl::Call => {
+                    // Call - edge to next (not a branch for basic block purposes)
+                    outgoing_edges.entry(addr).or_default().insert(next_addr);
+                    incoming_edges.entry(next_addr).or_default().insert(addr);
+                    queue.push_back(next_addr);
+                }
+                FlowControl::Return => {
+                    // Return - no outgoing edges
+                }
+                _ => {}
+            }
         }
     }
 
+    // Identify basic block boundaries
+    let mut block_starts = BTreeSet::new();
+    block_starts.insert(base); // Entry point is always a block start
+
+    for (&addr, _) in &instructions {
+        // An instruction is a block start if:
+        // 1. It has multiple incoming edges, or
+        // 2. Its predecessor has multiple outgoing edges
+        let incoming_count = incoming_edges.get(&addr).map(|s| s.len()).unwrap_or(0);
+
+        if incoming_count > 1 {
+            block_starts.insert(addr);
+        }
+
+        // Check if any predecessor has multiple outgoing edges
+        if let Some(predecessors) = incoming_edges.get(&addr) {
+            for &pred in predecessors {
+                let outgoing_count = outgoing_edges.get(&pred).map(|s| s.len()).unwrap_or(0);
+                if outgoing_count > 1 {
+                    block_starts.insert(addr);
+                }
+            }
+        }
+    }
+
+    // Build basic blocks
+    let mut basic_blocks = BTreeMap::new();
+    let starts: Vec<u64> = block_starts.iter().cloned().collect();
+
+    for i in 0..starts.len() {
+        let start = starts[i];
+        let mut end = start;
+
+        // Find the end of this basic block
+        let mut current = start;
+        while let Some((_, next)) = instructions.get(&current) {
+            end = *next;
+            current = *next;
+
+            // Stop if we hit the next block start
+            if block_starts.contains(&current) && current != start {
+                break;
+            }
+
+            // Stop if we hit the end of instructions
+            if !instructions.contains_key(&current) {
+                break;
+            }
+        }
+
+        basic_blocks.insert(start, end);
+    }
+
     basic_blocks
+}
+
+fn get_branch_target(instruction: &Instruction) -> Option<u64> {
+    match instruction.op_kind(0) {
+        OpKind::NearBranch16 => Some(instruction.near_branch16() as u64),
+        OpKind::NearBranch32 => Some(instruction.near_branch32() as u64),
+        OpKind::NearBranch64 => Some(instruction.near_branch64()),
+        _ => None,
+    }
 }
 
 fn create_basic_block_guid(raw_bytes: &[u8], base: u64) -> uuid::Uuid {
