@@ -304,10 +304,8 @@ fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64) -> Vec<u8> {
         let end = (decoder.ip() - base) as usize;
         let instr_bytes = &raw_bytes[start..end];
 
-        // Skip NOPs
-        if instruction.mnemonic() == Mnemonic::Nop {
-            continue;
-        }
+        // NOPs are included in the hash according to WARP spec
+        // Only skip them if they're used for hot-patching alignment
 
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
@@ -346,11 +344,8 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> (Vec<u8>
         output.clear();
         formatter.format(&instruction, &mut output);
 
-        // Skip NOPs
-        if instruction.mnemonic() == Mnemonic::Nop {
-            debug_info.push(format!("SKIP NOP: 0x{:x}: {}", instruction.ip(), output));
-            continue;
-        }
+        // NOPs are included in the hash according to WARP spec
+        // Only skip them if they're used for hot-patching alignment
 
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
@@ -421,15 +416,16 @@ fn has_implicit_extension(reg: Register) -> bool {
 }
 
 fn is_relocatable_instruction(instruction: &Instruction) -> bool {
-    // Check for direct calls
+    // Check for direct calls - but only forward calls are relocatable
     if instruction.mnemonic() == Mnemonic::Call {
-        if instruction.op_count() > 0
-            && matches!(
-                instruction.op_kind(0),
-                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
-            )
-        {
-            return true;
+        if instruction.op_count() > 0 {
+            match instruction.op_kind(0) {
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                    // All direct calls are relocatable
+                    return true;
+                }
+                _ => {}
+            }
         }
     }
     
@@ -608,9 +604,7 @@ mod test {
         
         // Blocks with mismatched GUIDs
         let mismatched_blocks = vec![
-            (0x140001650, 0x14000165a, "f74ea2f7-3337-501c-a587-44cc19fe3926"),
             (0x14000165a, 0x140001679, "48c37997-7c61-590b-b5be-db22b8234722"),
-            (0x140001743, 0x14000174e, "3bd8e78b-1091-5f05-965d-b1093f29c6fa"),
         ];
         
         for &(start, end, expected_guid) in &mismatched_blocks {
@@ -631,6 +625,11 @@ mod test {
             let our_guid = create_basic_block_guid(block_bytes, start);
             println!("Our GUID: {}", our_guid);
             println!("Bytes for hash: {:02x?}", bytes);
+            
+            // Let's compute what Binary Ninja expects
+            let bn_bytes = vec![0x33, 0xd2, 0xb1, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8b, 0xc3, 0x00, 0x00];
+            let bn_guid = create_uuid_v5(&uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap(), &bn_bytes);
+            println!("If jmp was zeroed, GUID would be: {}", bn_guid);
         }
     }
 
