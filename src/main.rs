@@ -433,23 +433,9 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
         }
     }
     
-    // Check for unconditional jumps (but not short jumps)
-    if instruction.mnemonic() == Mnemonic::Jmp {
-        if instruction.op_count() > 0 {
-            match instruction.op_kind(0) {
-                OpKind::NearBranch32 | OpKind::NearBranch64 => return true,
-                OpKind::NearBranch16 => {
-                    // Only consider it relocatable if it's not a short jump
-                    // Short jumps (EB xx) are typically not relocatable
-                    if instruction.len() > 2 {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
+    // Jumps are not considered relocatable in WARP
+    // This includes both short and long jumps
+    
     // Check for RIP-relative memory operands
     for i in 0..instruction.op_count() {
         if instruction.op_kind(i) == OpKind::Memory {
@@ -622,11 +608,8 @@ mod test {
         
         // Blocks with mismatched GUIDs
         let mismatched_blocks = vec![
-            (0x14000160d, 0x14000162b, "1017b146-0888-599c-8e3e-e5901322c61c"),
-            (0x14000162f, 0x140001650, "8c6757ca-bb64-5354-aec9-d43052d0f43c"),
             (0x140001650, 0x14000165a, "f74ea2f7-3337-501c-a587-44cc19fe3926"),
             (0x14000165a, 0x140001679, "48c37997-7c61-590b-b5be-db22b8234722"),
-            (0x1400016a2, 0x1400016b4, "6952f10c-d255-5a10-b605-2e772ab077b5"),
             (0x140001743, 0x14000174e, "3bd8e78b-1091-5f05-965d-b1093f29c6fa"),
         ];
         
@@ -635,6 +618,10 @@ mod test {
             println!("Expected GUID: {}", expected_guid);
             
             let block_bytes = &TEST_FUNCTION_BYTES[(start - base) as usize..(end - base) as usize];
+            
+            // Show raw bytes
+            println!("Raw bytes: {:02x?}", block_bytes);
+            
             let (bytes, debug_info) = get_instruction_bytes_for_guid_debug(block_bytes, start);
             
             for line in debug_info {
