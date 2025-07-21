@@ -1,0 +1,253 @@
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use sha1::{Digest, Sha1};
+use std::collections::BTreeMap;
+
+const FUNCTION_NAMESPACE: &str = "0192a179-61ac-7cef-88ed-012296e9492f";
+const BASIC_BLOCK_NAMESPACE: &str = "0192a178-7a5f-7936-8653-3cbaa7d6afe7";
+
+fn main() {
+    // Example x86_64 function bytes
+    let function_bytes = vec![
+        0x55, // push rbp
+        0x48, 0x89, 0xe5, // mov rbp, rsp
+        0x48, 0x83, 0xec, 0x10, // sub rsp, 0x10
+        0x89, 0x7d, 0xfc, // mov [rbp-4], edi
+        0x8b, 0x45, 0xfc, // mov eax, [rbp-4]
+        0x83, 0xc0, 0x01, // add eax, 1
+        0xc9, // leave
+        0xc3, // ret
+    ];
+
+    let warp_uuid = compute_warp_uuid(&function_bytes, 0x1000);
+    println!("WARP UUID: {}", warp_uuid);
+}
+
+fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> String {
+    // Disassemble and identify basic blocks
+    let basic_blocks = identify_basic_blocks(raw_bytes, base);
+
+    // Create UUID for each basic block
+    let mut block_uuids = Vec::new();
+    for (&start_addr, &end_addr) in basic_blocks.iter() {
+        let uuid = create_basic_block_guid(
+            &raw_bytes[(start_addr - base) as usize..(end_addr - base) as usize],
+            start_addr,
+        );
+        block_uuids.push((start_addr, uuid));
+    }
+
+    for (&start_addr, &end_addr) in &basic_blocks {
+        println!("0x{start_addr:x} 0x{end_addr:x}");
+    }
+    // Sort by address (highest to lowest)
+    for (start_addr, uuid) in block_uuids.iter().rev() {
+        println!("0x{start_addr:x}: {uuid}");
+    }
+
+    // Combine block UUIDs to create function UUID
+    let namespace = uuid::Uuid::parse_str(FUNCTION_NAMESPACE).unwrap();
+    let mut combined_bytes = Vec::new();
+    for (_, uuid) in block_uuids.iter().rev() {
+        combined_bytes.extend_from_slice(uuid.as_bytes());
+    }
+
+    create_uuid_v5(&namespace, &combined_bytes).to_string()
+}
+
+fn identify_basic_blocks(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, u64> {
+    let mut decoder = Decoder::with_ip(64, raw_bytes, base, DecoderOptions::NONE);
+
+    let mut basic_blocks = BTreeMap::new();
+    let mut current_block_start = base;
+
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        let is_block_end = instruction.flow_control() == FlowControl::ConditionalBranch;
+
+        if is_block_end || !decoder.can_decode() {
+            let ip = decoder.ip();
+            basic_blocks.insert(current_block_start, ip);
+            current_block_start = ip;
+        }
+    }
+
+    basic_blocks
+}
+
+fn create_basic_block_guid(raw_bytes: &[u8], base: u64) -> uuid::Uuid {
+    let namespace = uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap();
+    let instruction_bytes = get_instruction_bytes_for_guid(raw_bytes, base);
+    create_uuid_v5(&namespace, &instruction_bytes)
+}
+
+fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+
+    let mut decoder = Decoder::new(64, raw_bytes, DecoderOptions::NONE);
+    decoder.set_ip(base);
+
+    while decoder.can_decode() {
+        let start = (decoder.ip() - base) as usize;
+        let instruction = decoder.decode();
+        let end = (decoder.ip() - base) as usize;
+        let instr_bytes = &raw_bytes[start..end];
+
+        // Skip NOPs
+        if instruction.mnemonic() == Mnemonic::Nop {
+            continue;
+        }
+
+        // Skip instructions that set a register to itself (if they're effectively NOPs)
+        if is_register_to_itself_nop(&instruction) {
+            continue;
+        }
+
+        // Get instruction bytes, zeroing out relocatable instructions
+        if is_relocatable_instruction(&instruction) {
+            // Zero out relocatable instructions
+            bytes.extend(vec![0u8; instr_bytes.len()]);
+        } else {
+            // Use actual instruction bytes
+            bytes.extend_from_slice(&instr_bytes);
+        }
+    }
+
+    bytes
+}
+
+fn is_register_to_itself_nop(instruction: &Instruction) -> bool {
+    if instruction.mnemonic() != Mnemonic::Mov {
+        return false;
+    }
+
+    if instruction.op_count() != 2 {
+        return false;
+    }
+
+    // Check if both operands are the same register
+    if let (OpKind::Register, OpKind::Register) = (instruction.op_kind(0), instruction.op_kind(1)) {
+        let reg0 = instruction.op_register(0);
+        let reg1 = instruction.op_register(1);
+
+        // For x86_64, mov edi, edi is NOT removed (implicit extension)
+        // For x86, it would be removed
+        if reg0 == reg1 && !has_implicit_extension(reg0) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_implicit_extension(reg: Register) -> bool {
+    // In x86_64, 32-bit register operations zero-extend to 64 bits
+    matches!(
+        reg,
+        Register::EAX
+            | Register::EBX
+            | Register::ECX
+            | Register::EDX
+            | Register::EDI
+            | Register::ESI
+            | Register::EBP
+            | Register::ESP
+            | Register::R8D
+            | Register::R9D
+            | Register::R10D
+            | Register::R11D
+            | Register::R12D
+            | Register::R13D
+            | Register::R14D
+            | Register::R15D
+    )
+}
+
+fn is_relocatable_instruction(instruction: &Instruction) -> bool {
+    // Check for direct calls/jumps
+    if matches!(instruction.mnemonic(), Mnemonic::Call | Mnemonic::Jmp) {
+        if instruction.op_count() > 0
+            && matches!(
+                instruction.op_kind(0),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            )
+        {
+            return true;
+        }
+    }
+
+    // Check for instructions with immediate operands that could be addresses
+    for i in 0..instruction.op_count() {
+        if matches!(instruction.op_kind(i), OpKind::Immediate64 | OpKind::Memory) {
+            // Check if this is likely an address operand
+            if instruction.memory_base() != Register::None
+                || instruction.memory_index() != Register::None
+            {
+                continue; // This is a register-relative address, not absolute
+            }
+
+            // If it's a direct memory reference, it's relocatable
+            if instruction.op_kind(i) == OpKind::Memory {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn create_uuid_v5(namespace: &uuid::Uuid, data: &[u8]) -> uuid::Uuid {
+    let mut hasher = Sha1::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update(data);
+    let hash = hasher.finalize();
+
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+
+    // Set version (5) and variant bits
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    uuid::Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_big() {
+        let function_bytes = [
+            0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec,
+            0x30, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, 0xb8, 0xfb, 0xff, 0xff, 0x84, 0xc0, 0x0f,
+            0x84, 0x36, 0x01, 0x00, 0x00, 0x40, 0x32, 0xf6, 0x40, 0x88, 0x74, 0x24, 0x20, 0xe8,
+            0x85, 0xfb, 0xff, 0xff, 0x8a, 0xd8, 0x8b, 0x0d, 0x9e, 0x6b, 0x00, 0x00, 0x83, 0xf9,
+            0x01, 0x0f, 0x84, 0x23, 0x01, 0x00, 0x00, 0x85, 0xc9, 0x75, 0x4a, 0xc7, 0x05, 0x87,
+            0x6b, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x15, 0x20, 0x50, 0x00, 0x00,
+            0x48, 0x8d, 0x0d, 0xe9, 0x4c, 0x00, 0x00, 0xe8, 0xac, 0x12, 0x00, 0x00, 0x85, 0xc0,
+            0x74, 0x0a, 0xb8, 0xff, 0x00, 0x00, 0x00, 0xe9, 0xd9, 0x00, 0x00, 0x00, 0x48, 0x8d,
+            0x15, 0xbf, 0x4b, 0x00, 0x00, 0x48, 0x8d, 0x0d, 0x98, 0x49, 0x00, 0x00, 0xe8, 0x85,
+            0x12, 0x00, 0x00, 0xc7, 0x05, 0x49, 0x6b, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0xeb,
+            0x08, 0x40, 0xb6, 0x01, 0x40, 0x88, 0x74, 0x24, 0x20, 0x8a, 0xcb, 0xe8, 0x03, 0xfb,
+            0xff, 0xff, 0xe8, 0xc2, 0xfa, 0xff, 0xff, 0x48, 0x8b, 0xd8, 0x48, 0x83, 0x38, 0x00,
+            0x74, 0x1e, 0x48, 0x8b, 0xc8, 0xe8, 0x0c, 0xfa, 0xff, 0xff, 0x84, 0xc0, 0x74, 0x12,
+            0x45, 0x33, 0xc0, 0x41, 0x8d, 0x50, 0x02, 0x33, 0xc9, 0x48, 0x8b, 0x03, 0xff, 0x15,
+            0x6c, 0x99, 0x00, 0x00, 0xe8, 0xaf, 0xfa, 0xff, 0xff, 0x48, 0x8b, 0xd8, 0x48, 0x83,
+            0x38, 0x00, 0x74, 0x14, 0x48, 0x8b, 0xc8, 0xe8, 0xe0, 0xf9, 0xff, 0xff, 0x84, 0xc0,
+            0x74, 0x08, 0x48, 0x8b, 0x0b, 0xe8, 0x52, 0x12, 0x00, 0x00, 0xe8, 0x11, 0x12, 0x00,
+            0x00, 0x48, 0x8b, 0xf8, 0xe8, 0x33, 0x12, 0x00, 0x00, 0x48, 0x8b, 0x18, 0xe8, 0x25,
+            0x12, 0x00, 0x00, 0x4c, 0x8b, 0xc7, 0x48, 0x8b, 0xd3, 0x8b, 0x08, 0xe8, 0x2f, 0xfa,
+            0xff, 0xff, 0x8b, 0xd8, 0xe8, 0x32, 0xfa, 0xff, 0xff, 0x84, 0xc0, 0x74, 0x55, 0x40,
+            0x84, 0xf6, 0x75, 0x05, 0xe8, 0x0f, 0x12, 0x00, 0x00, 0x33, 0xd2, 0xb1, 0x01, 0xe8,
+            0x8a, 0xf9, 0xff, 0xff, 0x8b, 0xc3, 0xeb, 0x19, 0x8b, 0xd8, 0xe8, 0x10, 0xfa, 0xff,
+            0xff, 0x84, 0xc0, 0x74, 0x3b, 0x80, 0x7c, 0x24, 0x20, 0x00, 0x75, 0x05, 0xe8, 0xf1,
+            0x11, 0x00, 0x00, 0x8b, 0xc3, 0x48, 0x8b, 0x5c, 0x24, 0x40, 0x48, 0x8b, 0x74, 0x24,
+            0x48, 0x48, 0x83, 0xc4, 0x30, 0x5f, 0xc3, 0x48, 0x8b, 0x5c, 0x24, 0x40, 0x48, 0x8b,
+            0x74, 0x24, 0x48, 0x48, 0x83, 0xc4, 0x30, 0x5f, 0xc3, 0xb9, 0x07, 0x00, 0x00, 0x00,
+            0xe8, 0x48, 0xfa, 0xff, 0xff, 0x90, 0xb9, 0x07, 0x00, 0x00, 0x00, 0xe8, 0x3d, 0xfa,
+            0xff, 0xff, 0x8b, 0xcb, 0xe8, 0x9f, 0x11, 0x00, 0x00,
+        ];
+        let warp_uuid = compute_warp_uuid(&function_bytes, 0x1400015ec);
+        println!("WARP UUID: {}", warp_uuid);
+    }
+}

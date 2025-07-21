@@ -1,0 +1,9 @@
+[package]
+name = "warp-testing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced-x86 = "1.21"
+sha1 = "0.10"
+uuid = { version = "1.10", features = ["v5"] }
