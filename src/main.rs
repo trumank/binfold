@@ -1,4 +1,4 @@
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, OpKind, Register};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -36,8 +36,26 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> String {
         block_uuids.push((start_addr, uuid));
     }
 
+    // Print disassembly for each basic block
     for (&start_addr, &end_addr) in &basic_blocks {
-        println!("0x{start_addr:x} 0x{end_addr:x}");
+        println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
+        println!("----------------------------------------");
+        
+        // Disassemble the block
+        let block_start_offset = (start_addr - base) as usize;
+        let block_end_offset = (end_addr - base) as usize;
+        let block_bytes = &raw_bytes[block_start_offset..block_end_offset];
+        
+        let mut decoder = Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
+        let mut formatter = iced_x86::NasmFormatter::new();
+        let mut output = String::new();
+        
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            output.clear();
+            formatter.format(&instruction, &mut output);
+            println!("  0x{:x}: {}", instruction.ip(), output);
+        }
     }
     // Sort by address (highest to lowest)
     for (start_addr, uuid) in block_uuids.iter().rev() {
