@@ -589,7 +589,6 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_binary_ninja_blocks_old() {
         let base = 0x1400015ec;
         let blocks = identify_basic_blocks(&TEST_FUNCTION_BYTES, base);
