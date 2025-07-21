@@ -327,6 +327,52 @@ fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64) -> Vec<u8> {
     bytes
 }
 
+fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> (Vec<u8>, Vec<String>) {
+    let mut bytes = Vec::new();
+    let mut debug_info = Vec::new();
+
+    let mut decoder = Decoder::new(64, raw_bytes, DecoderOptions::NONE);
+    decoder.set_ip(base);
+    
+    let mut formatter = iced_x86::NasmFormatter::new();
+    let mut output = String::new();
+
+    while decoder.can_decode() {
+        let start = (decoder.ip() - base) as usize;
+        let instruction = decoder.decode();
+        let end = (decoder.ip() - base) as usize;
+        let instr_bytes = &raw_bytes[start..end];
+
+        output.clear();
+        formatter.format(&instruction, &mut output);
+
+        // Skip NOPs
+        if instruction.mnemonic() == Mnemonic::Nop {
+            debug_info.push(format!("SKIP NOP: 0x{:x}: {}", instruction.ip(), output));
+            continue;
+        }
+
+        // Skip instructions that set a register to itself (if they're effectively NOPs)
+        if is_register_to_itself_nop(&instruction) {
+            debug_info.push(format!("SKIP REG2REG: 0x{:x}: {}", instruction.ip(), output));
+            continue;
+        }
+
+        // Get instruction bytes, zeroing out relocatable instructions
+        if is_relocatable_instruction(&instruction) {
+            // Zero out relocatable instructions
+            bytes.extend(vec![0u8; instr_bytes.len()]);
+            debug_info.push(format!("ZERO RELOC: 0x{:x}: {} | {:02x?}", instruction.ip(), output, instr_bytes));
+        } else {
+            // Use actual instruction bytes
+            bytes.extend_from_slice(&instr_bytes);
+            debug_info.push(format!("KEEP: 0x{:x}: {} | {:02x?}", instruction.ip(), output, instr_bytes));
+        }
+    }
+
+    (bytes, debug_info)
+}
+
 fn is_register_to_itself_nop(instruction: &Instruction) -> bool {
     if instruction.mnemonic() != Mnemonic::Mov {
         return false;
@@ -375,8 +421,8 @@ fn has_implicit_extension(reg: Register) -> bool {
 }
 
 fn is_relocatable_instruction(instruction: &Instruction) -> bool {
-    // Check for direct calls/jumps
-    if matches!(instruction.mnemonic(), Mnemonic::Call | Mnemonic::Jmp) {
+    // Check for direct calls
+    if instruction.mnemonic() == Mnemonic::Call {
         if instruction.op_count() > 0
             && matches!(
                 instruction.op_kind(0),
@@ -386,19 +432,32 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
             return true;
         }
     }
-
-    // Check for instructions with immediate operands that could be addresses
-    for i in 0..instruction.op_count() {
-        if matches!(instruction.op_kind(i), OpKind::Immediate64 | OpKind::Memory) {
-            // Check if this is likely an address operand
-            if instruction.memory_base() != Register::None
-                || instruction.memory_index() != Register::None
-            {
-                continue; // This is a register-relative address, not absolute
+    
+    // Check for unconditional jumps (but not short jumps)
+    if instruction.mnemonic() == Mnemonic::Jmp {
+        if instruction.op_count() > 0 {
+            match instruction.op_kind(0) {
+                OpKind::NearBranch32 | OpKind::NearBranch64 => return true,
+                OpKind::NearBranch16 => {
+                    // Only consider it relocatable if it's not a short jump
+                    // Short jumps (EB xx) are typically not relocatable
+                    if instruction.len() > 2 {
+                        return true;
+                    }
+                }
+                _ => {}
             }
+        }
+    }
 
-            // If it's a direct memory reference, it's relocatable
-            if instruction.op_kind(i) == OpKind::Memory {
+    // Check for RIP-relative memory operands
+    for i in 0..instruction.op_count() {
+        if instruction.op_kind(i) == OpKind::Memory {
+            // Check if it's RIP-relative (no base register, or RIP as base)
+            if instruction.memory_base() == Register::RIP || 
+               (instruction.memory_base() == Register::None && 
+                instruction.memory_index() == Register::None &&
+                instruction.memory_displacement64() != 0) {
                 return true;
             }
         }
@@ -555,6 +614,37 @@ mod test {
     fn test_disassembly() {
         println!("\nFull disassembly with edge information:");
         print_disassembly_with_edges(TEST_FUNCTION_BYTES, 0x1400015ec);
+    }
+
+    #[test]
+    fn test_debug_mismatched_blocks() {
+        let base = 0x1400015ec;
+        
+        // Blocks with mismatched GUIDs
+        let mismatched_blocks = vec![
+            (0x14000160d, 0x14000162b, "1017b146-0888-599c-8e3e-e5901322c61c"),
+            (0x14000162f, 0x140001650, "8c6757ca-bb64-5354-aec9-d43052d0f43c"),
+            (0x140001650, 0x14000165a, "f74ea2f7-3337-501c-a587-44cc19fe3926"),
+            (0x14000165a, 0x140001679, "48c37997-7c61-590b-b5be-db22b8234722"),
+            (0x1400016a2, 0x1400016b4, "6952f10c-d255-5a10-b605-2e772ab077b5"),
+            (0x140001743, 0x14000174e, "3bd8e78b-1091-5f05-965d-b1093f29c6fa"),
+        ];
+        
+        for &(start, end, expected_guid) in &mismatched_blocks {
+            println!("\n=== Block 0x{:x} - 0x{:x} ===", start, end);
+            println!("Expected GUID: {}", expected_guid);
+            
+            let block_bytes = &TEST_FUNCTION_BYTES[(start - base) as usize..(end - base) as usize];
+            let (bytes, debug_info) = get_instruction_bytes_for_guid_debug(block_bytes, start);
+            
+            for line in debug_info {
+                println!("{}", line);
+            }
+            
+            let our_guid = create_basic_block_guid(block_bytes, start);
+            println!("Our GUID: {}", our_guid);
+            println!("Bytes for hash: {:02x?}", bytes);
+        }
     }
 
     #[test]
