@@ -331,7 +331,7 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> (Vec<u8>
 
     let mut decoder = Decoder::new(64, raw_bytes, DecoderOptions::NONE);
     decoder.set_ip(base);
-    
+
     let mut formatter = iced_x86::NasmFormatter::new();
     let mut output = String::new();
 
@@ -349,7 +349,11 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> (Vec<u8>
 
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
-            debug_info.push(format!("SKIP REG2REG: 0x{:x}: {}", instruction.ip(), output));
+            debug_info.push(format!(
+                "SKIP REG2REG: 0x{:x}: {}",
+                instruction.ip(),
+                output
+            ));
             continue;
         }
 
@@ -357,11 +361,21 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> (Vec<u8>
         if is_relocatable_instruction(&instruction) {
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
-            debug_info.push(format!("ZERO RELOC: 0x{:x}: {} | {:02x?}", instruction.ip(), output, instr_bytes));
+            debug_info.push(format!(
+                "ZERO RELOC: 0x{:x}: {} | {:02x?}",
+                instruction.ip(),
+                output,
+                instr_bytes
+            ));
         } else {
             // Use actual instruction bytes
             bytes.extend_from_slice(&instr_bytes);
-            debug_info.push(format!("KEEP: 0x{:x}: {} | {:02x?}", instruction.ip(), output, instr_bytes));
+            debug_info.push(format!(
+                "KEEP: 0x{:x}: {} | {:02x?}",
+                instruction.ip(),
+                output,
+                instr_bytes
+            ));
         }
     }
 
@@ -428,18 +442,37 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
             }
         }
     }
-    
+
     // Jumps are not considered relocatable in WARP
     // This includes both short and long jumps
-    
+    // Check for jumps that go outside the basic block
+    if instruction.mnemonic() == Mnemonic::Jmp {
+        if instruction.op_count() > 0 {
+            match instruction.op_kind(0) {
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                    // Short jumps at the end of a basic block that jump to another block
+                    // might need to be zeroed. This is a special case.
+                    // For now, zero short jumps that appear at the very end of blocks
+                    if instruction.len() == 2 {
+                        // println!("AHH 0x{:x}", instruction.ip());
+                        // Short jump (EB xx)
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Check for RIP-relative memory operands
     for i in 0..instruction.op_count() {
         if instruction.op_kind(i) == OpKind::Memory {
             // Check if it's RIP-relative (no base register, or RIP as base)
-            if instruction.memory_base() == Register::RIP || 
-               (instruction.memory_base() == Register::None && 
-                instruction.memory_index() == Register::None &&
-                instruction.memory_displacement64() != 0) {
+            if instruction.memory_base() == Register::RIP
+                || (instruction.memory_base() == Register::None
+                    && instruction.memory_index() == Register::None
+                    && instruction.memory_displacement64() != 0)
+            {
                 return true;
             }
         }
@@ -515,36 +548,120 @@ mod test {
     #[test]
     fn test_big() {
         let base = 0x1400015ec;
-        
+
         // Binary Ninja basic block GUIDs
         let expected_guids = vec![
-            (0x1400015ec, 0x14000160d, "4cd8b165-f08e-59b6-bcb5-bcdf6cbed1df"),
-            (0x14000160d, 0x14000162b, "1017b146-0888-599c-8e3e-e5901322c61c"),
-            (0x14000162b, 0x14000162f, "030bf918-6106-5003-a82f-14f803b68de7"),
-            (0x14000162f, 0x140001650, "8c6757ca-bb64-5354-aec9-d43052d0f43c"),
-            (0x140001650, 0x14000165a, "f74ea2f7-3337-501c-a587-44cc19fe3926"),
-            (0x14000165a, 0x140001679, "48c37997-7c61-590b-b5be-db22b8234722"),
-            (0x140001679, 0x140001681, "959f5dee-e81b-5648-9da1-49cfbfda6ef1"),
-            (0x140001681, 0x140001696, "b4848139-e544-555d-896a-c1cbcdcd1aef"),
-            (0x140001696, 0x1400016a2, "b0dd7350-27ac-5e56-9ad4-aefe4c0bc3d2"),
-            (0x1400016a2, 0x1400016b4, "6952f10c-d255-5a10-b605-2e772ab077b5"),
-            (0x1400016b4, 0x1400016c2, "fda8b2d0-f5c5-5a18-8a9b-d7f3a1d32bd4"),
-            (0x1400016c2, 0x1400016ce, "3b1a220f-21aa-5c1a-84dd-15478ddcd8ed"),
-            (0x1400016ce, 0x1400016d6, "28b92727-1675-5ab4-8aa8-efdf10503cb1"),
-            (0x1400016d6, 0x140001703, "43116bd4-d437-5c33-b334-9a20e8d2593b"),
-            (0x140001703, 0x140001708, "64d222ab-fd59-5dae-917a-8acf93a623b1"),
-            (0x140001708, 0x14000170d, "276080dd-41b1-52fa-b907-b6e17528147b"),
-            (0x14000170d, 0x14000171a, "781b3161-a5f6-5246-8248-202713e7b1b7"),
-            (0x140001733, 0x140001743, "10cc16f6-0eed-5e6a-8b56-7e35c6e7d33f"),
-            (0x140001743, 0x14000174e, "3bd8e78b-1091-5f05-965d-b1093f29c6fa"),
-            (0x14000174e, 0x140001758, "8e1db6ea-2719-547c-b067-d7657d21c74c"),
-            (0x140001758, 0x14000175f, "5cf3a71c-168c-55b3-baa0-d0d8f3ae3a89"),
+            (
+                0x1400015ec,
+                0x14000160d,
+                "4cd8b165-f08e-59b6-bcb5-bcdf6cbed1df",
+            ),
+            (
+                0x14000160d,
+                0x14000162b,
+                "1017b146-0888-599c-8e3e-e5901322c61c",
+            ),
+            (
+                0x14000162b,
+                0x14000162f,
+                "030bf918-6106-5003-a82f-14f803b68de7",
+            ),
+            (
+                0x14000162f,
+                0x140001650,
+                "8c6757ca-bb64-5354-aec9-d43052d0f43c",
+            ),
+            (
+                0x140001650,
+                0x14000165a,
+                "f74ea2f7-3337-501c-a587-44cc19fe3926",
+            ),
+            (
+                0x14000165a,
+                0x140001679,
+                "48c37997-7c61-590b-b5be-db22b8234722",
+            ),
+            (
+                0x140001679,
+                0x140001681,
+                "959f5dee-e81b-5648-9da1-49cfbfda6ef1",
+            ),
+            (
+                0x140001681,
+                0x140001696,
+                "b4848139-e544-555d-896a-c1cbcdcd1aef",
+            ),
+            (
+                0x140001696,
+                0x1400016a2,
+                "b0dd7350-27ac-5e56-9ad4-aefe4c0bc3d2",
+            ),
+            (
+                0x1400016a2,
+                0x1400016b4,
+                "6952f10c-d255-5a10-b605-2e772ab077b5",
+            ),
+            (
+                0x1400016b4,
+                0x1400016c2,
+                "fda8b2d0-f5c5-5a18-8a9b-d7f3a1d32bd4",
+            ),
+            (
+                0x1400016c2,
+                0x1400016ce,
+                "3b1a220f-21aa-5c1a-84dd-15478ddcd8ed",
+            ),
+            (
+                0x1400016ce,
+                0x1400016d6,
+                "28b92727-1675-5ab4-8aa8-efdf10503cb1",
+            ),
+            (
+                0x1400016d6,
+                0x140001703,
+                "43116bd4-d437-5c33-b334-9a20e8d2593b",
+            ),
+            (
+                0x140001703,
+                0x140001708,
+                "64d222ab-fd59-5dae-917a-8acf93a623b1",
+            ),
+            (
+                0x140001708,
+                0x14000170d,
+                "276080dd-41b1-52fa-b907-b6e17528147b",
+            ),
+            (
+                0x14000170d,
+                0x14000171a,
+                "781b3161-a5f6-5246-8248-202713e7b1b7",
+            ),
+            (
+                0x140001733,
+                0x140001743,
+                "10cc16f6-0eed-5e6a-8b56-7e35c6e7d33f",
+            ),
+            (
+                0x140001743,
+                0x14000174e,
+                "3bd8e78b-1091-5f05-965d-b1093f29c6fa",
+            ),
+            (
+                0x14000174e,
+                0x140001758,
+                "8e1db6ea-2719-547c-b067-d7657d21c74c",
+            ),
+            (
+                0x140001758,
+                0x14000175f,
+                "5cf3a71c-168c-55b3-baa0-d0d8f3ae3a89",
+            ),
         ];
-        
+
         // Compute our blocks and GUIDs
         let blocks = identify_basic_blocks(&TEST_FUNCTION_BYTES, base);
         let mut our_guids = Vec::new();
-        
+
         for (&start_addr, &end_addr) in blocks.iter() {
             let uuid = create_basic_block_guid(
                 &TEST_FUNCTION_BYTES[(start_addr - base) as usize..(end_addr - base) as usize],
@@ -552,31 +669,42 @@ mod test {
             );
             our_guids.push((start_addr, end_addr, uuid));
         }
-        
+
         // Compare blocks and GUIDs
         println!("\nComparing with Binary Ninja:");
-        println!("Start       | End         | Our GUID                             | BN GUID                              | Match");
-        println!("------------|-------------|--------------------------------------|--------------------------------------|-------");
-        
+        println!(
+            "Start       | End         | Our GUID                             | BN GUID                              | Match"
+        );
+        println!(
+            "------------|-------------|--------------------------------------|--------------------------------------|-------"
+        );
+
         for &(bn_start, bn_end, bn_guid) in &expected_guids {
             let our_block = blocks.get(&bn_start);
-            let our_guid = our_guids.iter()
+            let our_guid = our_guids
+                .iter()
                 .find(|(start, _, _)| *start == bn_start)
                 .map(|(_, _, guid)| guid.to_string());
-                
+
             let block_match = our_block == Some(&bn_end);
             let guid_match = our_guid.as_deref() == Some(bn_guid);
-            
+
             println!(
                 "0x{:08x} | 0x{:08x} | {} | {} | {}",
                 bn_start,
                 bn_end,
                 our_guid.as_deref().unwrap_or("NOT FOUND"),
                 bn_guid,
-                if block_match && guid_match { "YES" } else if block_match { "BLOCK" } else { "NO" }
+                if block_match && guid_match {
+                    "YES"
+                } else if block_match {
+                    "BLOCK"
+                } else {
+                    "NO"
+                }
             );
         }
-        
+
         // Compute WARP UUID
         let warp_uuid = compute_warp_uuid(TEST_FUNCTION_BYTES, base);
         println!("\nWARP UUID: {}", warp_uuid);
@@ -601,35 +729,48 @@ mod test {
     #[test]
     fn test_debug_mismatched_blocks() {
         let base = 0x1400015ec;
-        
+
         // Blocks with mismatched GUIDs
         let mismatched_blocks = vec![
-            (0x14000165a, 0x140001679, "48c37997-7c61-590b-b5be-db22b8234722"),
+            (
+                0x14000165a,
+                0x140001679,
+                "48c37997-7c61-590b-b5be-db22b8234722",
+            ),
+            (
+                0x14000170d,
+                0x14000171a,
+                "781b3161-a5f6-5246-8248-202713e7b1b7",
+            ),
         ];
-        
+
         for &(start, end, expected_guid) in &mismatched_blocks {
             println!("\n=== Block 0x{:x} - 0x{:x} ===", start, end);
-            println!("Expected GUID: {}", expected_guid);
-            
+
             let block_bytes = &TEST_FUNCTION_BYTES[(start - base) as usize..(end - base) as usize];
-            
-            // Show raw bytes
-            println!("Raw bytes: {:02x?}", block_bytes);
-            
+
             let (bytes, debug_info) = get_instruction_bytes_for_guid_debug(block_bytes, start);
-            
+
             for line in debug_info {
                 println!("{}", line);
             }
-            
+
             let our_guid = create_basic_block_guid(block_bytes, start);
-            println!("Our GUID: {}", our_guid);
+            println!("Our GUID:  {}", our_guid);
+            println!("Expected:  {}", expected_guid);
+            // Show raw bytes
+            println!("Raw bytes:      {:02x?}", block_bytes);
             println!("Bytes for hash: {:02x?}", bytes);
-            
+
             // Let's compute what Binary Ninja expects
-            let bn_bytes = vec![0x33, 0xd2, 0xb1, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8b, 0xc3, 0x00, 0x00];
-            let bn_guid = create_uuid_v5(&uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap(), &bn_bytes);
-            println!("If jmp was zeroed, GUID would be: {}", bn_guid);
+            // let bn_bytes = vec![
+            //     0x33, 0xd2, 0xb1, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8b, 0xc3, 0x00, 0x00,
+            // ];
+            // let bn_guid = create_uuid_v5(
+            //     &uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap(),
+            //     &bn_bytes,
+            // );
+            // println!("If jmp was zeroed, GUID would be: {}", bn_guid);
         }
     }
 
