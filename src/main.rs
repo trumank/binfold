@@ -101,8 +101,8 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> String {
     create_uuid_v5(&namespace, &combined_bytes).to_string()
 }
 
-fn identify_basic_blocks(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, u64> {
-    // First pass: decode all instructions and build instruction map
+// Helper function to decode all instructions in a byte array
+fn decode_instructions(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, (Instruction, u64)> {
     let mut decoder = Decoder::with_ip(64, raw_bytes, base, DecoderOptions::NONE);
     let mut instructions = BTreeMap::new();
 
@@ -113,11 +113,20 @@ fn identify_basic_blocks(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, u64> {
         instructions.insert(start, (instruction, end));
     }
 
-    // Build control flow graph edges
+    instructions
+}
+
+// Helper function to build control flow graph
+fn build_control_flow_graph(
+    instructions: &BTreeMap<u64, (Instruction, u64)>,
+    base: u64,
+) -> (
+    HashMap<u64, HashSet<u64>>,
+    HashMap<u64, HashSet<u64>>,
+    HashSet<u64>,
+) {
     let mut incoming_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut outgoing_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
-
-    // Walk instructions starting from entry point
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
     queue.push_back(base);
@@ -128,17 +137,17 @@ fn identify_basic_blocks(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, u64> {
         }
         visited.insert(addr);
 
-        if let Some((instruction, next_addr)) = instructions.get(&addr).cloned() {
+        if let Some((instruction, next_addr)) = instructions.get(&addr) {
             match instruction.flow_control() {
-                FlowControl::Next => {
-                    // Regular instruction - edge to next
-                    outgoing_edges.entry(addr).or_default().insert(next_addr);
-                    incoming_edges.entry(next_addr).or_default().insert(addr);
-                    queue.push_back(next_addr);
+                FlowControl::Next | FlowControl::Call => {
+                    // Regular instruction or call - edge to next
+                    outgoing_edges.entry(addr).or_default().insert(*next_addr);
+                    incoming_edges.entry(*next_addr).or_default().insert(addr);
+                    queue.push_back(*next_addr);
                 }
                 FlowControl::UnconditionalBranch => {
                     // Unconditional jump - edge to target only
-                    if let Some(target) = get_branch_target(&instruction) {
+                    if let Some(target) = get_branch_target(instruction) {
                         outgoing_edges.entry(addr).or_default().insert(target);
                         incoming_edges.entry(target).or_default().insert(addr);
                         queue.push_back(target);
@@ -146,21 +155,15 @@ fn identify_basic_blocks(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, u64> {
                 }
                 FlowControl::ConditionalBranch => {
                     // Conditional jump - edges to both next and target
-                    outgoing_edges.entry(addr).or_default().insert(next_addr);
-                    incoming_edges.entry(next_addr).or_default().insert(addr);
-                    queue.push_back(next_addr);
+                    outgoing_edges.entry(addr).or_default().insert(*next_addr);
+                    incoming_edges.entry(*next_addr).or_default().insert(addr);
+                    queue.push_back(*next_addr);
 
-                    if let Some(target) = get_branch_target(&instruction) {
+                    if let Some(target) = get_branch_target(instruction) {
                         outgoing_edges.entry(addr).or_default().insert(target);
                         incoming_edges.entry(target).or_default().insert(addr);
                         queue.push_back(target);
                     }
-                }
-                FlowControl::Call => {
-                    // Call - edge to next (not a branch for basic block purposes)
-                    outgoing_edges.entry(addr).or_default().insert(next_addr);
-                    incoming_edges.entry(next_addr).or_default().insert(addr);
-                    queue.push_back(next_addr);
                 }
                 FlowControl::Return => {
                     // Return - no outgoing edges
@@ -170,35 +173,38 @@ fn identify_basic_blocks(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, u64> {
         }
     }
 
-    // Identify basic block boundaries
+    (incoming_edges, outgoing_edges, visited)
+}
+
+// Helper function to identify block boundaries
+fn identify_block_boundaries(
+    instructions: &BTreeMap<u64, (Instruction, u64)>,
+    incoming_edges: &HashMap<u64, HashSet<u64>>,
+    outgoing_edges: &HashMap<u64, HashSet<u64>>,
+    base: u64,
+) -> BTreeSet<u64> {
     let mut block_starts = BTreeSet::new();
     block_starts.insert(base); // Entry point is always a block start
 
-    // First, add block starts based on control flow edges
-    for (&addr, _) in &instructions {
-        // An instruction is a block start if:
-        // 1. It has multiple incoming edges, or
-        // 2. Its predecessor has multiple outgoing edges
-        let incoming_count = incoming_edges.get(&addr).map(|s| s.len()).unwrap_or(0);
-
-        if incoming_count > 1 {
+    for (&addr, _) in instructions {
+        // Block start if multiple incoming edges
+        if incoming_edges.get(&addr).map(|s| s.len()).unwrap_or(0) > 1 {
             block_starts.insert(addr);
         }
 
-        // Check if any predecessor has multiple outgoing edges
+        // Block start if predecessor has multiple outgoing edges
         if let Some(predecessors) = incoming_edges.get(&addr) {
             for &pred in predecessors {
-                let outgoing_count = outgoing_edges.get(&pred).map(|s| s.len()).unwrap_or(0);
-                if outgoing_count > 1 {
+                if outgoing_edges.get(&pred).map(|s| s.len()).unwrap_or(0) > 1 {
                     block_starts.insert(addr);
                 }
             }
         }
     }
 
-    // Also add block starts after returns and unconditional jumps
+    // Block starts after returns and unconditional jumps
     let mut prev_instruction: Option<&Instruction> = None;
-    for (&addr, (instruction, _)) in &instructions {
+    for (&addr, (instruction, _)) in instructions {
         if let Some(prev) = prev_instruction {
             if matches!(
                 prev.flow_control(),
@@ -209,6 +215,19 @@ fn identify_basic_blocks(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, u64> {
         }
         prev_instruction = Some(instruction);
     }
+
+    block_starts
+}
+
+fn identify_basic_blocks(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, u64> {
+    let instructions = decode_instructions(raw_bytes, base);
+
+    // Build control flow graph edges and find reachable instructions
+    let (incoming_edges, outgoing_edges, visited) = build_control_flow_graph(&instructions, base);
+
+    // Identify basic block boundaries
+    let block_starts =
+        identify_block_boundaries(&instructions, &incoming_edges, &outgoing_edges, base);
 
     // Build basic blocks (only for reachable code)
     let mut basic_blocks = BTreeMap::new();
@@ -405,85 +424,15 @@ fn create_uuid_v5(namespace: &uuid::Uuid, data: &[u8]) -> uuid::Uuid {
 }
 
 fn print_disassembly_with_edges(raw_bytes: &[u8], base: u64) {
-    // First pass: decode all instructions and build instruction map
-    let mut decoder = Decoder::with_ip(64, raw_bytes, base, DecoderOptions::NONE);
-    let mut instructions = BTreeMap::new();
+    // Decode all instructions
+    let instructions = decode_instructions(raw_bytes, base);
 
-    while decoder.can_decode() {
-        let start = decoder.ip();
-        let instruction = decoder.decode();
-        let end = decoder.ip();
-        instructions.insert(start, (instruction, end));
-    }
-
-    // Build control flow graph edges
-    let mut incoming_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
-    let mut outgoing_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
-
-    for (&addr, (instruction, next_addr)) in &instructions {
-        match instruction.flow_control() {
-            FlowControl::Next => {
-                outgoing_edges.entry(addr).or_default().insert(*next_addr);
-                incoming_edges.entry(*next_addr).or_default().insert(addr);
-            }
-            FlowControl::UnconditionalBranch => {
-                if let Some(target) = get_branch_target(instruction) {
-                    outgoing_edges.entry(addr).or_default().insert(target);
-                    incoming_edges.entry(target).or_default().insert(addr);
-                }
-            }
-            FlowControl::ConditionalBranch => {
-                outgoing_edges.entry(addr).or_default().insert(*next_addr);
-                incoming_edges.entry(*next_addr).or_default().insert(addr);
-
-                if let Some(target) = get_branch_target(instruction) {
-                    outgoing_edges.entry(addr).or_default().insert(target);
-                    incoming_edges.entry(target).or_default().insert(addr);
-                }
-            }
-            FlowControl::Call => {
-                outgoing_edges.entry(addr).or_default().insert(*next_addr);
-                incoming_edges.entry(*next_addr).or_default().insert(addr);
-            }
-            FlowControl::Return => {
-                // No outgoing edges
-            }
-            _ => {}
-        }
-    }
+    // Build control flow graph edges (we don't need visited for display)
+    let (incoming_edges, outgoing_edges, _) = build_control_flow_graph(&instructions, base);
 
     // Identify block boundaries
-    let mut block_starts = BTreeSet::new();
-    block_starts.insert(base);
-
-    for (&addr, _) in &instructions {
-        let incoming_count = incoming_edges.get(&addr).map(|s| s.len()).unwrap_or(0);
-        if incoming_count > 1 {
-            block_starts.insert(addr);
-        }
-
-        if let Some(predecessors) = incoming_edges.get(&addr) {
-            for &pred in predecessors {
-                let outgoing_count = outgoing_edges.get(&pred).map(|s| s.len()).unwrap_or(0);
-                if outgoing_count > 1 {
-                    block_starts.insert(addr);
-                }
-            }
-        }
-    }
-
-    // Also add block starts after unconditional branches and returns
-    for (&addr, (instruction, _)) in &instructions {
-        if matches!(
-            instruction.flow_control(),
-            FlowControl::UnconditionalBranch | FlowControl::Return
-        ) {
-            // Find the next address after this instruction
-            if let Some((&next_addr, _)) = instructions.range((addr + 1)..).next() {
-                block_starts.insert(next_addr);
-            }
-        }
-    }
+    let block_starts =
+        identify_block_boundaries(&instructions, &incoming_edges, &outgoing_edges, base);
 
     // Print disassembly with edge information - LINEAR SWEEP
     let mut formatter = iced_x86::NasmFormatter::new();
@@ -536,60 +485,6 @@ mod test {
 
     #[test]
     fn test_binary_ninja_blocks() {
-        let base = 0x1400015ec;
-        let blocks = identify_basic_blocks(TEST_FUNCTION_BYTES, base);
-
-        // After looking at the disassembly, I think Binary Ninja's expected blocks have errors
-        // 0x14000174e doesn't exist as an instruction boundary
-        // Let's adjust the expected blocks to match actual instruction boundaries
-        let expected_blocks = vec![
-            (0x1400015ec, 0x14000160d),
-            (0x14000160d, 0x14000162b),
-            (0x14000162b, 0x14000162f),
-            (0x14000162f, 0x140001650),
-            (0x140001650, 0x14000165a),
-            (0x14000165a, 0x140001679),
-            (0x140001679, 0x140001681),
-            (0x140001681, 0x140001696),
-            (0x140001696, 0x1400016a2),
-            (0x1400016a2, 0x1400016b4),
-            (0x1400016b4, 0x1400016c2),
-            (0x1400016c2, 0x1400016ce),
-            (0x1400016ce, 0x1400016d6),
-            (0x1400016d6, 0x140001703),
-            (0x140001703, 0x140001708),
-            (0x140001708, 0x14000170d),
-            (0x14000170d, 0x14000171a),
-            (0x140001733, 0x140001743),
-            (0x140001743, 0x140001753), // Fixed: was 0x14000174e
-            (0x140001753, 0x140001758), // Fixed: was 0x14000174e - 0x140001758
-            (0x140001758, 0x14000175e), // Fixed: was 0x14000175f
-        ];
-
-        // Compare blocks
-        println!("Our blocks vs expected blocks:");
-        let mut all_match = true;
-        for &(start, end) in &expected_blocks {
-            let our_end = blocks.get(&start);
-            let matches = our_end == Some(&end);
-            if !matches {
-                all_match = false;
-            }
-            println!(
-                "0x{:x} - 0x{:x} | Expected: 0x{:x} - 0x{:x} | Match: {}",
-                start,
-                our_end.unwrap_or(&0),
-                start,
-                end,
-                matches
-            );
-        }
-
-        assert!(all_match, "Basic blocks don't match expected");
-    }
-
-    #[test]
-    fn test_binary_ninja_blocks_old() {
         let base = 0x1400015ec;
         let blocks = identify_basic_blocks(&TEST_FUNCTION_BYTES, base);
 
