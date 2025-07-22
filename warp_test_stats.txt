@@ -1,7 +1,6 @@
 WARP Function Analysis Statistics
 ==================================
-Generated at: SystemTime { tv_sec: 1753160921, tv_nsec: 822836839 }
-Total functions analyzed: 14
+Generated at: SystemTime { tv_sec: 1753162419, tv_nsec: 143509610 }
 
 Function #1 at 0x140e51460
   Expected GUID: e88c9e8a-c183-5897-bf9e-893a9acbeeff
@@ -103,6 +102,7 @@ Function #14 at 0x144797870
 
 Summary
 =======
+Total functions analyzed: 14
 Functions with exact GUID match: 2/14 (14.3%)
 Functions with size mismatch: 1
 Total basic blocks matched: 1402/2100 (66.8%)

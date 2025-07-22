@@ -1,10 +1,10 @@
+use crate::DebugContext;
 use anyhow::{Result, bail};
 use memmap2::Mmap;
 use object::pe::ImageNtHeaders64;
 use object::read::pe::{ImageNtHeaders, ImageOptionalHeader, PeFile};
 use std::fs::File;
 use std::path::Path;
-use crate::DebugContext;
 
 pub struct PeLoader {
     mmap: Mmap,
@@ -98,27 +98,32 @@ impl PeLoader {
 
         if ctx.debug_instructions {
             use iced_x86::Formatter;
-            
+
             println!("\nDecoding instructions from 0x{:x}:", va);
             let mut formatter = iced_x86::NasmFormatter::new();
             let mut output = String::new();
-            
+
             while decoder.can_decode() && all_instructions.len() < 50 {
                 let addr = decoder.ip();
                 let instruction = decoder.decode();
                 let next_addr = decoder.ip();
-                
+
                 output.clear();
                 formatter.format(&instruction, &mut output);
-                println!("  0x{:x}: {} (flow: {:?})", addr, output, instruction.flow_control());
-                
+                println!(
+                    "  0x{:x}: {} (flow: {:?})",
+                    addr,
+                    output,
+                    instruction.flow_control()
+                );
+
                 all_instructions.insert(addr, (instruction, next_addr));
             }
-            
+
             if decoder.can_decode() {
                 println!("  ... (showing first 50 instructions)");
             }
-            
+
             // Reset decoder for full scan
             decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
             all_instructions.clear();

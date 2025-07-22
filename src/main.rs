@@ -86,7 +86,8 @@ fn main() -> Result<()> {
             address,
             size,
         } => {
-            let warp_uuid = compute_warp_uuid_from_pe(&file, address, size, &DebugContext::default())?;
+            let warp_uuid =
+                compute_warp_uuid_from_pe(&file, address, size, &DebugContext::default())?;
             println!("Function at 0x{address:x}:");
             println!("WARP UUID: {warp_uuid}");
         }
@@ -112,11 +113,11 @@ fn main() -> Result<()> {
                     _ => eprintln!("Unknown debug flag: {}", flag),
                 }
             }
-            
+
             println!("Debug analysis for function at 0x{:x}", address);
             println!("Debug flags: {:?}", ctx);
             println!("========================================\n");
-            
+
             let warp_uuid = compute_warp_uuid_from_pe(&file, address, size, &ctx)?;
             println!("\nFinal WARP UUID: {warp_uuid}");
         }
@@ -141,7 +142,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn compute_warp_uuid_from_pe(path: &PathBuf, address: u64, size: Option<usize>, ctx: &DebugContext) -> Result<Uuid> {
+fn compute_warp_uuid_from_pe(
+    path: &PathBuf,
+    address: u64,
+    size: Option<usize>,
+    ctx: &DebugContext,
+) -> Result<Uuid> {
     let pe = PeLoader::load(path)?;
 
     // Determine function size if not provided
@@ -184,7 +190,7 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
         let block_bytes = &raw_bytes[(start_addr - base) as usize..(end_addr - base) as usize];
         let uuid = create_basic_block_guid(block_bytes, start_addr, ctx);
         block_uuids.push((start_addr, uuid));
-        
+
         if ctx.debug_guid {
             println!("Block 0x{:x}-0x{:x}: UUID {}", start_addr, end_addr, uuid);
         }
@@ -213,7 +219,7 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
             }
         }
     }
-    
+
     // Combine block UUIDs to create function UUID
     // Note: Despite WARP spec saying "highest to lowest", Binary Ninja
     // actually combines them in low-to-high address order
@@ -224,14 +230,14 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
     }
 
     let function_uuid = create_uuid_v5(&namespace, &combined_bytes);
-    
+
     if ctx.debug_guid {
         println!("\nFunction UUID calculation:");
         println!("  Namespace: {}", namespace);
         println!("  Block count: {}", block_uuids.len());
         println!("  Final UUID: {}", function_uuid);
     }
-    
+
     function_uuid
 }
 
@@ -357,7 +363,11 @@ fn identify_basic_blocks(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> BTr
     let instructions = decode_instructions(raw_bytes, base);
 
     if ctx.debug_blocks {
-        println!("Decoded {} instructions starting at 0x{:x}", instructions.len(), base);
+        println!(
+            "Decoded {} instructions starting at 0x{:x}",
+            instructions.len(),
+            base
+        );
     }
 
     // Build control flow graph edges and find reachable instructions
@@ -477,7 +487,7 @@ fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64) -> Vec<u8> {
 
 fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> Vec<u8> {
     use iced_x86::Formatter;
-    
+
     let mut bytes = Vec::new();
 
     let mut decoder = Decoder::new(64, raw_bytes, DecoderOptions::NONE);
@@ -502,11 +512,7 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> Vec<u8> 
 
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
-            println!(
-                "    SKIP REG2REG: 0x{:x}: {}",
-                instruction.ip(),
-                output
-            );
+            println!("    SKIP REG2REG: 0x{:x}: {}", instruction.ip(), output);
             continue;
         }
 
@@ -679,7 +685,12 @@ mod test {
     use super::*;
 
     use serde::Deserialize;
-    use uuid::uuid;
+
+    #[derive(Debug, Deserialize)]
+    struct Exe {
+        path: String,
+        functions: Vec<Function>,
+    }
 
     #[derive(Debug, Deserialize)]
     struct Function {
@@ -698,64 +709,105 @@ mod test {
     #[test]
     fn test_json() {
         use std::io::Write;
-        
+
         let f = std::io::BufReader::new(std::fs::File::open("functions.json").unwrap());
-        let functions: Vec<Function> = serde_json::from_reader(f).unwrap();
-        
+        let functions: Vec<Exe> = serde_json::from_reader(f).unwrap();
+
         let mut stats_file = std::fs::File::create("warp_test_stats.txt").unwrap();
         writeln!(stats_file, "WARP Function Analysis Statistics").unwrap();
         writeln!(stats_file, "==================================").unwrap();
-        writeln!(stats_file, "Generated at: {:?}", std::time::SystemTime::now()).unwrap();
-        writeln!(stats_file, "Total functions analyzed: {}", functions.len()).unwrap();
+        writeln!(
+            stats_file,
+            "Generated at: {:?}",
+            std::time::SystemTime::now()
+        )
+        .unwrap();
         writeln!(stats_file).unwrap();
-        
+
         let mut total_exact_matches = 0;
         let mut total_size_mismatches = 0;
         let mut total_blocks_analyzed = 0;
         let mut total_blocks_matched = 0;
-        
-        for (idx, function) in functions.iter().enumerate() {
-            writeln!(stats_file, "Function #{} at 0x{:x}", idx + 1, function.start).unwrap();
-            writeln!(stats_file, "  Expected GUID: {}", function.guid).unwrap();
-            writeln!(stats_file, "  Expected blocks: {}", function.blocks.len()).unwrap();
-            
-            let (size_diff, blocks_matched, blocks_total, guid_match) = test_warp_function_from_binary_with_stats(
-                "/home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe",
-                function.start,
-                function.guid,
-                function
-                    .blocks
-                    .iter()
-                    .map(|b| (b.start, b.end, b.guid))
-                    .collect(),
-            );
-            
-            writeln!(stats_file, "  Size difference: {} bytes", size_diff).unwrap();
-            writeln!(stats_file, "  Blocks matched: {}/{} ({:.1}%)", 
-                blocks_matched, blocks_total, 
-                blocks_matched as f64 / blocks_total as f64 * 100.0).unwrap();
-            writeln!(stats_file, "  GUID match: {}", if guid_match { "YES" } else { "NO" }).unwrap();
-            writeln!(stats_file).unwrap();
-            
-            if guid_match {
-                total_exact_matches += 1;
+        let mut total_functions = 0;
+
+        for exe in &functions {
+            for (idx, function) in exe.functions.iter().enumerate() {
+                writeln!(
+                    stats_file,
+                    "Function #{} at 0x{:x}",
+                    idx + 1,
+                    function.start
+                )
+                .unwrap();
+                writeln!(stats_file, "  Expected GUID: {}", function.guid).unwrap();
+                writeln!(stats_file, "  Expected blocks: {}", function.blocks.len()).unwrap();
+
+                let (size_diff, blocks_matched, blocks_total, guid_match) =
+                    test_warp_function_from_binary_with_stats(
+                        &exe.path,
+                        function.start,
+                        function.guid,
+                        function
+                            .blocks
+                            .iter()
+                            .map(|b| (b.start, b.end, b.guid))
+                            .collect(),
+                    );
+
+                writeln!(stats_file, "  Size difference: {} bytes", size_diff).unwrap();
+                writeln!(
+                    stats_file,
+                    "  Blocks matched: {}/{} ({:.1}%)",
+                    blocks_matched,
+                    blocks_total,
+                    blocks_matched as f64 / blocks_total as f64 * 100.0
+                )
+                .unwrap();
+                writeln!(
+                    stats_file,
+                    "  GUID match: {}",
+                    if guid_match { "YES" } else { "NO" }
+                )
+                .unwrap();
+                writeln!(stats_file).unwrap();
+
+                if guid_match {
+                    total_exact_matches += 1;
+                }
+                if size_diff != 0 {
+                    total_size_mismatches += 1;
+                }
+                total_blocks_analyzed += blocks_total;
+                total_blocks_matched += blocks_matched;
+                total_functions += 1;
             }
-            if size_diff != 0 {
-                total_size_mismatches += 1;
-            }
-            total_blocks_analyzed += blocks_total;
-            total_blocks_matched += blocks_matched;
         }
-        
+
         writeln!(stats_file, "Summary").unwrap();
         writeln!(stats_file, "=======").unwrap();
-        writeln!(stats_file, "Functions with exact GUID match: {}/{} ({:.1}%)", 
-            total_exact_matches, functions.len(),
-            total_exact_matches as f64 / functions.len() as f64 * 100.0).unwrap();
-        writeln!(stats_file, "Functions with size mismatch: {}", total_size_mismatches).unwrap();
-        writeln!(stats_file, "Total basic blocks matched: {}/{} ({:.1}%)",
-            total_blocks_matched, total_blocks_analyzed,
-            total_blocks_matched as f64 / total_blocks_analyzed as f64 * 100.0).unwrap();
+        writeln!(stats_file, "Total functions analyzed: {}", total_functions).unwrap();
+        writeln!(
+            stats_file,
+            "Functions with exact GUID match: {}/{} ({:.1}%)",
+            total_exact_matches,
+            total_functions,
+            total_exact_matches as f64 / total_functions as f64 * 100.0
+        )
+        .unwrap();
+        writeln!(
+            stats_file,
+            "Functions with size mismatch: {}",
+            total_size_mismatches
+        )
+        .unwrap();
+        writeln!(
+            stats_file,
+            "Total basic blocks matched: {}/{} ({:.1}%)",
+            total_blocks_matched,
+            total_blocks_analyzed,
+            total_blocks_matched as f64 / total_blocks_analyzed as f64 * 100.0
+        )
+        .unwrap();
     }
 
     // Helper function to test WARP function from binary and return statistics
@@ -765,8 +817,13 @@ mod test {
         expected_function_guid: Uuid,
         expected_blocks: Vec<(u64, u64, Uuid)>,
     ) -> (i64, usize, usize, bool) {
-        let (size_diff, blocks_matched, blocks_total, guid_match) = 
-            test_warp_function_from_binary_impl(exe_path, function_address, expected_function_guid, expected_blocks);
+        let (size_diff, blocks_matched, blocks_total, guid_match) =
+            test_warp_function_from_binary_impl(
+                exe_path,
+                function_address,
+                expected_function_guid,
+                expected_blocks,
+            );
         (size_diff, blocks_matched, blocks_total, guid_match)
     }
 
@@ -777,9 +834,14 @@ mod test {
         expected_function_guid: Uuid,
         expected_blocks: Vec<(u64, u64, Uuid)>,
     ) {
-        test_warp_function_from_binary_impl(exe_path, function_address, expected_function_guid, expected_blocks);
+        test_warp_function_from_binary_impl(
+            exe_path,
+            function_address,
+            expected_function_guid,
+            expected_blocks,
+        );
     }
-    
+
     // Implementation of test WARP function from binary
     fn test_warp_function_from_binary_impl(
         exe_path: impl AsRef<std::path::Path>,
@@ -820,7 +882,8 @@ mod test {
             .expect("Failed to read function bytes");
 
         // Compute basic blocks
-        let blocks = identify_basic_blocks(function_bytes, function_address, &DebugContext::default());
+        let blocks =
+            identify_basic_blocks(function_bytes, function_address, &DebugContext::default());
 
         println!("\nComparing basic blocks:");
         println!(
@@ -836,7 +899,11 @@ mod test {
             let our_guid = if our_end == Some(&end) {
                 let block_bytes = &function_bytes
                     [(start - function_address) as usize..(end - function_address) as usize];
-                Some(create_basic_block_guid(block_bytes, start, &DebugContext::default()))
+                Some(create_basic_block_guid(
+                    block_bytes,
+                    start,
+                    &DebugContext::default(),
+                ))
             } else {
                 None
             };
@@ -859,7 +926,8 @@ mod test {
         }
 
         // Compute WARP UUID
-        let warp_uuid = compute_warp_uuid(function_bytes, function_address, &DebugContext::default());
+        let warp_uuid =
+            compute_warp_uuid(function_bytes, function_address, &DebugContext::default());
         println!("\nWARP UUID: {}", warp_uuid);
         println!("Expected:  {}", expected_function_guid);
 
@@ -914,105 +982,14 @@ mod test {
         // Assertions for test validation
         assert!(function_size > 0, "Function size should be greater than 0");
         assert!(blocks.len() > 0, "Should have at least one basic block");
-        
+
         // Return statistics: (size_diff, blocks_matched, blocks_total, guid_match)
         let size_diff = function_size as i64 - expected_size as i64;
-        (size_diff, matching_blocks, expected_blocks.len(), exact_match)
-    }
-
-    #[test]
-    fn test_function_at_0x140001bf4() {
-        #[rustfmt::skip]
-        test_warp_function_from_binary(
-            "main.exe",
-            0x140001bf4,
-            uuid!("863d236e-ccc8-530a-b3f6-4a95b6e8c5c7"),
-            vec![
-                (0x140001bf4, 0x140001c09, uuid!("5db95fec-4dad-552c-94d3-627ff36d7cb0")),
-                (0x140001c09, 0x140001c22, uuid!("20cf54a2-472d-53c7-91cc-d0f8e0e9cf35")),
-                (0x140001c22, 0x140001c2d, uuid!("0f3e9534-0651-5d76-962e-5c5ead3c4ce9")),
-                (0x140001c2d, 0x140001c47, uuid!("81d7f090-dd49-5e7e-bd20-5c221f4167aa")),
-                (0x140001c47, 0x140001c50, uuid!("499bb1d1-6b28-5214-97c6-a69395b199fb")),
-                (0x140001c50, 0x140001c58, uuid!("1c78b954-16d9-5bbb-be5a-77843834febc")),
-                (0x140001c58, 0x140001c62, uuid!("1f74bbf6-ad7a-5a08-8c3e-bfb46c8b1f05")),
-                (0x140001c62, 0x140001c68, uuid!("24f3129c-e976-5d87-87ca-f280c91f052e")),
-                (0x140001c68, 0x140001c6a, uuid!("15f95f37-8c6b-5380-a865-5b9c20aee758")),
-                (0x140001c6a, 0x140001c6f, uuid!("1eb72e47-4d18-570d-8f74-76097b144ae5")),
-                (0x140001c6f, 0x140001c73, uuid!("d7d7e2c2-91eb-5d6c-b224-f2dfc495a7f2")),
-                (0x140001c73, 0x140001c79, uuid!("697bca86-51b0-53a5-8011-fee3a94036dd")),
-                (0x140001c79, 0x140001c7d, uuid!("80878bdc-bd23-5ee6-9255-f7ac1601ee3e")),
-                (0x140001c7d, 0x140001c81, uuid!("64e0e563-c542-53ad-ba1a-ecbd87531d5e")),
-                (0x140001c81, 0x140001c85, uuid!("681a270c-c970-5903-a9fa-dc26e5936cee")),
-                (0x140001c87, 0x140001c8c, uuid!("70a456bd-29ce-5068-bb99-23603ccd3f79")),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_function_at_0x140001fb4() {
-        #[rustfmt::skip]
-        test_warp_function_from_binary(
-            "main.exe",
-            0x140001fb4,
-            uuid!("f3249490-0a5f-504a-9f54-54ae22bafd72"),
-            vec![
-                (0x140001fb4, 0x140001fda, uuid!("33a75e99-c87b-59ae-9356-8afb31aea91c")),
-                (0x140001fda, 0x140001fde, uuid!("1e43ade3-9175-5150-84ef-55b3bdaf3267")),
-                (0x140001fde, 0x140002022, uuid!("2073619d-f0b4-5522-b949-b3c10a2b57da")),
-                (0x140002022, 0x14000205e, uuid!("d2a8a192-4c7d-52ab-859a-6b2e4f4b2362")),
-                (0x14000205e, 0x1400020de, uuid!("65845881-bf33-5018-9fd6-1ffa86c12a94")),
-                (0x1400020de, 0x1400020e3, uuid!("61cc7aa6-a12c-5b1b-9d0c-4ed2a96e84d1")),
-                (0x1400020e3, 0x1400020eb, uuid!("fbf4ac1c-c2e1-5aa5-b821-dbf95b3de866")),
-                (0x1400020eb, 0x1400020fc, uuid!("81583611-164b-5957-9bf0-fcc1ae60ebee")),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_function_at_0x14000261c() {
-        #[rustfmt::skip]
-        test_warp_function_from_binary(
-            "main.exe",
-            0x14000261c,
-            uuid!("ff2ad3fe-a9bd-5a3e-bda0-6254eda45d80"),
-            vec![
-                (0x14000261c, 0x140002675, uuid!("5b4500a3-8306-53e1-a967-d4db5263143b")),
-                (0x140002675, 0x140002694, uuid!("47b5b1af-6cfd-55ad-9637-9c61fc365d52")),
-                (0x140002694, 0x14000269b, uuid!("0f198a01-e025-5dac-9ec9-7ebd811aadce")),
-                (0x14000269b, 0x1400026a2, uuid!("23139502-4b5b-5655-905f-6ed4ba97af48")),
-                (0x1400026a2, 0x1400026ac, uuid!("8a6d9b48-f329-5a9d-b8eb-b23ab85422f7")),
-                (0x1400026ac, 0x1400026bc, uuid!("117483da-d018-5b35-8f6e-3bdb3581fbbf")),
-                (0x1400026bc, 0x1400026d0, uuid!("689e9fbc-5e30-5ffe-bdf1-1d1cd9206b15")),
-                (0x1400026d0, 0x1400026d7, uuid!("f0ed3e54-1af6-5463-ad13-23805c5dd144")),
-                (0x1400026d7, 0x1400026e4, uuid!("f2c2fa36-6e71-5c5b-85bf-fbda941fd56f")),
-                (0x1400026e4, 0x140002700, uuid!("13729f44-b768-58a3-837c-a10b0cdf0bc8")),
-                (0x140002700, 0x14000270a, uuid!("b1233c4d-8e1a-5600-a383-4a5a7d389e79")),
-                (0x14000270a, 0x140002725, uuid!("01fd9f02-71cd-55ae-9506-07842f907e39")),
-                (0x140002725, 0x14000273d, uuid!("2df0e266-342f-5aa3-8953-578f14143825")),
-                (0x14000273d, 0x140002743, uuid!("833d89e3-a114-5178-9098-bf40d7f363d4")),
-                (0x140002743, 0x14000275f, uuid!("0c56fdc6-d6b6-5df1-a78a-1023d9c24388")),
-                (0x14000275f, 0x14000277e, uuid!("68035525-aebb-5796-b70c-d41386eecf57")),
-                (0x14000277e, 0x14000279e, uuid!("b7e2e581-9523-5871-97ab-54c514018208")),
-                (0x14000279e, 0x1400027a9, uuid!("ab687395-0a66-5cfa-ab10-fafcb6b8bf14")),
-                (0x1400027a9, 0x1400027b6, uuid!("c70dfa11-a2d0-50bb-8115-a1f485bf6518")),
-                (0x1400027b6, 0x1400027c8, uuid!("a895d010-9366-5396-8aae-a96f6f995d2f")),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_function_at_0x140001a2c() {
-        #[rustfmt::skip]
-        test_warp_function_from_binary(
-            "main.exe",
-            0x140001a2c,
-            uuid!("19756a88-3460-556c-8424-0fde3749c556"),
-            vec![
-                (0x140001a2c, 0x140001a54, uuid!("a2e70f91-bfdb-5aad-b913-b1128d081074")),
-                (0x140001a54, 0x140001a59, uuid!("730a5cf5-d682-5d84-abd1-1ee1556c6be7")),
-                (0x140001a59, 0x140001a6a, uuid!("77b84327-bd45-552f-9aa1-a37bb4dd27b8")),
-                (0x140001a6a, 0x140001a8c, uuid!("67d5fd1f-da0f-5793-9551-03dc644059b6")),
-            ],
-        );
+        (
+            size_diff,
+            matching_blocks,
+            expected_blocks.len(),
+            exact_match,
+        )
     }
 }
