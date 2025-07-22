@@ -1,0 +1,108 @@
+WARP Function Analysis Statistics
+==================================
+Generated at: SystemTime { tv_sec: 1753160921, tv_nsec: 822836839 }
+Total functions analyzed: 14
+
+Function #1 at 0x140e51460
+  Expected GUID: e88c9e8a-c183-5897-bf9e-893a9acbeeff
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 148/150 (98.7%)
+  GUID match: NO
+
+Function #2 at 0x141011000
+  Expected GUID: acacaca9-514f-5f5a-be30-046aca7a60aa
+  Expected blocks: 150
+  Size difference: 1 bytes
+  Blocks matched: 147/150 (98.0%)
+  GUID match: YES
+
+Function #3 at 0x141053ec0
+  Expected GUID: 4705c21c-ac6c-54c2-a6f2-72e183b281f0
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 109/150 (72.7%)
+  GUID match: NO
+
+Function #4 at 0x141064b80
+  Expected GUID: 561db413-93a9-5311-8a9a-9dbdfb549de6
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 150/150 (100.0%)
+  GUID match: YES
+
+Function #5 at 0x14115b900
+  Expected GUID: 2e3c4e9c-ac4a-5ac2-9341-225130fc04c5
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 140/150 (93.3%)
+  GUID match: NO
+
+Function #6 at 0x1413db410
+  Expected GUID: 768b8775-c726-5de7-aedb-289e7f897c55
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 23/150 (15.3%)
+  GUID match: NO
+
+Function #7 at 0x141bdd2c0
+  Expected GUID: 4a44af36-181b-575b-b104-a190279ec48e
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 60/150 (40.0%)
+  GUID match: NO
+
+Function #8 at 0x141dbc2e0
+  Expected GUID: cdd9121b-176d-5129-83eb-714c290d97c7
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 142/150 (94.7%)
+  GUID match: NO
+
+Function #9 at 0x14205b7b0
+  Expected GUID: f410bb70-6cad-5d40-b6ad-c8ee1bcad692
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 95/150 (63.3%)
+  GUID match: NO
+
+Function #10 at 0x1423a59f0
+  Expected GUID: ea548a60-8139-51ce-b671-5a1f6969f67b
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 146/150 (97.3%)
+  GUID match: NO
+
+Function #11 at 0x1427731e0
+  Expected GUID: c1e14748-8de7-5b4d-bfaf-814dc527f594
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 79/150 (52.7%)
+  GUID match: NO
+
+Function #12 at 0x143898920
+  Expected GUID: 49cc5b4f-28eb-59f7-82f4-b944853f5a4e
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 10/150 (6.7%)
+  GUID match: NO
+
+Function #13 at 0x1440e2370
+  Expected GUID: e612888a-b569-5947-b437-c84a093dba1a
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 149/150 (99.3%)
+  GUID match: NO
+
+Function #14 at 0x144797870
+  Expected GUID: be7bd952-71fd-58e7-afa1-632ec92a2313
+  Expected blocks: 150
+  Size difference: 0 bytes
+  Blocks matched: 4/150 (2.7%)
+  GUID match: NO
+
+Summary
+=======
+Functions with exact GUID match: 2/14 (14.3%)
+Functions with size mismatch: 1
+Total basic blocks matched: 1402/2100 (66.8%)

@@ -595,21 +595,77 @@ mod test {
 
     #[test]
     fn test_json() {
+        use std::io::Write;
+        
         let f = std::io::BufReader::new(std::fs::File::open("functions.json").unwrap());
         let functions: Vec<Function> = serde_json::from_reader(f).unwrap();
-        // dbg!(functions);
-        for function in functions {
-            test_warp_function_from_binary(
+        
+        let mut stats_file = std::fs::File::create("warp_test_stats.txt").unwrap();
+        writeln!(stats_file, "WARP Function Analysis Statistics").unwrap();
+        writeln!(stats_file, "==================================").unwrap();
+        writeln!(stats_file, "Generated at: {:?}", std::time::SystemTime::now()).unwrap();
+        writeln!(stats_file, "Total functions analyzed: {}", functions.len()).unwrap();
+        writeln!(stats_file).unwrap();
+        
+        let mut total_exact_matches = 0;
+        let mut total_size_mismatches = 0;
+        let mut total_blocks_analyzed = 0;
+        let mut total_blocks_matched = 0;
+        
+        for (idx, function) in functions.iter().enumerate() {
+            writeln!(stats_file, "Function #{} at 0x{:x}", idx + 1, function.start).unwrap();
+            writeln!(stats_file, "  Expected GUID: {}", function.guid).unwrap();
+            writeln!(stats_file, "  Expected blocks: {}", function.blocks.len()).unwrap();
+            
+            let (size_diff, blocks_matched, blocks_total, guid_match) = test_warp_function_from_binary_with_stats(
                 "/home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe",
                 function.start,
                 function.guid,
                 function
                     .blocks
-                    .into_iter()
+                    .iter()
                     .map(|b| (b.start, b.end, b.guid))
                     .collect(),
             );
+            
+            writeln!(stats_file, "  Size difference: {} bytes", size_diff).unwrap();
+            writeln!(stats_file, "  Blocks matched: {}/{} ({:.1}%)", 
+                blocks_matched, blocks_total, 
+                blocks_matched as f64 / blocks_total as f64 * 100.0).unwrap();
+            writeln!(stats_file, "  GUID match: {}", if guid_match { "YES" } else { "NO" }).unwrap();
+            writeln!(stats_file).unwrap();
+            
+            if guid_match {
+                total_exact_matches += 1;
+            }
+            if size_diff != 0 {
+                total_size_mismatches += 1;
+            }
+            total_blocks_analyzed += blocks_total;
+            total_blocks_matched += blocks_matched;
         }
+        
+        writeln!(stats_file, "Summary").unwrap();
+        writeln!(stats_file, "=======").unwrap();
+        writeln!(stats_file, "Functions with exact GUID match: {}/{} ({:.1}%)", 
+            total_exact_matches, functions.len(),
+            total_exact_matches as f64 / functions.len() as f64 * 100.0).unwrap();
+        writeln!(stats_file, "Functions with size mismatch: {}", total_size_mismatches).unwrap();
+        writeln!(stats_file, "Total basic blocks matched: {}/{} ({:.1}%)",
+            total_blocks_matched, total_blocks_analyzed,
+            total_blocks_matched as f64 / total_blocks_analyzed as f64 * 100.0).unwrap();
+    }
+
+    // Helper function to test WARP function from binary and return statistics
+    fn test_warp_function_from_binary_with_stats(
+        exe_path: impl AsRef<std::path::Path>,
+        function_address: u64,
+        expected_function_guid: Uuid,
+        expected_blocks: Vec<(u64, u64, Uuid)>,
+    ) -> (i64, usize, usize, bool) {
+        let (size_diff, blocks_matched, blocks_total, guid_match) = 
+            test_warp_function_from_binary_impl(exe_path, function_address, expected_function_guid, expected_blocks);
+        (size_diff, blocks_matched, blocks_total, guid_match)
     }
 
     // Helper function to test WARP function from binary
@@ -619,6 +675,16 @@ mod test {
         expected_function_guid: Uuid,
         expected_blocks: Vec<(u64, u64, Uuid)>,
     ) {
+        test_warp_function_from_binary_impl(exe_path, function_address, expected_function_guid, expected_blocks);
+    }
+    
+    // Implementation of test WARP function from binary
+    fn test_warp_function_from_binary_impl(
+        exe_path: impl AsRef<std::path::Path>,
+        function_address: u64,
+        expected_function_guid: Uuid,
+        expected_blocks: Vec<(u64, u64, Uuid)>,
+    ) -> (i64, usize, usize, bool) {
         // Load main.exe from root directory
         let pe = PeLoader::load(exe_path).expect("Failed to load main.exe");
 
@@ -746,6 +812,10 @@ mod test {
         // Assertions for test validation
         assert!(function_size > 0, "Function size should be greater than 0");
         assert!(blocks.len() > 0, "Should have at least one basic block");
+        
+        // Return statistics: (size_diff, blocks_matched, blocks_total, guid_match)
+        let size_diff = function_size as i64 - expected_size as i64;
+        (size_diff, matching_blocks, expected_blocks.len(), exact_match)
     }
 
     #[test]
