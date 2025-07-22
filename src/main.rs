@@ -610,9 +610,11 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
                 let current_ip = instruction.ip();
                 let distance = jump_target.abs_diff(current_ip);
 
-                // Tail calls typically jump far (>1KB) to other functions
+                // Tail calls typically jump far to other functions
+                // We use a conservative threshold to avoid false positives
+                // Most intra-function jumps are under 2KB
                 // TODO check against function bounds which is determined using its own heuristic?
-                if distance > 1024 {
+                if distance > 2048 {
                     return true;
                 }
             }
