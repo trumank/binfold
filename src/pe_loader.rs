@@ -153,26 +153,24 @@ impl PeLoader {
                     }
                     FlowControl::UnconditionalBranch => {
                         // Check if it's a tail call (jmp to external function)
-                        if let Some(target) = get_branch_target(instruction) {
-                            if target >= va && target < va + scan_size as u64 {
+                        if let Some(target) = get_branch_target(instruction)
+                            && target >= va && target < va + scan_size as u64 {
                                 // Internal jump - follow it
                                 queue.push_back(target);
                             }
                             // External jump - end of function
-                        }
                     }
                     FlowControl::ConditionalBranch => {
                         // Follow both paths
                         // println!("    -> ConditionalBranch: queueing fall-through 0x{:x}", *next_addr);
                         queue.push_back(*next_addr); // Fall through
 
-                        if let Some(target) = get_branch_target(instruction) {
-                            if target >= va && target < va + scan_size as u64 {
+                        if let Some(target) = get_branch_target(instruction)
+                            && target >= va && target < va + scan_size as u64 {
                                 // Internal jump - follow it
                                 // println!("    -> ConditionalBranch: queueing target 0x{:x}", target);
                                 queue.push_back(target);
                             }
-                        }
                     }
                     FlowControl::Return => {
                         // Return instruction - path ends here

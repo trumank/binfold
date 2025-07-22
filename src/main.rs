@@ -60,8 +60,8 @@ fn main() -> Result<()> {
             size,
         } => {
             let warp_uuid = compute_warp_uuid_from_pe(&file, address, size)?;
-            println!("Function at 0x{:x}:", address);
-            println!("WARP UUID: {}", warp_uuid);
+            println!("Function at 0x{address:x}:");
+            println!("WARP UUID: {warp_uuid}");
         }
         Commands::Example => {
             // Example x86_64 function bytes
@@ -77,7 +77,7 @@ fn main() -> Result<()> {
             ];
 
             let warp_uuid = compute_warp_uuid(&function_bytes, 0x1000);
-            println!("WARP UUID: {}", warp_uuid);
+            println!("WARP UUID: {warp_uuid}");
         }
     }
 
@@ -96,7 +96,7 @@ fn compute_warp_uuid_from_pe(path: &PathBuf, address: u64, size: Option<usize>) 
         }
     };
 
-    println!("Function size: 0x{:x} bytes", func_size);
+    println!("Function size: 0x{func_size:x} bytes");
 
     // Read function bytes
     let func_bytes = pe.read_at_va(address, func_size)?;
@@ -237,7 +237,7 @@ fn identify_block_boundaries(
     let mut block_starts = BTreeSet::new();
     block_starts.insert(base); // Entry point is always a block start
 
-    for (&addr, _) in instructions {
+    for &addr in instructions.keys() {
         // Block start if multiple incoming edges
         if incoming_edges.get(&addr).map(|s| s.len()).unwrap_or(0) > 1 {
             block_starts.insert(addr);
@@ -256,14 +256,13 @@ fn identify_block_boundaries(
     // Block starts after returns and unconditional jumps
     let mut prev_instruction: Option<&Instruction> = None;
     for (&addr, (instruction, _)) in instructions {
-        if let Some(prev) = prev_instruction {
-            if matches!(
+        if let Some(prev) = prev_instruction
+            && matches!(
                 prev.flow_control(),
                 FlowControl::UnconditionalBranch | FlowControl::Return
             ) {
                 block_starts.insert(addr);
             }
-        }
         prev_instruction = Some(instruction);
     }
 
@@ -369,7 +368,7 @@ fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64) -> Vec<u8> {
             bytes.extend(vec![0u8; instr_bytes.len()]);
         } else {
             // Use actual instruction bytes
-            bytes.extend_from_slice(&instr_bytes);
+            bytes.extend_from_slice(instr_bytes);
         }
     }
 
@@ -420,7 +419,7 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> (Vec<u8>
             ));
         } else {
             // Use actual instruction bytes
-            bytes.extend_from_slice(&instr_bytes);
+            bytes.extend_from_slice(instr_bytes);
             debug_info.push(format!(
                 "KEEP: 0x{:x}: {} | {:02x?}",
                 instruction.ip(),
@@ -482,8 +481,8 @@ fn has_implicit_extension(reg: Register) -> bool {
 
 fn is_relocatable_instruction(instruction: &Instruction) -> bool {
     // Check for direct calls - but only forward calls are relocatable
-    if instruction.mnemonic() == Mnemonic::Call {
-        if instruction.op_count() > 0 {
+    if instruction.mnemonic() == Mnemonic::Call
+        && instruction.op_count() > 0 {
             match instruction.op_kind(0) {
                 OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                     // All direct calls are relocatable
@@ -492,7 +491,6 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
                 _ => {}
             }
         }
-    }
 
     // Jumps are not considered relocatable in WARP
     // This includes both short and long jumps
@@ -568,8 +566,7 @@ fn print_disassembly_with_edges(raw_bytes: &[u8], base: u64) {
         formatter.format(&instruction, &mut output);
 
         println!(
-            "0x{:08x}  | {:3} | {:3} | {}",
-            addr, in_edges, out_edges, output
+            "0x{addr:08x}  | {in_edges:3} | {out_edges:3} | {output}"
         );
     }
 }
