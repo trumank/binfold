@@ -75,6 +75,8 @@ impl PeLoader {
         use std::collections::{HashSet, VecDeque};
 
         let max_scan = 0x10000; // Maximum function size to scan (64KB)
+        let tail_call_threshold = 0x100;
+
         let start_offset = self.rva_to_file_offset(va.saturating_sub(self.image_base))?;
 
         // Adjust max_scan if it would go past end of file
@@ -93,70 +95,15 @@ impl PeLoader {
         }
 
         // First decode all instructions in the scan range
-        let mut all_instructions = std::collections::BTreeMap::new();
+        // let mut all_instructions = std::collections::BTreeMap::new();
         let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
-
-        if ctx.debug_instructions {
-            use iced_x86::Formatter;
-
-            println!("\nDecoding instructions from 0x{:x}:", va);
-            let mut formatter = iced_x86::NasmFormatter::new();
-            let mut output = String::new();
-
-            while decoder.can_decode() && all_instructions.len() < 50 {
-                let addr = decoder.ip();
-                let instruction = decoder.decode();
-                let next_addr = decoder.ip();
-
-                output.clear();
-                formatter.format(&instruction, &mut output);
-                println!(
-                    "  0x{:x}: {} (flow: {:?})",
-                    addr,
-                    output,
-                    instruction.flow_control()
-                );
-
-                all_instructions.insert(addr, (instruction, next_addr));
-            }
-
-            if decoder.can_decode() {
-                println!("  ... (showing first 50 instructions)");
-            }
-
-            // Reset decoder for full scan
-            decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
-            all_instructions.clear();
-        }
-
-        let mut decode_count = 0;
-        while decoder.can_decode() {
-            let addr = decoder.ip();
-            let instruction = decoder.decode();
-            let next_addr = decoder.ip();
-
-            all_instructions.insert(addr, (instruction, next_addr));
-            decode_count += 1;
-
-            // Stop if we've decoded enough instructions (safety limit)
-            if decode_count > 2000 {
-                if ctx.debug_size {
-                    println!("  ... stopping at instruction limit (2000)");
-                }
-                break;
-            }
-        }
-
-        // Note: decoder.can_decode() returning false is expected at the scan limit
-
-        if ctx.debug_size {
-            println!("  Decoded {} instructions", all_instructions.len());
-        }
 
         // Now do recursive descent to find all reachable instructions
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
-        queue.push_back(va);
+        let mut tailcall_queue = VecDeque::new();
+
+        queue.push_back((va, None));
 
         let mut max_address = va;
 
@@ -164,24 +111,59 @@ impl PeLoader {
             println!("\nStarting recursive descent from 0x{:x}", va);
         }
 
-        while let Some(addr) = queue.pop_front() {
-            if visited.contains(&addr) {
+        while let Some((ip, from)) = queue.pop_front() {
+            if ctx.debug_size {
+                if let Some(from) = from {
+                    println!("  Disassembing @ 0x{ip:x} (from 0x{from:x})",);
+                } else {
+                    println!("  Disassembing @ 0x{ip:x}",);
+                }
+            }
+
+            if ip
+                .checked_sub(va)
+                .and_then(|pos| decoder.set_position(pos as usize).ok())
+                .is_some()
+            {
+                decoder.set_ip(ip);
+            } else {
+                if ctx.debug_size {
+                    println!("  Out of function bounds: 0x{ip:x}");
+                }
                 continue;
             }
-            visited.insert(addr);
-            if let Some((instruction, next_addr)) = all_instructions.get(&addr) {
+            while decoder.can_decode() && !visited.contains(&decoder.ip()) {
+                let instruction = decoder.decode();
+                let ip = instruction.ip();
+                visited.insert(ip);
+
+                if ctx.debug_size {
+                    use iced_x86::Formatter;
+                    let mut formatter = iced_x86::NasmFormatter::new();
+                    let mut output = String::new();
+                    formatter.format(&instruction, &mut output);
+                    println!(
+                        "    +{:<5x} 0x{:x}: {} (flow: {:?})",
+                        ip - va,
+                        ip,
+                        output,
+                        instruction.flow_control()
+                    );
+                }
+
                 // Update max address - but not for returns or interrupts
                 match instruction.flow_control() {
                     FlowControl::Return | FlowControl::Interrupt => {
                         // For returns and interrupts, the current instruction end is the max
-                        if addr + instruction.len() as u64 > max_address {
-                            max_address = addr + instruction.len() as u64;
+                        if ip + instruction.len() as u64 > max_address {
+                            max_address = ip + instruction.len() as u64;
                         }
                     }
                     _ => {
                         // For other instructions, track the next address
-                        if *next_addr > max_address {
-                            max_address = *next_addr;
+                        let next_addr = decoder.ip();
+                        if next_addr > max_address {
+                            max_address = next_addr;
                         }
                     }
                 }
@@ -189,61 +171,70 @@ impl PeLoader {
                 match instruction.flow_control() {
                     FlowControl::Next => {
                         // Continue to next instruction
-                        queue.push_back(*next_addr);
                     }
                     FlowControl::Call | FlowControl::IndirectCall => {
                         // For calls, always continue to next instruction
                         // (both direct and indirect calls return to the next instruction)
-                        queue.push_back(*next_addr);
                     }
                     FlowControl::UnconditionalBranch => {
                         // Check if it's a tail call (jmp to external function)
-                        if let Some(target) = get_branch_target(instruction)
+                        if let Some(target) = get_branch_target(&instruction)
                             && target >= va
                             && target < va + scan_size as u64
                         {
                             // Internal jump - follow it
-                            queue.push_back(target);
+                            tailcall_queue.push_back((target, Some(ip)));
                         }
+                        break;
                         // External jump - end of function
                     }
                     FlowControl::ConditionalBranch => {
                         // Follow both paths
-                        queue.push_back(*next_addr); // Fall through
-
-                        if let Some(target) = get_branch_target(instruction)
+                        if let Some(target) = get_branch_target(&instruction)
                             && target >= va
                             && target < va + scan_size as u64
                         {
                             // Internal jump - follow it
-                            queue.push_back(target);
+                            queue.push_back((target, Some(ip)));
                         }
                     }
                     FlowControl::Return => {
                         // Return instruction - path ends here
                         // println!("    -> Return: path ends");
+                        break;
                     }
                     FlowControl::IndirectBranch => {
                         // Indirect jump (like jmp rax or jmp [rax])
                         // We can't determine the target statically, but we should
                         // at least handle known patterns
                         if ctx.debug_size {
-                            println!("  Found indirect branch at 0x{:x}", addr);
+                            println!("  Found indirect branch at 0x{:x}", ip);
                         }
                         // For now, we can't follow indirect jumps
                         // This is a limitation that might cause us to miss code
+                        break;
                     }
                     _ => {
                         if ctx.debug_size {
                             println!(
                                 "  Unhandled flow control {:?} at 0x{:x}",
                                 instruction.flow_control(),
-                                addr
+                                ip
                             );
                         }
+                        break;
                     }
                 }
             }
+
+            tailcall_queue.retain(|item| {
+                if item.0 < max_address + tail_call_threshold {
+                    queue.push_back(item.clone());
+                    false
+                } else {
+                    true
+                }
+            });
         }
 
         let size = (max_address - va) as usize;

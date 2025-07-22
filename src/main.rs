@@ -4,6 +4,7 @@ use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, OpKind, Register,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::path::PathBuf;
 use uuid::{Uuid, uuid};
 
@@ -188,7 +189,12 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
     for (&start_addr, &end_addr) in basic_blocks.iter() {
         // println!("{:x?}", (start_addr - base, end_addr - base, base));
         let block_bytes = &raw_bytes[(start_addr - base) as usize..(end_addr - base) as usize];
-        let uuid = create_basic_block_guid(block_bytes, start_addr, ctx);
+        let uuid = create_basic_block_guid(
+            block_bytes,
+            start_addr,
+            base..(base + raw_bytes.len() as u64),
+            ctx,
+        );
         block_uuids.push((start_addr, uuid));
 
         if ctx.debug_guid {
@@ -466,12 +472,22 @@ fn get_branch_target(instruction: &Instruction) -> Option<u64> {
     }
 }
 
-fn create_basic_block_guid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
-    let instruction_bytes = get_instruction_bytes_for_guid(raw_bytes, base, ctx);
+fn create_basic_block_guid(
+    raw_bytes: &[u8],
+    base: u64,
+    function_bounds: Range<u64>,
+    ctx: &DebugContext,
+) -> Uuid {
+    let instruction_bytes = get_instruction_bytes_for_guid(raw_bytes, base, function_bounds, ctx);
     Uuid::new_v5(&BASIC_BLOCK_NAMESPACE, &instruction_bytes)
 }
 
-fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Vec<u8> {
+fn get_instruction_bytes_for_guid(
+    raw_bytes: &[u8],
+    base: u64,
+    function_bounds: Range<u64>,
+    ctx: &DebugContext,
+) -> Vec<u8> {
     use iced_x86::Formatter;
 
     let mut bytes = Vec::new();
@@ -507,7 +523,7 @@ fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64, ctx: &DebugContex
         }
 
         // Get instruction bytes, zeroing out relocatable instructions
-        if is_relocatable_instruction(&instruction) {
+        if is_relocatable_instruction(&instruction, function_bounds.clone()) {
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
             if ctx.debug_guid {
@@ -582,7 +598,7 @@ fn has_implicit_extension(reg: Register) -> bool {
     )
 }
 
-fn is_relocatable_instruction(instruction: &Instruction) -> bool {
+fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<u64>) -> bool {
     // Check for direct calls - but only forward calls are relocatable
     if instruction.mnemonic() == Mnemonic::Call && instruction.op_count() > 0 {
         match instruction.op_kind(0) {
@@ -606,15 +622,8 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
                     _ => 0,
                 };
 
-                // If the jump distance is large (likely to another function), treat as relocatable
-                let current_ip = instruction.ip();
-                let distance = jump_target.abs_diff(current_ip);
-
-                // Tail calls typically jump far to other functions
-                // We use a conservative threshold to avoid false positives
-                // Most intra-function jumps are under 2KB
-                // TODO check against function bounds which is determined using its own heuristic?
-                if distance > 2048 {
+                // Check if jump target is outside function bounds
+                if !function_bounds.contains(&jump_target) {
                     return true;
                 }
             }
@@ -984,6 +993,7 @@ mod test {
                 Some(create_basic_block_guid(
                     block_bytes,
                     start,
+                    function_address..(function_address + function_size as u64),
                     &DebugContext::default(),
                 ))
             } else {
