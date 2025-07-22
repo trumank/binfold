@@ -627,9 +627,23 @@ mod test {
             .find_function_size(function_address)
             .expect("Failed to determine function size");
 
+        // Calculate expected size from the blocks
+        let expected_size = if expected_blocks.is_empty() {
+            0
+        } else {
+            let last_block = expected_blocks
+                .iter()
+                .max_by_key(|(_, end, _)| end)
+                .unwrap();
+            (last_block.1 - function_address) as usize
+        };
+
         println!(
-            "Function at 0x{:x} has size: 0x{:x}",
-            function_address, function_size
+            "Function at 0x{:x}: detected size = 0x{:x}, expected size = 0x{:x} (diff = {})",
+            function_address,
+            function_size,
+            expected_size,
+            function_size as i64 - expected_size as i64
         );
 
         // Read the function bytes

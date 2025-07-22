@@ -73,7 +73,7 @@ impl PeLoader {
         use iced_x86::{Decoder, DecoderOptions, FlowControl};
         use std::collections::{HashSet, VecDeque};
 
-        let max_scan = 0x1000; // Maximum function size to scan (4KB)
+        let max_scan = 0x10000; // Maximum function size to scan (64KB)
         let start_offset = self.rva_to_file_offset(va.saturating_sub(self.image_base))?;
 
         // Adjust max_scan if it would go past end of file
@@ -107,15 +107,13 @@ impl PeLoader {
             decode_count += 1;
 
             // Stop if we've decoded enough instructions (safety limit)
-            if decode_count > 200 {
+            if decode_count > 2000 {
                 println!("  ... stopping at instruction limit");
                 break;
             }
         }
 
-        if !decoder.can_decode() {
-            println!("  Decoder stopped - can_decode() returned false");
-        }
+        // Note: decoder.can_decode() returning false is expected at the scan limit
 
         // Now do recursive descent to find all reachable instructions
         let mut visited = HashSet::new();
@@ -131,46 +129,55 @@ impl PeLoader {
                 continue;
             }
             visited.insert(addr);
-            // println!("  Visiting 0x{:x}", addr);
-
             if let Some((instruction, next_addr)) = all_instructions.get(&addr) {
-                // Update max address
-                if *next_addr > max_address {
-                    max_address = *next_addr;
+                // Update max address - but not for returns or interrupts
+                match instruction.flow_control() {
+                    FlowControl::Return | FlowControl::Interrupt => {
+                        // For returns and interrupts, the current instruction end is the max
+                        if addr + instruction.len() as u64 > max_address {
+                            max_address = addr + instruction.len() as u64;
+                        }
+                    }
+                    _ => {
+                        // For other instructions, track the next address
+                        if *next_addr > max_address {
+                            max_address = *next_addr;
+                        }
+                    }
                 }
 
                 match instruction.flow_control() {
                     FlowControl::Next => {
                         // Continue to next instruction
-                        // println!("    -> Next: queueing 0x{:x}", *next_addr);
                         queue.push_back(*next_addr);
                     }
                     FlowControl::Call | FlowControl::IndirectCall => {
                         // For calls, always continue to next instruction
                         // (both direct and indirect calls return to the next instruction)
-                        // println!("    -> Call: queueing 0x{:x}", *next_addr);
                         queue.push_back(*next_addr);
                     }
                     FlowControl::UnconditionalBranch => {
                         // Check if it's a tail call (jmp to external function)
                         if let Some(target) = get_branch_target(instruction)
-                            && target >= va && target < va + scan_size as u64 {
-                                // Internal jump - follow it
-                                queue.push_back(target);
-                            }
-                            // External jump - end of function
+                            && target >= va
+                            && target < va + scan_size as u64
+                        {
+                            // Internal jump - follow it
+                            queue.push_back(target);
+                        }
+                        // External jump - end of function
                     }
                     FlowControl::ConditionalBranch => {
                         // Follow both paths
-                        // println!("    -> ConditionalBranch: queueing fall-through 0x{:x}", *next_addr);
                         queue.push_back(*next_addr); // Fall through
 
                         if let Some(target) = get_branch_target(instruction)
-                            && target >= va && target < va + scan_size as u64 {
-                                // Internal jump - follow it
-                                // println!("    -> ConditionalBranch: queueing target 0x{:x}", target);
-                                queue.push_back(target);
-                            }
+                            && target >= va
+                            && target < va + scan_size as u64
+                        {
+                            // Internal jump - follow it
+                            queue.push_back(target);
+                        }
                     }
                     FlowControl::Return => {
                         // Return instruction - path ends here
