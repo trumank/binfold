@@ -467,48 +467,11 @@ fn get_branch_target(instruction: &Instruction) -> Option<u64> {
 }
 
 fn create_basic_block_guid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
-    let instruction_bytes = if ctx.debug_guid {
-        get_instruction_bytes_for_guid_debug(raw_bytes, base)
-    } else {
-        get_instruction_bytes_for_guid(raw_bytes, base)
-    };
+    let instruction_bytes = get_instruction_bytes_for_guid(raw_bytes, base, ctx);
     Uuid::new_v5(&BASIC_BLOCK_NAMESPACE, &instruction_bytes)
 }
 
-fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64) -> Vec<u8> {
-    let mut bytes = Vec::new();
-
-    let mut decoder = Decoder::new(64, raw_bytes, DecoderOptions::NONE);
-    decoder.set_ip(base);
-
-    while decoder.can_decode() {
-        let start = (decoder.ip() - base) as usize;
-        let instruction = decoder.decode();
-        let end = (decoder.ip() - base) as usize;
-        let instr_bytes = &raw_bytes[start..end];
-
-        // NOPs handling is complex - Binary Ninja seems to include them
-        // Only skip register-to-itself NOPs for hot-patching
-
-        // Skip instructions that set a register to itself (if they're effectively NOPs)
-        if is_register_to_itself_nop(&instruction) {
-            continue;
-        }
-
-        // Get instruction bytes, zeroing out relocatable instructions
-        if is_relocatable_instruction(&instruction) {
-            // Zero out relocatable instructions
-            bytes.extend(vec![0u8; instr_bytes.len()]);
-        } else {
-            // Use actual instruction bytes
-            bytes.extend_from_slice(instr_bytes);
-        }
-    }
-
-    bytes
-}
-
-fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> Vec<u8> {
+fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Vec<u8> {
     use iced_x86::Formatter;
 
     let mut bytes = Vec::new();
@@ -519,7 +482,9 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> Vec<u8> 
     let mut formatter = iced_x86::NasmFormatter::new();
     let mut output = String::new();
 
-    println!("  Instruction processing for GUID:");
+    if ctx.debug_guid {
+        println!("  Instruction processing for GUID:");
+    }
 
     while decoder.can_decode() {
         let start = (decoder.ip() - base) as usize;
@@ -535,7 +500,9 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> Vec<u8> 
 
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
-            println!("    SKIP REG2REG: 0x{:x}: {}", instruction.ip(), output);
+            if ctx.debug_guid {
+                println!("    SKIP REG2REG: 0x{:x}: {}", instruction.ip(), output);
+            }
             continue;
         }
 
@@ -543,21 +510,25 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> Vec<u8> 
         if is_relocatable_instruction(&instruction) {
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
-            println!(
-                "    ZERO RELOC: 0x{:x}: {} | {:02x?}",
-                instruction.ip(),
-                output,
-                instr_bytes
-            );
+            if ctx.debug_guid {
+                println!(
+                    "    ZERO RELOC: 0x{:x}: {} | {:02x?}",
+                    instruction.ip(),
+                    output,
+                    instr_bytes
+                );
+            }
         } else {
             // Use actual instruction bytes
             bytes.extend_from_slice(instr_bytes);
-            println!(
-                "    KEEP: 0x{:x}: {} | {:02x?}",
-                instruction.ip(),
-                output,
-                instr_bytes
-            );
+            if ctx.debug_guid {
+                println!(
+                    "    KEEP: 0x{:x}: {} | {:02x?}",
+                    instruction.ip(),
+                    output,
+                    instr_bytes
+                );
+            }
         }
     }
 
@@ -1017,14 +988,8 @@ mod test {
         for &(start, end, expected_guid) in &expected_blocks {
             let our_end = blocks.get(&start);
             let our_guid = if let Some(&actual_end) = our_end {
-                let block_end = if actual_end == end {
-                    end
-                } else {
-                    // Use the smaller of the two ends to avoid out of bounds
-                    std::cmp::min(actual_end, end)
-                };
                 let block_bytes = &function_bytes
-                    [(start - function_address) as usize..(block_end - function_address) as usize];
+                    [(start - function_address) as usize..(actual_end - function_address) as usize];
                 Some(create_basic_block_guid(
                     block_bytes,
                     start,
