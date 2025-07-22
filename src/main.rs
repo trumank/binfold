@@ -594,8 +594,31 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
         }
     }
 
-    // Jumps are not considered relocatable in WARP
-    // This includes both short and long jumps
+    // Check for tail call jumps (unconditional jumps that likely go to other functions)
+    if instruction.mnemonic() == Mnemonic::Jmp && instruction.op_count() > 0 {
+        match instruction.op_kind(0) {
+            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                // Get the jump target
+                let jump_target = match instruction.op_kind(0) {
+                    OpKind::NearBranch16 => instruction.near_branch16() as u64,
+                    OpKind::NearBranch32 => instruction.near_branch32() as u64,
+                    OpKind::NearBranch64 => instruction.near_branch64(),
+                    _ => 0,
+                };
+
+                // If the jump distance is large (likely to another function), treat as relocatable
+                let current_ip = instruction.ip();
+                let distance = jump_target.abs_diff(current_ip);
+
+                // Tail calls typically jump far (>1KB) to other functions
+                // TODO check against function bounds which is determined using its own heuristic?
+                if distance > 1024 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
 
     // Check for RIP-relative memory operands
     for i in 0..instruction.op_count() {
