@@ -10,16 +10,17 @@ use uuid::{Uuid, uuid};
 
 mod pe_loader;
 use pe_loader::PeLoader;
+mod pdb_analyzer;
 
 const FUNCTION_NAMESPACE: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
 const BASIC_BLOCK_NAMESPACE: Uuid = uuid!("0192a178-7a5f-7936-8653-3cbaa7d6afe7");
 
 #[derive(Debug, Clone, Default)]
-struct DebugContext {
-    debug_size: bool,
-    debug_blocks: bool,
-    debug_instructions: bool,
-    debug_guid: bool,
+pub struct DebugContext {
+    pub debug_size: bool,
+    pub debug_blocks: bool,
+    pub debug_instructions: bool,
+    pub debug_guid: bool,
 }
 
 #[derive(Parser)]
@@ -67,6 +68,29 @@ enum Commands {
 
     /// Run the example function
     Example,
+
+    /// Analyze PDB file and compute GUIDs for all functions
+    Pdb {
+        /// Path to the PE/EXE file
+        #[arg(short = 'e', long = "exe")]
+        exe_path: PathBuf,
+
+        /// Path to the PDB file (defaults to exe path with .pdb extension)
+        #[arg(short = 'p', long = "pdb")]
+        pdb_path: Option<PathBuf>,
+
+        /// Enable debug output
+        #[arg(short, long)]
+        debug: bool,
+
+        /// Output format (json or text)
+        #[arg(short = 'f', long = "format", default_value = "text")]
+        format: String,
+
+        /// Limit number of functions to process (for testing)
+        #[arg(short = 'l', long = "limit")]
+        limit: Option<usize>,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
@@ -137,6 +161,97 @@ fn main() -> Result<()> {
             let warp_uuid = compute_warp_uuid(&function_bytes, 0x1000, &DebugContext::default());
             println!("WARP UUID: {warp_uuid}");
         }
+        Commands::Pdb {
+            exe_path,
+            pdb_path,
+            debug,
+            format,
+            limit,
+        } => {
+            use pdb_analyzer::PdbAnalyzer;
+
+            // Derive PDB path from EXE path if not provided
+            let pdb_path = pdb_path.unwrap_or_else(|| {
+                let mut path = exe_path.clone();
+                path.set_extension("pdb");
+                path
+            });
+
+            let debug_context = if debug {
+                DebugContext {
+                    debug_size: true,
+                    debug_blocks: true,
+                    debug_instructions: false,
+                    debug_guid: true,
+                }
+            } else {
+                DebugContext::default()
+            };
+
+            let mut analyzer = PdbAnalyzer::new(&exe_path, &pdb_path)?;
+            let mut function_guids = analyzer.compute_function_guids(&debug_context)?;
+
+            // Apply limit if specified
+            if let Some(limit) = limit {
+                function_guids.truncate(limit);
+            }
+
+            match format.as_str() {
+                "json" => {
+                    use serde::Serialize;
+
+                    #[derive(Serialize)]
+                    struct JsonOutput {
+                        exe_path: String,
+                        pdb_path: String,
+                        function_count: usize,
+                        functions: Vec<JsonFunction>,
+                    }
+
+                    #[derive(Serialize)]
+                    struct JsonFunction {
+                        name: String,
+                        address: String,
+                        size: Option<u32>,
+                        guid: String,
+                    }
+
+                    let output = JsonOutput {
+                        exe_path: exe_path.display().to_string(),
+                        pdb_path: pdb_path.display().to_string(),
+                        function_count: function_guids.len(),
+                        functions: function_guids
+                            .into_iter()
+                            .map(|f| JsonFunction {
+                                name: f.name,
+                                address: format!("0x{:x}", f.address),
+                                size: f.size,
+                                guid: f.guid.to_string(),
+                            })
+                            .collect(),
+                    };
+
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                }
+                _ => {
+                    println!("PDB Analysis Results");
+                    println!("===================");
+                    println!("EXE: {}", exe_path.display());
+                    println!("PDB: {}", pdb_path.display());
+                    println!("Total functions found: {}\n", function_guids.len());
+
+                    for func in &function_guids {
+                        println!("Function: {}", func.name);
+                        println!("  Address: 0x{:x}", func.address);
+                        if let Some(size) = func.size {
+                            println!("  Size: {} bytes", size);
+                        }
+                        println!("  GUID: {}", func.guid);
+                        println!();
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -176,7 +291,7 @@ fn compute_warp_uuid_from_pe(
     Ok(compute_warp_uuid(func_bytes, address, ctx))
 }
 
-fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
+pub fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
     // Disassemble and identify basic blocks
     let basic_blocks = identify_basic_blocks(raw_bytes, base, ctx);
 
@@ -384,7 +499,11 @@ fn identify_block_boundaries(
     block_starts
 }
 
-fn identify_basic_blocks(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> BTreeMap<u64, u64> {
+pub fn identify_basic_blocks(
+    raw_bytes: &[u8],
+    base: u64,
+    ctx: &DebugContext,
+) -> BTreeMap<u64, u64> {
     let instructions = decode_instructions(raw_bytes, base);
 
     if ctx.debug_blocks {

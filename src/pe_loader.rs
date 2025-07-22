@@ -8,7 +8,7 @@ use std::path::Path;
 
 pub struct PeLoader {
     mmap: Mmap,
-    image_base: u64,
+    pub image_base: u64,
 }
 
 impl PeLoader {
