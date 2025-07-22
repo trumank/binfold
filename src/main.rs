@@ -916,4 +916,119 @@ mod test {
             }
         }
     }
+
+    #[test]
+    fn test_from_binary() {
+        // Load main.exe from root directory
+        let exe_path = std::path::PathBuf::from("main.exe");
+        let pe = PeLoader::load(&exe_path).expect("Failed to load main.exe");
+        
+        // Address where test_big function is located
+        let function_address = 0x1400015ec;
+        
+        // Use the heuristic to find function size
+        let function_size = pe.find_function_size(function_address)
+            .expect("Failed to determine function size");
+        
+        println!("Function at 0x{:x} has size: 0x{:x}", function_address, function_size);
+        
+        // Read the function bytes
+        let function_bytes = pe.read_at_va(function_address, function_size)
+            .expect("Failed to read function bytes");
+        
+        // Print last few bytes for debugging
+        println!("Last 20 bytes from binary: {:02x?}", &function_bytes[function_bytes.len().saturating_sub(20)..]);
+        println!("Last 20 bytes from TEST:   {:02x?}", &TEST_FUNCTION_BYTES[TEST_FUNCTION_BYTES.len().saturating_sub(20)..]);
+        
+        // Verify the bytes match TEST_FUNCTION_BYTES
+        assert_eq!(function_bytes.len(), TEST_FUNCTION_BYTES.len(), 
+            "Function size mismatch: got {} bytes, expected {} bytes", 
+            function_bytes.len(), TEST_FUNCTION_BYTES.len());
+        
+        assert_eq!(function_bytes, TEST_FUNCTION_BYTES,
+            "Function bytes don't match expected bytes");
+        
+        // Compute the WARP UUID
+        let warp_uuid = compute_warp_uuid(function_bytes, function_address);
+        println!("WARP UUID from binary: {}", warp_uuid);
+        
+        // Verify it matches the expected UUID
+        assert_eq!(warp_uuid, "1e607388-3f66-59cd-8e32-89dd0df7925f",
+            "WARP UUID doesn't match expected value");
+    }
+
+    #[test]
+    fn test_function_at_0x140001bf4() {
+        // Load main.exe from root directory
+        let exe_path = std::path::PathBuf::from("main.exe");
+        let pe = PeLoader::load(&exe_path).expect("Failed to load main.exe");
+        
+        // Function at 0x140001bf4
+        let function_address = 0x140001bf4;
+        
+        // Use the heuristic to find function size
+        let function_size = pe.find_function_size(function_address)
+            .expect("Failed to determine function size");
+        
+        println!("Function at 0x{:x} has size: 0x{:x}", function_address, function_size);
+        
+        // Read the function bytes
+        let function_bytes = pe.read_at_va(function_address, function_size)
+            .expect("Failed to read function bytes");
+        
+        // Expected basic block GUIDs from Binary Ninja
+        let expected_blocks = vec![
+            (0x140001bf4, 0x140001c09, "5db95fec-4dad-552c-94d3-627ff36d7cb0"),
+            (0x140001c09, 0x140001c22, "20cf54a2-472d-53c7-91cc-d0f8e0e9cf35"),
+            (0x140001c22, 0x140001c2d, "0f3e9534-0651-5d76-962e-5c5ead3c4ce9"),
+            (0x140001c2d, 0x140001c47, "81d7f090-dd49-5e7e-bd20-5c221f4167aa"),
+            (0x140001c47, 0x140001c50, "499bb1d1-6b28-5214-97c6-a69395b199fb"),
+            (0x140001c50, 0x140001c58, "1c78b954-16d9-5bbb-be5a-77843834febc"),
+            (0x140001c58, 0x140001c62, "1f74bbf6-ad7a-5a08-8c3e-bfb46c8b1f05"),
+            (0x140001c62, 0x140001c68, "24f3129c-e976-5d87-87ca-f280c91f052e"),
+            (0x140001c68, 0x140001c6a, "15f95f37-8c6b-5380-a865-5b9c20aee758"),
+            (0x140001c6a, 0x140001c6f, "1eb72e47-4d18-570d-8f74-76097b144ae5"),
+            (0x140001c6f, 0x140001c73, "d7d7e2c2-91eb-5d6c-b224-f2dfc495a7f2"),
+            (0x140001c73, 0x140001c79, "697bca86-51b0-53a5-8011-fee3a94036dd"),
+            (0x140001c79, 0x140001c7d, "80878bdc-bd23-5ee6-9255-f7ac1601ee3e"),
+            (0x140001c7d, 0x140001c81, "64e0e563-c542-53ad-ba1a-ecbd87531d5e"),
+            (0x140001c81, 0x140001c85, "681a270c-c970-5903-a9fa-dc26e5936cee"),
+            (0x140001c87, 0x140001c8c, "70a456bd-29ce-5068-bb99-23603ccd3f79"),
+        ];
+        
+        // Compute basic blocks
+        let blocks = identify_basic_blocks(function_bytes, function_address);
+        
+        println!("\nComparing basic blocks:");
+        println!("Start       | End         | Our GUID                             | Expected GUID                        | Match");
+        println!("------------|-------------|--------------------------------------|--------------------------------------|-------");
+        
+        for &(start, end, expected_guid) in &expected_blocks {
+            let our_end = blocks.get(&start);
+            let our_guid = if our_end == Some(&end) {
+                let block_bytes = &function_bytes[(start - function_address) as usize..(end - function_address) as usize];
+                create_basic_block_guid(block_bytes, start).to_string()
+            } else {
+                "BLOCK NOT FOUND".to_string()
+            };
+            
+            let guid_match = our_guid == expected_guid;
+            println!(
+                "0x{:08x} | 0x{:08x} | {} | {} | {}",
+                start,
+                end,
+                our_guid,
+                expected_guid,
+                if guid_match { "YES" } else { "NO" }
+            );
+        }
+        
+        // Compute WARP UUID
+        let warp_uuid = compute_warp_uuid(function_bytes, function_address);
+        println!("\nWARP UUID: {}", warp_uuid);
+        
+        // Verify it matches the expected UUID
+        assert_eq!(warp_uuid, "863d236e-ccc8-530a-b3f6-4a95b6e8c5c7",
+            "WARP UUID doesn't match expected value");
+    }
 }

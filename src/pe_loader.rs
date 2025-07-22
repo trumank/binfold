@@ -67,59 +67,93 @@ impl PeLoader {
     }
 
     /// Find a function at the given address and return its approximate size
-    /// This is a heuristic - it looks for RET instructions or the next function
+    /// Uses recursive descent to follow all code paths
     pub fn find_function_size(&self, va: u64) -> Result<usize, Box<dyn std::error::Error>> {
-        use iced_x86::{Decoder, DecoderOptions, FlowControl};
-
+        use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
+        use std::collections::{HashSet, VecDeque};
+        
         let max_scan = 0x1000; // Maximum function size to scan (4KB)
         let start_offset = self.rva_to_file_offset(va.saturating_sub(self.image_base))?;
-
+        
         // Adjust max_scan if it would go past end of file
         let available = self.mmap.len().saturating_sub(start_offset);
         let scan_size = max_scan.min(available);
-
+        
         if scan_size == 0 {
             return Err("No bytes available to scan".into());
         }
-
+        
         let bytes = &self.mmap[start_offset..start_offset + scan_size];
+        
+        // First decode all instructions in the scan range
+        let mut all_instructions = std::collections::BTreeMap::new();
         let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
-
-        let mut size = 0;
-        let mut found_ret = false;
-
-        while decoder.can_decode() && !found_ret {
+        
+        while decoder.can_decode() {
+            let addr = decoder.ip();
             let instruction = decoder.decode();
-            let instr_end = (decoder.ip() - va) as usize;
-
-            match instruction.flow_control() {
-                FlowControl::Return => {
-                    size = instr_end;
-                    found_ret = true;
+            let next_addr = decoder.ip();
+            all_instructions.insert(addr, (instruction, next_addr));
+        }
+        
+        // Now do recursive descent to find all reachable instructions
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(va);
+        
+        let mut max_address = va;
+        
+        while let Some(addr) = queue.pop_front() {
+            if visited.contains(&addr) {
+                continue;
+            }
+            visited.insert(addr);
+            
+            if let Some((instruction, next_addr)) = all_instructions.get(&addr) {
+                // Update max address
+                if *next_addr > max_address {
+                    max_address = *next_addr;
                 }
-                FlowControl::UnconditionalBranch => {
-                    // Check if it's a tail call (jmp to external function)
-                    if let Some(target) = get_branch_target(&instruction) {
-                        if target < self.image_base || target > self.image_base + 0x10000000 {
-                            // Likely a tail call
-                            size = instr_end;
-                            found_ret = true;
+                
+                match instruction.flow_control() {
+                    FlowControl::Next | FlowControl::Call => {
+                        // Continue to next instruction
+                        queue.push_back(*next_addr);
+                    }
+                    FlowControl::UnconditionalBranch => {
+                        // Check if it's a tail call (jmp to external function)
+                        if let Some(target) = get_branch_target(instruction) {
+                            if target >= va && target < va + scan_size as u64 {
+                                // Internal jump - follow it
+                                queue.push_back(target);
+                            }
+                            // External jump - end of function
                         }
                     }
+                    FlowControl::ConditionalBranch => {
+                        // Follow both paths
+                        queue.push_back(*next_addr); // Fall through
+                        
+                        if let Some(target) = get_branch_target(instruction) {
+                            if target >= va && target < va + scan_size as u64 {
+                                // Internal jump - follow it
+                                queue.push_back(target);
+                            }
+                        }
+                    }
+                    FlowControl::Return => {
+                        // Return instruction - path ends here
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-
-            // Update size even if we haven't found ret yet
-            if !found_ret {
-                size = instr_end;
             }
         }
-
+        
+        let size = (max_address - va) as usize;
         if size == 0 {
             return Err("Could not determine function size".into());
         }
-
+        
         Ok(size)
     }
 }
