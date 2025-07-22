@@ -86,15 +86,12 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> String {
             println!("  0x{:x}: {}", instruction.ip(), output);
         }
     }
-    // Sort by address (highest to lowest)
-    for (start_addr, uuid) in block_uuids.iter() {
-        println!("0x{start_addr:x}: {uuid}");
-    }
-
     // Combine block UUIDs to create function UUID
+    // Note: Despite WARP spec saying "highest to lowest", Binary Ninja
+    // actually combines them in low-to-high address order
     let namespace = uuid::Uuid::parse_str(FUNCTION_NAMESPACE).unwrap();
     let mut combined_bytes = Vec::new();
-    for (_, uuid) in block_uuids.iter().rev() {
+    for (_, uuid) in block_uuids.iter() {
         combined_bytes.extend_from_slice(uuid.as_bytes());
     }
 
@@ -690,6 +687,9 @@ mod test {
         // Compute WARP UUID
         let warp_uuid = compute_warp_uuid(TEST_FUNCTION_BYTES, base);
         println!("\nWARP UUID: {}", warp_uuid);
+        
+        // Verify the WARP UUID matches Binary Ninja's result
+        assert_eq!(warp_uuid, "1e607388-3f66-59cd-8e32-89dd0df7925f");
     }
 
     #[test]
