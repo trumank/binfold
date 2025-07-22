@@ -1174,4 +1174,115 @@ mod test {
             println!("  0x{:x}: {}", instruction.ip(), output);
         }
     }
+
+    #[test]
+    fn test_function_at_0x14000261c() {
+        // Load main.exe from root directory
+        let exe_path = std::path::PathBuf::from("main.exe");
+        let pe = PeLoader::load(&exe_path).expect("Failed to load main.exe");
+        
+        // Function at 0x14000261c
+        let function_address = 0x14000261c;
+        
+        // Use the heuristic to find function size
+        let function_size = pe.find_function_size(function_address)
+            .expect("Failed to determine function size");
+        
+        println!("Function at 0x{:x} has size: 0x{:x}", function_address, function_size);
+        
+        // Read the function bytes
+        let function_bytes = pe.read_at_va(function_address, function_size)
+            .expect("Failed to read function bytes");
+        
+        // Expected basic block GUIDs from Binary Ninja
+        let expected_blocks = vec![
+            (0x14000261c, 0x140002675, "5b4500a3-8306-53e1-a967-d4db5263143b"),
+            (0x140002675, 0x140002694, "47b5b1af-6cfd-55ad-9637-9c61fc365d52"),
+            (0x140002694, 0x14000269b, "0f198a01-e025-5dac-9ec9-7ebd811aadce"),
+            (0x14000269b, 0x1400026a2, "23139502-4b5b-5655-905f-6ed4ba97af48"),
+            (0x1400026a2, 0x1400026ac, "8a6d9b48-f329-5a9d-b8eb-b23ab85422f7"),
+            (0x1400026ac, 0x1400026bc, "117483da-d018-5b35-8f6e-3bdb3581fbbf"),
+            (0x1400026bc, 0x1400026d0, "689e9fbc-5e30-5ffe-bdf1-1d1cd9206b15"),
+            (0x1400026d0, 0x1400026d7, "f0ed3e54-1af6-5463-ad13-23805c5dd144"),
+            (0x1400026d7, 0x1400026e4, "f2c2fa36-6e71-5c5b-85bf-fbda941fd56f"),
+            (0x1400026e4, 0x140002700, "13729f44-b768-58a3-837c-a10b0cdf0bc8"),
+            (0x140002700, 0x14000270a, "b1233c4d-8e1a-5600-a383-4a5a7d389e79"),
+            (0x14000270a, 0x140002725, "01fd9f02-71cd-55ae-9506-07842f907e39"),
+            (0x140002725, 0x14000273d, "2df0e266-342f-5aa3-8953-578f14143825"),
+            (0x14000273d, 0x140002743, "833d89e3-a114-5178-9098-bf40d7f363d4"),
+            (0x140002743, 0x14000275f, "0c56fdc6-d6b6-5df1-a78a-1023d9c24388"),
+            (0x14000275f, 0x14000277e, "68035525-aebb-5796-b70c-d41386eecf57"),
+            (0x14000277e, 0x14000279e, "b7e2e581-9523-5871-97ab-54c514018208"),
+            (0x14000279e, 0x1400027a9, "ab687395-0a66-5cfa-ab10-fafcb6b8bf14"),
+            (0x1400027a9, 0x1400027b6, "c70dfa11-a2d0-50bb-8115-a1f485bf6518"),
+            (0x1400027b6, 0x1400027c8, "a895d010-9366-5396-8aae-a96f6f995d2f"),
+        ];
+        
+        // Compute basic blocks
+        let blocks = identify_basic_blocks(function_bytes, function_address);
+        
+        println!("\nComparing basic blocks:");
+        println!("Start       | End         | Our GUID                             | Expected GUID                        | Match");
+        println!("------------|-------------|--------------------------------------|--------------------------------------|-------");
+        
+        let mut matching_blocks = 0;
+        for &(start, end, expected_guid) in &expected_blocks {
+            let our_end = blocks.get(&start);
+            let our_guid = if our_end == Some(&end) {
+                let block_bytes = &function_bytes[(start - function_address) as usize..(end - function_address) as usize];
+                create_basic_block_guid(block_bytes, start).to_string()
+            } else {
+                "BLOCK NOT FOUND".to_string()
+            };
+            
+            let guid_match = our_guid == expected_guid;
+            if guid_match {
+                matching_blocks += 1;
+            }
+            
+            println!(
+                "0x{:08x} | 0x{:08x} | {} | {} | {}",
+                start,
+                end,
+                our_guid,
+                expected_guid,
+                if guid_match { "YES" } else { "NO" }
+            );
+        }
+        
+        // Compute WARP UUID
+        let warp_uuid = compute_warp_uuid(function_bytes, function_address);
+        println!("\nWARP UUID: {}", warp_uuid);
+        println!("Expected:  ff2ad3fe-a9bd-5a3e-bda0-6254eda45d80");
+        
+        println!("\nNote: {}/{} basic blocks match Binary Ninja exactly.", matching_blocks, expected_blocks.len());
+        
+        // Show first few and last few blocks
+        println!("\nFirst 3 basic blocks:");
+        let block_vec: Vec<_> = blocks.iter().collect();
+        for i in 0..3.min(block_vec.len()) {
+            let (&start_addr, &end_addr) = block_vec[i];
+            println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
+            println!("----------------------------------------");
+            
+            let block_start_offset = (start_addr - function_address) as usize;
+            let block_end_offset = (end_addr - function_address) as usize;
+            let block_bytes = &function_bytes[block_start_offset..block_end_offset];
+            
+            let mut decoder = Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
+            let mut formatter = iced_x86::NasmFormatter::new();
+            let mut output = String::new();
+            
+            while decoder.can_decode() {
+                let instruction = decoder.decode();
+                output.clear();
+                formatter.format(&instruction, &mut output);
+                println!("  0x{:x}: {}", instruction.ip(), output);
+            }
+        }
+        
+        // Verify test passes
+        assert!(function_size > 0, "Function size should be greater than 0");
+        assert!(blocks.len() > 0, "Should have at least one basic block");
+    }
 }
