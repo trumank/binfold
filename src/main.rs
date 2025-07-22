@@ -187,6 +187,7 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
     // Create UUID for each basic block
     let mut block_uuids = Vec::new();
     for (&start_addr, &end_addr) in basic_blocks.iter() {
+        // println!("{:x?}", (start_addr - base, end_addr - base, base));
         let block_bytes = &raw_bytes[(start_addr - base) as usize..(end_addr - base) as usize];
         let uuid = create_basic_block_guid(block_bytes, start_addr, ctx);
         block_uuids.push((start_addr, uuid));
@@ -287,7 +288,9 @@ fn build_control_flow_graph(
                 }
                 FlowControl::UnconditionalBranch => {
                     // Unconditional jump - edge to target only
-                    if let Some(target) = get_branch_target(instruction) {
+                    if let Some(target) = get_branch_target(instruction)
+                        && instructions.contains_key(&target)
+                    {
                         outgoing_edges.entry(addr).or_default().insert(target);
                         incoming_edges.entry(target).or_default().insert(addr);
                         queue.push_back(target);
@@ -299,7 +302,9 @@ fn build_control_flow_graph(
                     incoming_edges.entry(*next_addr).or_default().insert(addr);
                     queue.push_back(*next_addr);
 
-                    if let Some(target) = get_branch_target(instruction) {
+                    if let Some(target) = get_branch_target(instruction)
+                        && instructions.contains_key(&target)
+                    {
                         outgoing_edges.entry(addr).or_default().insert(target);
                         incoming_edges.entry(target).or_default().insert(addr);
                         queue.push_back(target);
@@ -447,7 +452,9 @@ fn identify_basic_blocks(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> BTr
             }
         }
 
-        basic_blocks.insert(start, end);
+        if start != end {
+            basic_blocks.insert(start, end);
+        }
     }
 
     basic_blocks
