@@ -69,7 +69,7 @@ impl PeLoader {
     /// Find a function at the given address and return its approximate size
     /// Uses recursive descent to follow all code paths
     pub fn find_function_size(&self, va: u64) -> Result<usize, Box<dyn std::error::Error>> {
-        use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
+        use iced_x86::{Decoder, DecoderOptions, FlowControl};
         use std::collections::{HashSet, VecDeque};
         
         let max_scan = 0x1000; // Maximum function size to scan (4KB)
@@ -89,11 +89,31 @@ impl PeLoader {
         let mut all_instructions = std::collections::BTreeMap::new();
         let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
         
+        // println!("\nDecoding instructions from 0x{:x}:", va);
+        
+        let mut decode_count = 0;
         while decoder.can_decode() {
             let addr = decoder.ip();
             let instruction = decoder.decode();
             let next_addr = decoder.ip();
+            
+            // Format and print the instruction
+            // output.clear();
+            // formatter.format(&instruction, &mut output);
+            // println!("  0x{:x}: {} (flow: {:?})", addr, output, instruction.flow_control());
+            
             all_instructions.insert(addr, (instruction, next_addr));
+            decode_count += 1;
+            
+            // Stop if we've decoded enough instructions (safety limit)
+            if decode_count > 200 {
+                println!("  ... stopping at instruction limit");
+                break;
+            }
+        }
+        
+        if !decoder.can_decode() {
+            println!("  Decoder stopped - can_decode() returned false");
         }
         
         // Now do recursive descent to find all reachable instructions
@@ -103,11 +123,14 @@ impl PeLoader {
         
         let mut max_address = va;
         
+        // println!("\nStarting recursive descent from 0x{:x}", va);
+        
         while let Some(addr) = queue.pop_front() {
             if visited.contains(&addr) {
                 continue;
             }
             visited.insert(addr);
+            // println!("  Visiting 0x{:x}", addr);
             
             if let Some((instruction, next_addr)) = all_instructions.get(&addr) {
                 // Update max address
@@ -116,8 +139,15 @@ impl PeLoader {
                 }
                 
                 match instruction.flow_control() {
-                    FlowControl::Next | FlowControl::Call => {
+                    FlowControl::Next => {
                         // Continue to next instruction
+                        // println!("    -> Next: queueing 0x{:x}", *next_addr);
+                        queue.push_back(*next_addr);
+                    }
+                    FlowControl::Call | FlowControl::IndirectCall => {
+                        // For calls, always continue to next instruction
+                        // (both direct and indirect calls return to the next instruction)
+                        // println!("    -> Call: queueing 0x{:x}", *next_addr);
                         queue.push_back(*next_addr);
                     }
                     FlowControl::UnconditionalBranch => {
@@ -132,19 +162,24 @@ impl PeLoader {
                     }
                     FlowControl::ConditionalBranch => {
                         // Follow both paths
+                        // println!("    -> ConditionalBranch: queueing fall-through 0x{:x}", *next_addr);
                         queue.push_back(*next_addr); // Fall through
                         
                         if let Some(target) = get_branch_target(instruction) {
                             if target >= va && target < va + scan_size as u64 {
                                 // Internal jump - follow it
+                                // println!("    -> ConditionalBranch: queueing target 0x{:x}", target);
                                 queue.push_back(target);
                             }
                         }
                     }
                     FlowControl::Return => {
                         // Return instruction - path ends here
+                        // println!("    -> Return: path ends");
                     }
-                    _ => {}
+                    _ => {
+                        // println!("    -> {:?}: not handled", instruction.flow_control());
+                    }
                 }
             }
         }
