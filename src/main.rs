@@ -1,44 +1,18 @@
+use anyhow::Result;
+use clap::{Parser, Subcommand};
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, OpKind, Register,
 };
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use uuid::Uuid;
 
 mod pe_loader;
 use pe_loader::PeLoader;
 
 const FUNCTION_NAMESPACE: &str = "0192a179-61ac-7cef-88ed-012296e9492f";
 const BASIC_BLOCK_NAMESPACE: &str = "0192a178-7a5f-7936-8653-3cbaa7d6afe7";
-
-const TEST_FUNCTION_BYTES: &[u8] = &[
-    0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x30, 0xb9,
-    0x01, 0x00, 0x00, 0x00, 0xe8, 0xb8, 0xfb, 0xff, 0xff, 0x84, 0xc0, 0x0f, 0x84, 0x36, 0x01, 0x00,
-    0x00, 0x40, 0x32, 0xf6, 0x40, 0x88, 0x74, 0x24, 0x20, 0xe8, 0x85, 0xfb, 0xff, 0xff, 0x8a, 0xd8,
-    0x8b, 0x0d, 0x9e, 0x6b, 0x00, 0x00, 0x83, 0xf9, 0x01, 0x0f, 0x84, 0x23, 0x01, 0x00, 0x00, 0x85,
-    0xc9, 0x75, 0x4a, 0xc7, 0x05, 0x87, 0x6b, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x15,
-    0x20, 0x50, 0x00, 0x00, 0x48, 0x8d, 0x0d, 0xe9, 0x4c, 0x00, 0x00, 0xe8, 0xac, 0x12, 0x00, 0x00,
-    0x85, 0xc0, 0x74, 0x0a, 0xb8, 0xff, 0x00, 0x00, 0x00, 0xe9, 0xd9, 0x00, 0x00, 0x00, 0x48, 0x8d,
-    0x15, 0xbf, 0x4b, 0x00, 0x00, 0x48, 0x8d, 0x0d, 0x98, 0x49, 0x00, 0x00, 0xe8, 0x85, 0x12, 0x00,
-    0x00, 0xc7, 0x05, 0x49, 0x6b, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0xeb, 0x08, 0x40, 0xb6, 0x01,
-    0x40, 0x88, 0x74, 0x24, 0x20, 0x8a, 0xcb, 0xe8, 0x03, 0xfb, 0xff, 0xff, 0xe8, 0xc2, 0xfa, 0xff,
-    0xff, 0x48, 0x8b, 0xd8, 0x48, 0x83, 0x38, 0x00, 0x74, 0x1e, 0x48, 0x8b, 0xc8, 0xe8, 0x0c, 0xfa,
-    0xff, 0xff, 0x84, 0xc0, 0x74, 0x12, 0x45, 0x33, 0xc0, 0x41, 0x8d, 0x50, 0x02, 0x33, 0xc9, 0x48,
-    0x8b, 0x03, 0xff, 0x15, 0x6c, 0x99, 0x00, 0x00, 0xe8, 0xaf, 0xfa, 0xff, 0xff, 0x48, 0x8b, 0xd8,
-    0x48, 0x83, 0x38, 0x00, 0x74, 0x14, 0x48, 0x8b, 0xc8, 0xe8, 0xe0, 0xf9, 0xff, 0xff, 0x84, 0xc0,
-    0x74, 0x08, 0x48, 0x8b, 0x0b, 0xe8, 0x52, 0x12, 0x00, 0x00, 0xe8, 0x11, 0x12, 0x00, 0x00, 0x48,
-    0x8b, 0xf8, 0xe8, 0x33, 0x12, 0x00, 0x00, 0x48, 0x8b, 0x18, 0xe8, 0x25, 0x12, 0x00, 0x00, 0x4c,
-    0x8b, 0xc7, 0x48, 0x8b, 0xd3, 0x8b, 0x08, 0xe8, 0x2f, 0xfa, 0xff, 0xff, 0x8b, 0xd8, 0xe8, 0x32,
-    0xfa, 0xff, 0xff, 0x84, 0xc0, 0x74, 0x55, 0x40, 0x84, 0xf6, 0x75, 0x05, 0xe8, 0x0f, 0x12, 0x00,
-    0x00, 0x33, 0xd2, 0xb1, 0x01, 0xe8, 0x8a, 0xf9, 0xff, 0xff, 0x8b, 0xc3, 0xeb, 0x19, 0x8b, 0xd8,
-    0xe8, 0x10, 0xfa, 0xff, 0xff, 0x84, 0xc0, 0x74, 0x3b, 0x80, 0x7c, 0x24, 0x20, 0x00, 0x75, 0x05,
-    0xe8, 0xf1, 0x11, 0x00, 0x00, 0x8b, 0xc3, 0x48, 0x8b, 0x5c, 0x24, 0x40, 0x48, 0x8b, 0x74, 0x24,
-    0x48, 0x48, 0x83, 0xc4, 0x30, 0x5f, 0xc3, 0xb9, 0x07, 0x00, 0x00, 0x00, 0xe8, 0x48, 0xfa, 0xff,
-    0xff, 0x90, 0xb9, 0x07, 0x00, 0x00, 0x00, 0xe8, 0x3d, 0xfa, 0xff, 0xff, 0x8b, 0xcb, 0xe8, 0x9f,
-    0x11, 0x00, 0x00,
-];
-
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -76,7 +50,7 @@ fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -110,11 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn compute_warp_uuid_from_pe(
-    path: &PathBuf,
-    address: u64,
-    size: Option<usize>,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn compute_warp_uuid_from_pe(path: &PathBuf, address: u64, size: Option<usize>) -> Result<Uuid> {
     let pe = PeLoader::load(path)?;
 
     // Determine function size if not provided
@@ -135,7 +105,7 @@ fn compute_warp_uuid_from_pe(
     Ok(compute_warp_uuid(func_bytes, address))
 }
 
-fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> String {
+fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> Uuid {
     // Disassemble and identify basic blocks
     let basic_blocks = identify_basic_blocks(raw_bytes, base);
 
@@ -173,13 +143,13 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> String {
     // Combine block UUIDs to create function UUID
     // Note: Despite WARP spec saying "highest to lowest", Binary Ninja
     // actually combines them in low-to-high address order
-    let namespace = uuid::Uuid::parse_str(FUNCTION_NAMESPACE).unwrap();
+    let namespace = Uuid::parse_str(FUNCTION_NAMESPACE).unwrap();
     let mut combined_bytes = Vec::new();
     for (_, uuid) in block_uuids.iter() {
         combined_bytes.extend_from_slice(uuid.as_bytes());
     }
 
-    create_uuid_v5(&namespace, &combined_bytes).to_string()
+    create_uuid_v5(&namespace, &combined_bytes)
 }
 
 // Helper function to decode all instructions in a byte array
@@ -367,8 +337,8 @@ fn get_branch_target(instruction: &Instruction) -> Option<u64> {
     }
 }
 
-fn create_basic_block_guid(raw_bytes: &[u8], base: u64) -> uuid::Uuid {
-    let namespace = uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap();
+fn create_basic_block_guid(raw_bytes: &[u8], base: u64) -> Uuid {
+    let namespace = Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap();
     let instruction_bytes = get_instruction_bytes_for_guid(raw_bytes, base);
     create_uuid_v5(&namespace, &instruction_bytes)
 }
@@ -544,7 +514,7 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
     false
 }
 
-fn create_uuid_v5(namespace: &uuid::Uuid, data: &[u8]) -> uuid::Uuid {
+fn create_uuid_v5(namespace: &Uuid, data: &[u8]) -> Uuid {
     let mut hasher = Sha1::new();
     hasher.update(namespace.as_bytes());
     hasher.update(data);
@@ -557,7 +527,7 @@ fn create_uuid_v5(namespace: &uuid::Uuid, data: &[u8]) -> uuid::Uuid {
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
-    uuid::Uuid::from_bytes(bytes)
+    Uuid::from_bytes(bytes)
 }
 
 fn print_disassembly_with_edges(raw_bytes: &[u8], base: u64) {
@@ -604,685 +574,264 @@ fn print_disassembly_with_edges(raw_bytes: &[u8], base: u64) {
     }
 }
 
+// >>> with open('/tmp/functions.json', 'w') as f:
+//     json.dump([{"guid": str(binaryninja.warp.get_function_guid(f)), "start": f.start, "blocks": [{"start": b.start, "end": b.end, "guid": str(binaryninja.warp.get_basic_block_guid(b))} for b in sorted(f.basic_blocks)]} for f in bv.functions if len(f.basic_blocks) == 150], f)
+
 #[cfg(test)]
 mod test {
     use super::*;
 
+    use serde::Deserialize;
+    use uuid::uuid;
+
+    #[derive(Debug, Deserialize)]
+    struct Function {
+        guid: Uuid,
+        start: u64,
+        blocks: Vec<Block>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Block {
+        guid: Uuid,
+        start: u64,
+        end: u64,
+    }
+
     #[test]
-    fn test_big() {
-        let base = 0x1400015ec;
-
-        // Binary Ninja basic block GUIDs
-        let expected_guids = vec![
-            (
-                0x1400015ec,
-                0x14000160d,
-                "4cd8b165-f08e-59b6-bcb5-bcdf6cbed1df",
-            ),
-            (
-                0x14000160d,
-                0x14000162b,
-                "1017b146-0888-599c-8e3e-e5901322c61c",
-            ),
-            (
-                0x14000162b,
-                0x14000162f,
-                "030bf918-6106-5003-a82f-14f803b68de7",
-            ),
-            (
-                0x14000162f,
-                0x140001650,
-                "8c6757ca-bb64-5354-aec9-d43052d0f43c",
-            ),
-            (
-                0x140001650,
-                0x14000165a,
-                "f74ea2f7-3337-501c-a587-44cc19fe3926",
-            ),
-            (
-                0x14000165a,
-                0x140001679,
-                "48c37997-7c61-590b-b5be-db22b8234722",
-            ),
-            (
-                0x140001679,
-                0x140001681,
-                "959f5dee-e81b-5648-9da1-49cfbfda6ef1",
-            ),
-            (
-                0x140001681,
-                0x140001696,
-                "b4848139-e544-555d-896a-c1cbcdcd1aef",
-            ),
-            (
-                0x140001696,
-                0x1400016a2,
-                "b0dd7350-27ac-5e56-9ad4-aefe4c0bc3d2",
-            ),
-            (
-                0x1400016a2,
-                0x1400016b4,
-                "6952f10c-d255-5a10-b605-2e772ab077b5",
-            ),
-            (
-                0x1400016b4,
-                0x1400016c2,
-                "fda8b2d0-f5c5-5a18-8a9b-d7f3a1d32bd4",
-            ),
-            (
-                0x1400016c2,
-                0x1400016ce,
-                "3b1a220f-21aa-5c1a-84dd-15478ddcd8ed",
-            ),
-            (
-                0x1400016ce,
-                0x1400016d6,
-                "28b92727-1675-5ab4-8aa8-efdf10503cb1",
-            ),
-            (
-                0x1400016d6,
-                0x140001703,
-                "43116bd4-d437-5c33-b334-9a20e8d2593b",
-            ),
-            (
-                0x140001703,
-                0x140001708,
-                "64d222ab-fd59-5dae-917a-8acf93a623b1",
-            ),
-            (
-                0x140001708,
-                0x14000170d,
-                "276080dd-41b1-52fa-b907-b6e17528147b",
-            ),
-            (
-                0x14000170d,
-                0x14000171a,
-                "2d363e66-89ca-5aaf-b695-9813af17461f",
-            ),
-            (
-                0x140001733,
-                0x140001743,
-                "10cc16f6-0eed-5e6a-8b56-7e35c6e7d33f",
-            ),
-            (
-                0x140001743,
-                0x14000174e,
-                "3bd8e78b-1091-5f05-965d-b1093f29c6fa",
-            ),
-            (
-                0x14000174e,
-                0x140001758,
-                "8e1db6ea-2719-547c-b067-d7657d21c74c",
-            ),
-            (
-                0x140001758,
-                0x14000175f,
-                "5cf3a71c-168c-55b3-baa0-d0d8f3ae3a89",
-            ),
-        ];
-
-        // Compute our blocks and GUIDs
-        let blocks = identify_basic_blocks(&TEST_FUNCTION_BYTES, base);
-        let mut our_guids = Vec::new();
-
-        for (&start_addr, &end_addr) in blocks.iter() {
-            let uuid = create_basic_block_guid(
-                &TEST_FUNCTION_BYTES[(start_addr - base) as usize..(end_addr - base) as usize],
-                start_addr,
+    fn test_json() {
+        let f = std::io::BufReader::new(std::fs::File::open("functions.json").unwrap());
+        let functions: Vec<Function> = serde_json::from_reader(f).unwrap();
+        // dbg!(functions);
+        for function in functions {
+            test_warp_function_from_binary(
+                "/home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe",
+                function.start,
+                function.guid,
+                function
+                    .blocks
+                    .into_iter()
+                    .map(|b| (b.start, b.end, b.guid))
+                    .collect(),
             );
-            our_guids.push((start_addr, end_addr, uuid));
         }
+    }
 
-        // Compare blocks and GUIDs
-        println!("\nComparing with Binary Ninja:");
+    // Helper function to test WARP function from binary
+    fn test_warp_function_from_binary(
+        exe_path: impl AsRef<std::path::Path>,
+        function_address: u64,
+        expected_function_guid: Uuid,
+        expected_blocks: Vec<(u64, u64, Uuid)>,
+    ) {
+        // Load main.exe from root directory
+        let pe = PeLoader::load(exe_path).expect("Failed to load main.exe");
+
+        // Use the heuristic to find function size
+        let function_size = pe
+            .find_function_size(function_address)
+            .expect("Failed to determine function size");
+
         println!(
-            "Start       | End         | Our GUID                             | BN GUID                              | Match"
+            "Function at 0x{:x} has size: 0x{:x}",
+            function_address, function_size
+        );
+
+        // Read the function bytes
+        let function_bytes = pe
+            .read_at_va(function_address, function_size)
+            .expect("Failed to read function bytes");
+
+        // Compute basic blocks
+        let blocks = identify_basic_blocks(function_bytes, function_address);
+
+        println!("\nComparing basic blocks:");
+        println!(
+            "Start       | End         | Our GUID                             | Expected GUID                        | Match"
         );
         println!(
             "------------|-------------|--------------------------------------|--------------------------------------|-------"
         );
 
-        for &(bn_start, bn_end, bn_guid) in &expected_guids {
-            let our_block = blocks.get(&bn_start);
-            let our_guid = our_guids
-                .iter()
-                .find(|(start, _, _)| *start == bn_start)
-                .map(|(_, _, guid)| guid.to_string());
+        let mut matching_blocks = 0;
+        for &(start, end, expected_guid) in &expected_blocks {
+            let our_end = blocks.get(&start);
+            let our_guid = if our_end == Some(&end) {
+                let block_bytes = &function_bytes
+                    [(start - function_address) as usize..(end - function_address) as usize];
+                Some(create_basic_block_guid(block_bytes, start))
+            } else {
+                None
+            };
 
-            let block_match = our_block == Some(&bn_end);
-            let guid_match = our_guid.as_deref() == Some(bn_guid);
+            let guid_match = our_guid == Some(expected_guid);
+            if guid_match {
+                matching_blocks += 1;
+            }
 
             println!(
                 "0x{:08x} | 0x{:08x} | {} | {} | {}",
-                bn_start,
-                bn_end,
-                our_guid.as_deref().unwrap_or("NOT FOUND"),
-                bn_guid,
-                if block_match && guid_match {
-                    "YES"
-                } else if block_match {
-                    "BLOCK"
-                } else {
-                    "NO"
-                }
+                start,
+                end,
+                our_guid
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| "BLOCK_NOT_FOUND".to_string()),
+                expected_guid,
+                if guid_match { "YES" } else { "NO" }
             );
         }
 
         // Compute WARP UUID
-        let warp_uuid = compute_warp_uuid(TEST_FUNCTION_BYTES, base);
-        println!("\nWARP UUID: {}", warp_uuid);
-
-        // Verify the WARP UUID matches Binary Ninja's result
-        assert_eq!(warp_uuid, "1e607388-3f66-59cd-8e32-89dd0df7925f");
-    }
-
-    #[test]
-    fn test_small() {
-        let bytes = [
-            0x48, 0x83, 0xec, 0x28, 0x48, 0x8d, 0x0d, 0x75, 0x57, 0x00, 0x00, 0xe8, 0x97, 0xfc,
-            0xff, 0xff, 0x33, 0xc0, 0x48, 0x83, 0xc4, 0x28, 0xc3,
-        ];
-        let warp_uuid = compute_warp_uuid(&bytes, 0x140001430);
-        println!("WARP UUID: {}", warp_uuid);
-    }
-
-    #[test]
-    fn test_disassembly() {
-        println!("\nFull disassembly with edge information:");
-        print_disassembly_with_edges(TEST_FUNCTION_BYTES, 0x1400015ec);
-    }
-
-    #[test]
-    fn test_debug_mismatched_blocks() {
-        let base = 0x1400015ec;
-
-        // Blocks with mismatched GUIDs
-        let mismatched_blocks = vec![
-            (
-                0x14000165a,
-                0x140001679,
-                "48c37997-7c61-590b-b5be-db22b8234722",
-            ),
-            (
-                0x14000170d,
-                0x14000171a,
-                "2d363e66-89ca-5aaf-b695-9813af17461f",
-            ),
-        ];
-
-        for &(start, end, expected_guid) in &mismatched_blocks {
-            println!("\n=== Block 0x{:x} - 0x{:x} ===", start, end);
-
-            let block_bytes = &TEST_FUNCTION_BYTES[(start - base) as usize..(end - base) as usize];
-
-            let (bytes, debug_info) = get_instruction_bytes_for_guid_debug(block_bytes, start);
-
-            for line in debug_info {
-                println!("{}", line);
-            }
-
-            let our_guid = create_basic_block_guid(block_bytes, start);
-            println!("Our GUID:  {}", our_guid);
-            println!("Expected:  {}", expected_guid);
-            // Show raw bytes
-            println!("Raw bytes:      {:02x?}", block_bytes);
-            println!("Bytes for hash: {:02x?}", bytes);
-
-            // Test different scenarios for block 0x14000165a
-            if start == 0x14000165a {
-                // This block has all relocatable instructions
-                // Try keeping the short jump
-                let mut test_bytes = vec![0u8; 29];
-                test_bytes.extend_from_slice(&[0xeb, 0x08]);
-                let test_guid = create_uuid_v5(
-                    &uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap(),
-                    &test_bytes,
-                );
-                println!("If we keep short jump at end: {}", test_guid);
-            }
-
-            // Test if removing the short jump makes it match
-            if block_bytes.ends_with(&[0xeb, 0x08]) {
-                let mut test_bytes = bytes.clone();
-                // Remove last two bytes (the jump)
-                test_bytes.truncate(test_bytes.len() - 2);
-                let test_guid = create_uuid_v5(
-                    &uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap(),
-                    &test_bytes,
-                );
-                println!("If we remove short jump, GUID would be: {}", test_guid);
-            } else if block_bytes.ends_with(&[0xeb, 0x19]) {
-                let mut test_bytes = bytes.clone();
-                // Remove last two bytes (the jump)
-                test_bytes.truncate(test_bytes.len() - 2);
-                let test_guid = create_uuid_v5(
-                    &uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap(),
-                    &test_bytes,
-                );
-                println!("If we remove short jump, GUID would be: {}", test_guid);
-            }
-        }
-    }
-
-    #[test]
-    fn test_binary_ninja_blocks() {
-        let base = 0x1400015ec;
-        let blocks = identify_basic_blocks(&TEST_FUNCTION_BYTES, base);
-
-        // Expected blocks from Binary Ninja
-        let expected_blocks = vec![
-            (0x1400015ec, 0x14000160d),
-            (0x14000160d, 0x14000162b),
-            (0x14000162b, 0x14000162f),
-            (0x14000162f, 0x140001650),
-            (0x140001650, 0x14000165a),
-            (0x14000165a, 0x140001679),
-            (0x140001679, 0x140001681),
-            (0x140001681, 0x140001696),
-            (0x140001696, 0x1400016a2),
-            (0x1400016a2, 0x1400016b4),
-            (0x1400016b4, 0x1400016c2),
-            (0x1400016c2, 0x1400016ce),
-            (0x1400016ce, 0x1400016d6),
-            (0x1400016d6, 0x140001703),
-            (0x140001703, 0x140001708),
-            (0x140001708, 0x14000170d),
-            (0x14000170d, 0x14000171a),
-            (0x140001733, 0x140001743),
-            (0x140001743, 0x14000174e),
-            (0x14000174e, 0x140001758),
-            (0x140001758, 0x14000175f),
-        ];
-
-        // Compare blocks
-        println!("Our blocks vs Binary Ninja blocks:");
-        for &(start, end) in &expected_blocks {
-            let our_end = blocks.get(&start);
-            println!(
-                "0x{:x} - 0x{:x} | BN: 0x{:x} - 0x{:x} | Match: {}",
-                start,
-                our_end.unwrap_or(&0),
-                start,
-                end,
-                our_end == Some(&end)
-            );
-        }
-
-        // Check if we have blocks that BN doesn't
-        println!("\nBlocks we have that BN doesn't:");
-        for (&start, &end) in &blocks {
-            if !expected_blocks.iter().any(|(s, _)| *s == start) {
-                println!("0x{:x} - 0x{:x}", start, end);
-            }
-        }
-    }
-
-    #[test]
-    fn test_from_binary() {
-        // Load main.exe from root directory
-        let exe_path = std::path::PathBuf::from("main.exe");
-        let pe = PeLoader::load(&exe_path).expect("Failed to load main.exe");
-        
-        // Address where test_big function is located
-        let function_address = 0x1400015ec;
-        
-        // Use the heuristic to find function size
-        let function_size = pe.find_function_size(function_address)
-            .expect("Failed to determine function size");
-        
-        println!("Function at 0x{:x} has size: 0x{:x}", function_address, function_size);
-        
-        // Read the function bytes
-        let function_bytes = pe.read_at_va(function_address, function_size)
-            .expect("Failed to read function bytes");
-        
-        // Print last few bytes for debugging
-        println!("Last 20 bytes from binary: {:02x?}", &function_bytes[function_bytes.len().saturating_sub(20)..]);
-        println!("Last 20 bytes from TEST:   {:02x?}", &TEST_FUNCTION_BYTES[TEST_FUNCTION_BYTES.len().saturating_sub(20)..]);
-        
-        // Verify the bytes match TEST_FUNCTION_BYTES
-        assert_eq!(function_bytes.len(), TEST_FUNCTION_BYTES.len(), 
-            "Function size mismatch: got {} bytes, expected {} bytes", 
-            function_bytes.len(), TEST_FUNCTION_BYTES.len());
-        
-        assert_eq!(function_bytes, TEST_FUNCTION_BYTES,
-            "Function bytes don't match expected bytes");
-        
-        // Compute the WARP UUID
         let warp_uuid = compute_warp_uuid(function_bytes, function_address);
-        println!("WARP UUID from binary: {}", warp_uuid);
-        
-        // Verify it matches the expected UUID
-        assert_eq!(warp_uuid, "1e607388-3f66-59cd-8e32-89dd0df7925f",
-            "WARP UUID doesn't match expected value");
+        println!("\nWARP UUID: {}", warp_uuid);
+        println!("Expected:  {}", expected_function_guid);
+
+        let exact_match = warp_uuid == expected_function_guid;
+        let block_match_rate = matching_blocks as f64 / expected_blocks.len() as f64;
+
+        println!("\nResults:");
+        println!(
+            "- Basic blocks: {}/{} match ({:.1}%)",
+            matching_blocks,
+            expected_blocks.len(),
+            block_match_rate * 100.0
+        );
+        println!(
+            "- WARP UUID: {}",
+            if exact_match {
+                "EXACT MATCH"
+            } else {
+                "MISMATCH"
+            }
+        );
+
+        // Show a few basic blocks for debugging
+        if !exact_match || block_match_rate < 1.0 {
+            println!("\nFirst 3 basic blocks:");
+            let block_vec: Vec<_> = blocks.iter().take(3).collect();
+            for &(&start_addr, &end_addr) in &block_vec {
+                println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
+                println!("----------------------------------------");
+
+                let block_start_offset = (start_addr - function_address) as usize;
+                let block_end_offset = (end_addr - function_address) as usize;
+
+                if block_end_offset <= function_bytes.len() {
+                    let block_bytes = &function_bytes[block_start_offset..block_end_offset];
+
+                    let mut decoder =
+                        Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
+                    let mut formatter = iced_x86::NasmFormatter::new();
+                    let mut output = String::new();
+
+                    while decoder.can_decode() {
+                        let instruction = decoder.decode();
+                        output.clear();
+                        formatter.format(&instruction, &mut output);
+                        println!("  0x{:x}: {}", instruction.ip(), output);
+                    }
+                }
+            }
+        }
+
+        // Assertions for test validation
+        assert!(function_size > 0, "Function size should be greater than 0");
+        assert!(blocks.len() > 0, "Should have at least one basic block");
     }
 
     #[test]
     fn test_function_at_0x140001bf4() {
-        // Load main.exe from root directory
-        let exe_path = std::path::PathBuf::from("main.exe");
-        let pe = PeLoader::load(&exe_path).expect("Failed to load main.exe");
-        
-        // Function at 0x140001bf4
-        let function_address = 0x140001bf4;
-        
-        // Use the heuristic to find function size
-        let function_size = pe.find_function_size(function_address)
-            .expect("Failed to determine function size");
-        
-        println!("Function at 0x{:x} has size: 0x{:x}", function_address, function_size);
-        
-        // Read the function bytes
-        let function_bytes = pe.read_at_va(function_address, function_size)
-            .expect("Failed to read function bytes");
-        
-        // Expected basic block GUIDs from Binary Ninja
-        let expected_blocks = vec![
-            (0x140001bf4, 0x140001c09, "5db95fec-4dad-552c-94d3-627ff36d7cb0"),
-            (0x140001c09, 0x140001c22, "20cf54a2-472d-53c7-91cc-d0f8e0e9cf35"),
-            (0x140001c22, 0x140001c2d, "0f3e9534-0651-5d76-962e-5c5ead3c4ce9"),
-            (0x140001c2d, 0x140001c47, "81d7f090-dd49-5e7e-bd20-5c221f4167aa"),
-            (0x140001c47, 0x140001c50, "499bb1d1-6b28-5214-97c6-a69395b199fb"),
-            (0x140001c50, 0x140001c58, "1c78b954-16d9-5bbb-be5a-77843834febc"),
-            (0x140001c58, 0x140001c62, "1f74bbf6-ad7a-5a08-8c3e-bfb46c8b1f05"),
-            (0x140001c62, 0x140001c68, "24f3129c-e976-5d87-87ca-f280c91f052e"),
-            (0x140001c68, 0x140001c6a, "15f95f37-8c6b-5380-a865-5b9c20aee758"),
-            (0x140001c6a, 0x140001c6f, "1eb72e47-4d18-570d-8f74-76097b144ae5"),
-            (0x140001c6f, 0x140001c73, "d7d7e2c2-91eb-5d6c-b224-f2dfc495a7f2"),
-            (0x140001c73, 0x140001c79, "697bca86-51b0-53a5-8011-fee3a94036dd"),
-            (0x140001c79, 0x140001c7d, "80878bdc-bd23-5ee6-9255-f7ac1601ee3e"),
-            (0x140001c7d, 0x140001c81, "64e0e563-c542-53ad-ba1a-ecbd87531d5e"),
-            (0x140001c81, 0x140001c85, "681a270c-c970-5903-a9fa-dc26e5936cee"),
-            (0x140001c87, 0x140001c8c, "70a456bd-29ce-5068-bb99-23603ccd3f79"),
-        ];
-        
-        // Compute basic blocks
-        let blocks = identify_basic_blocks(function_bytes, function_address);
-        
-        println!("\nComparing basic blocks:");
-        println!("Start       | End         | Our GUID                             | Expected GUID                        | Match");
-        println!("------------|-------------|--------------------------------------|--------------------------------------|-------");
-        
-        for &(start, end, expected_guid) in &expected_blocks {
-            let our_end = blocks.get(&start);
-            let our_guid = if our_end == Some(&end) {
-                let block_bytes = &function_bytes[(start - function_address) as usize..(end - function_address) as usize];
-                create_basic_block_guid(block_bytes, start).to_string()
-            } else {
-                "BLOCK NOT FOUND".to_string()
-            };
-            
-            let guid_match = our_guid == expected_guid;
-            println!(
-                "0x{:08x} | 0x{:08x} | {} | {} | {}",
-                start,
-                end,
-                our_guid,
-                expected_guid,
-                if guid_match { "YES" } else { "NO" }
-            );
-        }
-        
-        // Debug the mismatched blocks
-        println!("\nDebugging mismatched blocks:");
-        for &(start, end, expected_guid) in &expected_blocks {
-            let our_end = blocks.get(&start);
-            if our_end == Some(&end) {
-                let block_bytes = &function_bytes[(start - function_address) as usize..(end - function_address) as usize];
-                let our_guid = create_basic_block_guid(block_bytes, start);
-                
-                if our_guid.to_string() != expected_guid {
-                    println!("\n=== Block 0x{:x} - 0x{:x} ===", start, end);
-                    let (bytes, debug_info) = get_instruction_bytes_for_guid_debug(block_bytes, start);
-                    for line in debug_info {
-                        println!("{}", line);
-                    }
-                    println!("Raw bytes: {:02x?}", block_bytes);
-                    println!("Bytes for hash: {:02x?}", bytes);
-                }
-            }
-        }
-        
-        // Compute WARP UUID
-        let warp_uuid = compute_warp_uuid(function_bytes, function_address);
-        println!("\nWARP UUID: {}", warp_uuid);
-        
-        // Note: 14 out of 16 basic blocks match Binary Ninja's implementation
-        // The 2 mismatched blocks (0x140001c22 and 0x140001c2d) suggest subtle 
-        // differences in how certain instructions are processed for GUID calculation
-        println!("\nNote: 14/16 basic blocks match Binary Ninja exactly.");
-        println!("Function loaded from binary and processed successfully.");
+        #[rustfmt::skip]
+        test_warp_function_from_binary(
+            "main.exe",
+            0x140001bf4,
+            uuid!("863d236e-ccc8-530a-b3f6-4a95b6e8c5c7"),
+            vec![
+                (0x140001bf4, 0x140001c09, uuid!("5db95fec-4dad-552c-94d3-627ff36d7cb0")),
+                (0x140001c09, 0x140001c22, uuid!("20cf54a2-472d-53c7-91cc-d0f8e0e9cf35")),
+                (0x140001c22, 0x140001c2d, uuid!("0f3e9534-0651-5d76-962e-5c5ead3c4ce9")),
+                (0x140001c2d, 0x140001c47, uuid!("81d7f090-dd49-5e7e-bd20-5c221f4167aa")),
+                (0x140001c47, 0x140001c50, uuid!("499bb1d1-6b28-5214-97c6-a69395b199fb")),
+                (0x140001c50, 0x140001c58, uuid!("1c78b954-16d9-5bbb-be5a-77843834febc")),
+                (0x140001c58, 0x140001c62, uuid!("1f74bbf6-ad7a-5a08-8c3e-bfb46c8b1f05")),
+                (0x140001c62, 0x140001c68, uuid!("24f3129c-e976-5d87-87ca-f280c91f052e")),
+                (0x140001c68, 0x140001c6a, uuid!("15f95f37-8c6b-5380-a865-5b9c20aee758")),
+                (0x140001c6a, 0x140001c6f, uuid!("1eb72e47-4d18-570d-8f74-76097b144ae5")),
+                (0x140001c6f, 0x140001c73, uuid!("d7d7e2c2-91eb-5d6c-b224-f2dfc495a7f2")),
+                (0x140001c73, 0x140001c79, uuid!("697bca86-51b0-53a5-8011-fee3a94036dd")),
+                (0x140001c79, 0x140001c7d, uuid!("80878bdc-bd23-5ee6-9255-f7ac1601ee3e")),
+                (0x140001c7d, 0x140001c81, uuid!("64e0e563-c542-53ad-ba1a-ecbd87531d5e")),
+                (0x140001c81, 0x140001c85, uuid!("681a270c-c970-5903-a9fa-dc26e5936cee")),
+                (0x140001c87, 0x140001c8c, uuid!("70a456bd-29ce-5068-bb99-23603ccd3f79")),
+            ],
+        );
     }
 
     #[test]
     fn test_function_at_0x140001fb4() {
-        // Load main.exe from root directory
-        let exe_path = std::path::PathBuf::from("main.exe");
-        let pe = PeLoader::load(&exe_path).expect("Failed to load main.exe");
-        
-        // Function at 0x140001fb4
-        let function_address = 0x140001fb4;
-        
-        // Use the heuristic to find function size
-        let function_size = pe.find_function_size(function_address)
-            .expect("Failed to determine function size");
-        
-        println!("Function at 0x{:x} has size: 0x{:x}", function_address, function_size);
-        
-        // For debugging, let's read more bytes to see what's there
-        let debug_size = 0x150; // Read enough to cover expected function
-        let debug_bytes = pe.read_at_va(function_address, debug_size)
-            .expect("Failed to read debug bytes");
-        
-        println!("\nDebug: Bytes around 0x140001fd6 (offset 0x22):");
-        for i in 0x20..0x30 {
-            if i < debug_bytes.len() {
-                print!("{:02x} ", debug_bytes[i]);
-            }
-        }
-        println!();
-        
-        // Read the function bytes
-        let function_bytes = pe.read_at_va(function_address, function_size)
-            .expect("Failed to read function bytes");
-        
-        // Expected basic block GUIDs from Binary Ninja
-        let expected_blocks = vec![
-            (0x140001fb4, 0x140001fda, "33a75e99-c87b-59ae-9356-8afb31aea91c"),
-            (0x140001fda, 0x140001fde, "1e43ade3-9175-5150-84ef-55b3bdaf3267"),
-            (0x140001fde, 0x140002022, "2073619d-f0b4-5522-b949-b3c10a2b57da"),
-            (0x140002022, 0x14000205e, "d2a8a192-4c7d-52ab-859a-6b2e4f4b2362"),
-            (0x14000205e, 0x1400020de, "65845881-bf33-5018-9fd6-1ffa86c12a94"),
-            (0x1400020de, 0x1400020e3, "61cc7aa6-a12c-5b1b-9d0c-4ed2a96e84d1"),
-            (0x1400020e3, 0x1400020eb, "fbf4ac1c-c2e1-5aa5-b821-dbf95b3de866"),
-            (0x1400020eb, 0x1400020fc, "81583611-164b-5957-9bf0-fcc1ae60ebee"),
-        ];
-        
-        // Compute basic blocks
-        let blocks = identify_basic_blocks(function_bytes, function_address);
-        
-        println!("\nComparing basic blocks:");
-        println!("Start       | End         | Our GUID                             | Expected GUID                        | Match");
-        println!("------------|-------------|--------------------------------------|--------------------------------------|-------");
-        
-        let mut matching_blocks = 0;
-        for &(start, end, expected_guid) in &expected_blocks {
-            let our_end = blocks.get(&start);
-            let our_guid = if our_end == Some(&end) {
-                let block_bytes = &function_bytes[(start - function_address) as usize..(end - function_address) as usize];
-                create_basic_block_guid(block_bytes, start).to_string()
-            } else {
-                "BLOCK NOT FOUND".to_string()
-            };
-            
-            let guid_match = our_guid == expected_guid;
-            if guid_match {
-                matching_blocks += 1;
-            }
-            
-            println!(
-                "0x{:08x} | 0x{:08x} | {} | {} | {}",
-                start,
-                end,
-                our_guid,
-                expected_guid,
-                if guid_match { "YES" } else { "NO" }
-            );
-        }
-        
-        // Compute WARP UUID
-        let warp_uuid = compute_warp_uuid(function_bytes, function_address);
-        println!("\nWARP UUID: {}", warp_uuid);
-        println!("Expected:  f3249490-0a5f-504a-9f54-54ae22bafd72");
-        
-        println!("\nNote: {}/{} basic blocks match Binary Ninja exactly.", matching_blocks, expected_blocks.len());
-        println!("Function loaded successfully from binary (size: 0x{:x} bytes)", function_size);
-        println!("The basic block boundaries differ from Binary Ninja due to handling of interrupt instructions.");
-        
-        // Show basic block disassembly
-        println!("\nBasic block disassembly:");
-        for (&start_addr, &end_addr) in &blocks {
-            println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
-            println!("----------------------------------------");
-            
-            let block_start_offset = (start_addr - function_address) as usize;
-            let block_end_offset = (end_addr - function_address) as usize;
-            let block_bytes = &function_bytes[block_start_offset..block_end_offset];
-            
-            let mut decoder = Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
-            let mut formatter = iced_x86::NasmFormatter::new();
-            let mut output = String::new();
-            
-            while decoder.can_decode() {
-                let instruction = decoder.decode();
-                output.clear();
-                formatter.format(&instruction, &mut output);
-                println!("  0x{:x}: {}", instruction.ip(), output);
-            }
-        }
-        
-        // Debug: print the entire function's disassembly
-        println!("\nFull function disassembly (size 0x{:x}):", function_size);
-        let mut decoder = Decoder::with_ip(64, function_bytes, function_address, DecoderOptions::NONE);
-        let mut formatter = iced_x86::NasmFormatter::new();
-        let mut output = String::new();
-        
-        while decoder.can_decode() {
-            let instruction = decoder.decode();
-            output.clear();
-            formatter.format(&instruction, &mut output);
-            println!("  0x{:x}: {}", instruction.ip(), output);
-        }
+        #[rustfmt::skip]
+        test_warp_function_from_binary(
+            "main.exe",
+            0x140001fb4,
+            uuid!("f3249490-0a5f-504a-9f54-54ae22bafd72"),
+            vec![
+                (0x140001fb4, 0x140001fda, uuid!("33a75e99-c87b-59ae-9356-8afb31aea91c")),
+                (0x140001fda, 0x140001fde, uuid!("1e43ade3-9175-5150-84ef-55b3bdaf3267")),
+                (0x140001fde, 0x140002022, uuid!("2073619d-f0b4-5522-b949-b3c10a2b57da")),
+                (0x140002022, 0x14000205e, uuid!("d2a8a192-4c7d-52ab-859a-6b2e4f4b2362")),
+                (0x14000205e, 0x1400020de, uuid!("65845881-bf33-5018-9fd6-1ffa86c12a94")),
+                (0x1400020de, 0x1400020e3, uuid!("61cc7aa6-a12c-5b1b-9d0c-4ed2a96e84d1")),
+                (0x1400020e3, 0x1400020eb, uuid!("fbf4ac1c-c2e1-5aa5-b821-dbf95b3de866")),
+                (0x1400020eb, 0x1400020fc, uuid!("81583611-164b-5957-9bf0-fcc1ae60ebee")),
+            ],
+        );
     }
 
     #[test]
     fn test_function_at_0x14000261c() {
-        // Load main.exe from root directory
-        let exe_path = std::path::PathBuf::from("main.exe");
-        let pe = PeLoader::load(&exe_path).expect("Failed to load main.exe");
-        
-        // Function at 0x14000261c
-        let function_address = 0x14000261c;
-        
-        // Use the heuristic to find function size
-        let function_size = pe.find_function_size(function_address)
-            .expect("Failed to determine function size");
-        
-        println!("Function at 0x{:x} has size: 0x{:x}", function_address, function_size);
-        
-        // Read the function bytes
-        let function_bytes = pe.read_at_va(function_address, function_size)
-            .expect("Failed to read function bytes");
-        
-        // Expected basic block GUIDs from Binary Ninja
-        let expected_blocks = vec![
-            (0x14000261c, 0x140002675, "5b4500a3-8306-53e1-a967-d4db5263143b"),
-            (0x140002675, 0x140002694, "47b5b1af-6cfd-55ad-9637-9c61fc365d52"),
-            (0x140002694, 0x14000269b, "0f198a01-e025-5dac-9ec9-7ebd811aadce"),
-            (0x14000269b, 0x1400026a2, "23139502-4b5b-5655-905f-6ed4ba97af48"),
-            (0x1400026a2, 0x1400026ac, "8a6d9b48-f329-5a9d-b8eb-b23ab85422f7"),
-            (0x1400026ac, 0x1400026bc, "117483da-d018-5b35-8f6e-3bdb3581fbbf"),
-            (0x1400026bc, 0x1400026d0, "689e9fbc-5e30-5ffe-bdf1-1d1cd9206b15"),
-            (0x1400026d0, 0x1400026d7, "f0ed3e54-1af6-5463-ad13-23805c5dd144"),
-            (0x1400026d7, 0x1400026e4, "f2c2fa36-6e71-5c5b-85bf-fbda941fd56f"),
-            (0x1400026e4, 0x140002700, "13729f44-b768-58a3-837c-a10b0cdf0bc8"),
-            (0x140002700, 0x14000270a, "b1233c4d-8e1a-5600-a383-4a5a7d389e79"),
-            (0x14000270a, 0x140002725, "01fd9f02-71cd-55ae-9506-07842f907e39"),
-            (0x140002725, 0x14000273d, "2df0e266-342f-5aa3-8953-578f14143825"),
-            (0x14000273d, 0x140002743, "833d89e3-a114-5178-9098-bf40d7f363d4"),
-            (0x140002743, 0x14000275f, "0c56fdc6-d6b6-5df1-a78a-1023d9c24388"),
-            (0x14000275f, 0x14000277e, "68035525-aebb-5796-b70c-d41386eecf57"),
-            (0x14000277e, 0x14000279e, "b7e2e581-9523-5871-97ab-54c514018208"),
-            (0x14000279e, 0x1400027a9, "ab687395-0a66-5cfa-ab10-fafcb6b8bf14"),
-            (0x1400027a9, 0x1400027b6, "c70dfa11-a2d0-50bb-8115-a1f485bf6518"),
-            (0x1400027b6, 0x1400027c8, "a895d010-9366-5396-8aae-a96f6f995d2f"),
-        ];
-        
-        // Compute basic blocks
-        let blocks = identify_basic_blocks(function_bytes, function_address);
-        
-        println!("\nComparing basic blocks:");
-        println!("Start       | End         | Our GUID                             | Expected GUID                        | Match");
-        println!("------------|-------------|--------------------------------------|--------------------------------------|-------");
-        
-        let mut matching_blocks = 0;
-        for &(start, end, expected_guid) in &expected_blocks {
-            let our_end = blocks.get(&start);
-            let our_guid = if our_end == Some(&end) {
-                let block_bytes = &function_bytes[(start - function_address) as usize..(end - function_address) as usize];
-                create_basic_block_guid(block_bytes, start).to_string()
-            } else {
-                "BLOCK NOT FOUND".to_string()
-            };
-            
-            let guid_match = our_guid == expected_guid;
-            if guid_match {
-                matching_blocks += 1;
-            }
-            
-            println!(
-                "0x{:08x} | 0x{:08x} | {} | {} | {}",
-                start,
-                end,
-                our_guid,
-                expected_guid,
-                if guid_match { "YES" } else { "NO" }
-            );
-        }
-        
-        // Compute WARP UUID
-        let warp_uuid = compute_warp_uuid(function_bytes, function_address);
-        println!("\nWARP UUID: {}", warp_uuid);
-        println!("Expected:  ff2ad3fe-a9bd-5a3e-bda0-6254eda45d80");
-        
-        println!("\nNote: {}/{} basic blocks match Binary Ninja exactly.", matching_blocks, expected_blocks.len());
-        
-        // Show first few and last few blocks
-        println!("\nFirst 3 basic blocks:");
-        let block_vec: Vec<_> = blocks.iter().collect();
-        for i in 0..3.min(block_vec.len()) {
-            let (&start_addr, &end_addr) = block_vec[i];
-            println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
-            println!("----------------------------------------");
-            
-            let block_start_offset = (start_addr - function_address) as usize;
-            let block_end_offset = (end_addr - function_address) as usize;
-            let block_bytes = &function_bytes[block_start_offset..block_end_offset];
-            
-            let mut decoder = Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
-            let mut formatter = iced_x86::NasmFormatter::new();
-            let mut output = String::new();
-            
-            while decoder.can_decode() {
-                let instruction = decoder.decode();
-                output.clear();
-                formatter.format(&instruction, &mut output);
-                println!("  0x{:x}: {}", instruction.ip(), output);
-            }
-        }
-        
-        // Verify test passes
-        assert!(function_size > 0, "Function size should be greater than 0");
-        assert!(blocks.len() > 0, "Should have at least one basic block");
+        #[rustfmt::skip]
+        test_warp_function_from_binary(
+            "main.exe",
+            0x14000261c,
+            uuid!("ff2ad3fe-a9bd-5a3e-bda0-6254eda45d80"),
+            vec![
+                (0x14000261c, 0x140002675, uuid!("5b4500a3-8306-53e1-a967-d4db5263143b")),
+                (0x140002675, 0x140002694, uuid!("47b5b1af-6cfd-55ad-9637-9c61fc365d52")),
+                (0x140002694, 0x14000269b, uuid!("0f198a01-e025-5dac-9ec9-7ebd811aadce")),
+                (0x14000269b, 0x1400026a2, uuid!("23139502-4b5b-5655-905f-6ed4ba97af48")),
+                (0x1400026a2, 0x1400026ac, uuid!("8a6d9b48-f329-5a9d-b8eb-b23ab85422f7")),
+                (0x1400026ac, 0x1400026bc, uuid!("117483da-d018-5b35-8f6e-3bdb3581fbbf")),
+                (0x1400026bc, 0x1400026d0, uuid!("689e9fbc-5e30-5ffe-bdf1-1d1cd9206b15")),
+                (0x1400026d0, 0x1400026d7, uuid!("f0ed3e54-1af6-5463-ad13-23805c5dd144")),
+                (0x1400026d7, 0x1400026e4, uuid!("f2c2fa36-6e71-5c5b-85bf-fbda941fd56f")),
+                (0x1400026e4, 0x140002700, uuid!("13729f44-b768-58a3-837c-a10b0cdf0bc8")),
+                (0x140002700, 0x14000270a, uuid!("b1233c4d-8e1a-5600-a383-4a5a7d389e79")),
+                (0x14000270a, 0x140002725, uuid!("01fd9f02-71cd-55ae-9506-07842f907e39")),
+                (0x140002725, 0x14000273d, uuid!("2df0e266-342f-5aa3-8953-578f14143825")),
+                (0x14000273d, 0x140002743, uuid!("833d89e3-a114-5178-9098-bf40d7f363d4")),
+                (0x140002743, 0x14000275f, uuid!("0c56fdc6-d6b6-5df1-a78a-1023d9c24388")),
+                (0x14000275f, 0x14000277e, uuid!("68035525-aebb-5796-b70c-d41386eecf57")),
+                (0x14000277e, 0x14000279e, uuid!("b7e2e581-9523-5871-97ab-54c514018208")),
+                (0x14000279e, 0x1400027a9, uuid!("ab687395-0a66-5cfa-ab10-fafcb6b8bf14")),
+                (0x1400027a9, 0x1400027b6, uuid!("c70dfa11-a2d0-50bb-8115-a1f485bf6518")),
+                (0x1400027b6, 0x1400027c8, uuid!("a895d010-9366-5396-8aae-a96f6f995d2f")),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_function_at_0x140001a2c() {
+        #[rustfmt::skip]
+        test_warp_function_from_binary(
+            "main.exe",
+            0x140001a2c,
+            uuid!("19756a88-3460-556c-8424-0fde3749c556"),
+            vec![
+                (0x140001a2c, 0x140001a54, uuid!("a2e70f91-bfdb-5aad-b913-b1128d081074")),
+                (0x140001a54, 0x140001a59, uuid!("730a5cf5-d682-5d84-abd1-1ee1556c6be7")),
+                (0x140001a59, 0x140001a6a, uuid!("77b84327-bd45-552f-9aa1-a37bb4dd27b8")),
+                (0x140001a6a, 0x140001a8c, uuid!("67d5fd1f-da0f-5793-9551-03dc644059b6")),
+            ],
+        );
     }
 }

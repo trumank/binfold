@@ -1,3 +1,4 @@
+use anyhow::{Result, bail};
 use memmap2::Mmap;
 use object::pe::ImageNtHeaders64;
 use object::read::pe::{ImageNtHeaders, ImageOptionalHeader, PeFile};
@@ -10,7 +11,7 @@ pub struct PeLoader {
 }
 
 impl PeLoader {
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
@@ -26,7 +27,7 @@ impl PeLoader {
     }
 
     /// Convert RVA to file offset
-    pub fn rva_to_file_offset(&self, rva: u64) -> Result<usize, Box<dyn std::error::Error>> {
+    pub fn rva_to_file_offset(&self, rva: u64) -> Result<usize> {
         let pe_file = PeFile::<ImageNtHeaders64>::parse(&*self.mmap)?;
 
         // Get the raw section headers to access the VirtualAddress field directly
@@ -49,18 +50,18 @@ impl PeLoader {
             }
         }
 
-        Err(format!("RVA 0x{:x} not found in any section", rva).into())
+        bail!("RVA 0x{:x} not found in any section", rva)
     }
 
     /// Read bytes at a given virtual address
-    pub fn read_at_va(&self, va: u64, size: usize) -> Result<&[u8], Box<dyn std::error::Error>> {
+    pub fn read_at_va(&self, va: u64, size: usize) -> Result<&[u8]> {
         // Convert VA to RVA
         let rva = va.saturating_sub(self.image_base);
         let file_offset = self.rva_to_file_offset(rva)?;
 
         // Bounds check
         if file_offset + size > self.mmap.len() {
-            return Err("Read would go past end of file".into());
+            bail!("Read would go past end of file");
         }
 
         Ok(&self.mmap[file_offset..file_offset + size])
@@ -68,76 +69,76 @@ impl PeLoader {
 
     /// Find a function at the given address and return its approximate size
     /// Uses recursive descent to follow all code paths
-    pub fn find_function_size(&self, va: u64) -> Result<usize, Box<dyn std::error::Error>> {
+    pub fn find_function_size(&self, va: u64) -> Result<usize> {
         use iced_x86::{Decoder, DecoderOptions, FlowControl};
         use std::collections::{HashSet, VecDeque};
-        
+
         let max_scan = 0x1000; // Maximum function size to scan (4KB)
         let start_offset = self.rva_to_file_offset(va.saturating_sub(self.image_base))?;
-        
+
         // Adjust max_scan if it would go past end of file
         let available = self.mmap.len().saturating_sub(start_offset);
         let scan_size = max_scan.min(available);
-        
+
         if scan_size == 0 {
-            return Err("No bytes available to scan".into());
+            bail!("No bytes available to scan");
         }
-        
+
         let bytes = &self.mmap[start_offset..start_offset + scan_size];
-        
+
         // First decode all instructions in the scan range
         let mut all_instructions = std::collections::BTreeMap::new();
         let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
-        
+
         // println!("\nDecoding instructions from 0x{:x}:", va);
-        
+
         let mut decode_count = 0;
         while decoder.can_decode() {
             let addr = decoder.ip();
             let instruction = decoder.decode();
             let next_addr = decoder.ip();
-            
+
             // Format and print the instruction
             // output.clear();
             // formatter.format(&instruction, &mut output);
             // println!("  0x{:x}: {} (flow: {:?})", addr, output, instruction.flow_control());
-            
+
             all_instructions.insert(addr, (instruction, next_addr));
             decode_count += 1;
-            
+
             // Stop if we've decoded enough instructions (safety limit)
             if decode_count > 200 {
                 println!("  ... stopping at instruction limit");
                 break;
             }
         }
-        
+
         if !decoder.can_decode() {
             println!("  Decoder stopped - can_decode() returned false");
         }
-        
+
         // Now do recursive descent to find all reachable instructions
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(va);
-        
+
         let mut max_address = va;
-        
+
         // println!("\nStarting recursive descent from 0x{:x}", va);
-        
+
         while let Some(addr) = queue.pop_front() {
             if visited.contains(&addr) {
                 continue;
             }
             visited.insert(addr);
             // println!("  Visiting 0x{:x}", addr);
-            
+
             if let Some((instruction, next_addr)) = all_instructions.get(&addr) {
                 // Update max address
                 if *next_addr > max_address {
                     max_address = *next_addr;
                 }
-                
+
                 match instruction.flow_control() {
                     FlowControl::Next => {
                         // Continue to next instruction
@@ -164,7 +165,7 @@ impl PeLoader {
                         // Follow both paths
                         // println!("    -> ConditionalBranch: queueing fall-through 0x{:x}", *next_addr);
                         queue.push_back(*next_addr); // Fall through
-                        
+
                         if let Some(target) = get_branch_target(instruction) {
                             if target >= va && target < va + scan_size as u64 {
                                 // Internal jump - follow it
@@ -183,12 +184,12 @@ impl PeLoader {
                 }
             }
         }
-        
+
         let size = (max_address - va) as usize;
         if size == 0 {
-            return Err("Could not determine function size".into());
+            bail!("Could not determine function size")
         }
-        
+
         Ok(size)
     }
 }
