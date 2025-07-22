@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use pdb::{FallibleIterator, PDB, SymbolData};
 use std::fs::File;
 use std::path::Path;
@@ -39,12 +40,48 @@ impl PdbAnalyzer {
         let mut results = Vec::new();
         let address_map = self.pdb.address_map()?;
 
+        // First, count total procedures for progress bar
+        let mut total_procedures = 0;
+
+        // Count global symbols
+        let symbol_table = self.pdb.global_symbols()?;
+        let mut symbols = symbol_table.iter();
+        while let Some(symbol) = symbols.next()? {
+            if let Ok(SymbolData::Procedure(_)) = symbol.parse() {
+                total_procedures += 1;
+            }
+        }
+
+        // Count module symbols
+        let dbi = self.pdb.debug_information()?;
+        let mut modules = dbi.modules()?;
+        while let Some(module) = modules.next()? {
+            if let Some(module_info) = self.pdb.module_info(&module)? {
+                let mut module_symbols = module_info.symbols()?;
+                while let Some(symbol) = module_symbols.next()? {
+                    if let Ok(SymbolData::Procedure(_)) = symbol.parse() {
+                        total_procedures += 1;
+                    }
+                }
+            }
+        }
+
+        // Create progress bar
+        let pb = ProgressBar::new(total_procedures as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) Analyzing functions")
+                .expect("Failed to set progress style")
+                .progress_chars("#>-")
+        );
+
         // Process global symbols
         let symbol_table = self.pdb.global_symbols()?;
         let mut symbols = symbol_table.iter();
         while let Some(symbol) = symbols.next()? {
             if let Ok(SymbolData::Procedure(proc)) = symbol.parse() {
                 self.process_procedure(&proc, &address_map, debug_context, &mut results);
+                pb.inc(1);
             }
         }
 
@@ -57,14 +94,13 @@ impl PdbAnalyzer {
                 while let Some(symbol) = module_symbols.next()? {
                     if let Ok(SymbolData::Procedure(proc)) = symbol.parse() {
                         self.process_procedure(&proc, &address_map, debug_context, &mut results);
+                        pb.inc(1);
                     }
                 }
             }
         }
 
-        // Remove duplicates (same address)
-        results.sort_by_key(|f| f.address);
-        // results.dedup_by_key(|f| f.address);
+        pb.finish_with_message("Analysis complete!");
 
         Ok(results)
     }

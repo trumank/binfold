@@ -234,7 +234,6 @@ fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&output)?);
                 }
                 format if format.starts_with("sqlite:") => {
-                    use indicatif::{ProgressBar, ProgressStyle};
                     use rusqlite::{Connection, params};
                     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -252,11 +251,11 @@ fn main() -> Result<()> {
                     // Create table if it doesn't exist
                     conn.execute(
                         "CREATE TABLE IF NOT EXISTS function_guids (
-                            address INTEGER PRIMARY KEY,
+                            address INTEGER NOT NULL,
                             guid TEXT NOT NULL,
+                            timestamp INTEGER NOT NULL,
                             exe_name TEXT NOT NULL,
-                            function_name TEXT NOT NULL,
-                            timestamp INTEGER NOT NULL
+                            function_name TEXT NOT NULL
                         )",
                         [],
                     )?;
@@ -272,16 +271,6 @@ fn main() -> Result<()> {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_secs() as i64;
-
-                    // Create progress bar
-                    let pb = ProgressBar::new(function_guids.len() as u64);
-                    pb.set_style(
-                        ProgressStyle::default_bar()
-                            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta})")
-                            .expect("Failed to set progress style")
-                            .progress_chars("#>-")
-                    );
-                    pb.set_message("Inserting function GUIDs");
 
                     // Insert all records in a single transaction
                     let mut inserted = 0;
@@ -301,16 +290,12 @@ fn main() -> Result<()> {
                                     func.name,
                                     timestamp
                                 ]) {
-                                    Ok(_) => {
-                                        inserted += 1;
-                                        pb.inc(1);
-                                    }
+                                    Ok(_) => inserted += 1,
                                     Err(e) => {
                                         eprintln!(
                                             "Failed to insert function {} at 0x{:x}: {}",
                                             func.name, func.address, e
                                         );
-                                        pb.inc(1);
                                     }
                                 }
                             }
@@ -318,9 +303,7 @@ fn main() -> Result<()> {
                         tx.commit()?;
                     }
 
-                    pb.finish_with_message("Done!");
-
-                    println!("\nSQLite database: {}", db_path);
+                    println!("SQLite database: {}", db_path);
                     println!(
                         "Inserted {} function GUIDs for {} at timestamp {}",
                         inserted, exe_name, timestamp
