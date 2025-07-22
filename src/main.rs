@@ -3,7 +3,6 @@ use clap::{Parser, Subcommand};
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, OpKind, Register,
 };
-use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -78,12 +77,12 @@ enum Commands {
         exe_paths: Vec<PathBuf>,
 
         /// Enable debug output
-        #[arg(short, long)]
+        #[arg(long)]
         debug: bool,
 
-        /// Output format (json, text, or sqlite:<path>)
-        #[arg(short = 'f', long = "format", default_value = "text")]
-        format: String,
+        /// SQLite database path
+        #[arg(short = 'd', long = "database", required = true)]
+        database: PathBuf,
     },
 }
 
@@ -158,10 +157,61 @@ fn main() -> Result<()> {
         Commands::Pdb {
             exe_paths,
             debug,
-            format,
+            database,
         } => {
-            use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
+            use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
             use pdb_analyzer::PdbAnalyzer;
+            use std::fs;
+
+            // Expand directories to find EXE files with PDB files
+            let mut expanded_exe_paths = Vec::new();
+
+            fn find_exe_files_recursive(
+                dir: &std::path::Path,
+                exe_files: &mut Vec<PathBuf>,
+            ) -> std::io::Result<()> {
+                for entry in fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+
+                    if path.is_dir() {
+                        // Recursively search subdirectories
+                        let _ = find_exe_files_recursive(&path, exe_files);
+                    } else if let Some(ext) = path.extension() {
+                        if ext.eq_ignore_ascii_case("exe") {
+                            // Check if corresponding PDB exists
+                            let pdb_path = path.with_extension("pdb");
+                            if pdb_path.exists() {
+                                exe_files.push(path);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            for path in exe_paths {
+                if path.is_dir() {
+                    // Recursively find all EXE files in the directory tree
+                    let _ = find_exe_files_recursive(&path, &mut expanded_exe_paths);
+                } else {
+                    // It's a file, add it directly
+                    expanded_exe_paths.push(path);
+                }
+            }
+
+            if expanded_exe_paths.is_empty() {
+                anyhow::bail!("No EXE files with corresponding PDB files found");
+            }
+
+            // Sort for consistent output
+            expanded_exe_paths.sort();
+
+            println!(
+                "Found {} EXE files with PDB files",
+                expanded_exe_paths.len()
+            );
+            let exe_paths = expanded_exe_paths;
 
             let debug_context = if debug {
                 DebugContext {
@@ -174,254 +224,127 @@ fn main() -> Result<()> {
                 DebugContext::default()
             };
 
-            // Structure to hold results from each executable
-            #[derive(Debug)]
-            struct ExeResults {
-                exe_path: PathBuf,
-                pdb_path: PathBuf,
-                function_guids: Vec<pdb_analyzer::FunctionGuid>,
-                error: Option<String>,
-            }
+            use rusqlite::{Connection, params};
+            use std::sync::{Arc, Mutex};
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            // Open database connection
+            let conn = Connection::open(&database)?;
+
+            // Set pragmas for better performance
+            conn.execute_batch(
+                "PRAGMA synchronous = OFF;
+                 PRAGMA journal_mode = MEMORY;
+                 PRAGMA temp_store = MEMORY;
+                 PRAGMA mmap_size = 30000000000;",
+            )?;
+
+            // Create table if it doesn't exist
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS function_guids (
+                    address INTEGER NOT NULL,
+                    guid TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    exe_name TEXT NOT NULL,
+                    function_name TEXT NOT NULL
+                )",
+                [],
+            )?;
+
+            // Create index on guid column for fast lookups
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_function_guids_guid ON function_guids(guid)",
+                [],
+            )?;
+
+            // Wrap connection in Arc<Mutex> for thread-safe access
+            let conn = Arc::new(Mutex::new(conn));
 
             // Create multi-progress for parallel progress bars
             let multi_progress = MultiProgress::new();
 
             let pb = ProgressBar::new(exe_paths.len() as u64).with_style(
                         ProgressStyle::default_bar()
-                            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta})")
+                            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) Processing executables")
                             .unwrap()
                             .progress_chars("#>-"));
             pb.enable_steady_tick(std::time::Duration::from_millis(100));
             multi_progress.add(pb.clone());
 
-            // Process all executables in parallel
-            let results: Vec<ExeResults> = exe_paths
-                .par_iter()
-                .map(|exe_path| {
-                    // Derive PDB path for this exe if not explicitly provided
-                    let pdb_path_for_exe = exe_path.with_extension("pdb");
+            let mut total_processed = 0;
+            let mut total_failed = 0;
 
-                    // Process this exe/pdb pair
-                    let result = (|| -> Result<Vec<pdb_analyzer::FunctionGuid>> {
-                        let mut analyzer = PdbAnalyzer::new(exe_path, &pdb_path_for_exe)?;
-                        let function_guids = analyzer.compute_function_guids_with_progress(
-                            &debug_context,
-                            Some(multi_progress.clone()),
+            // Get current unix timestamp
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+
+            // Process executables sequentially to avoid OOM
+            for exe_path in exe_paths {
+                // Derive PDB path for this exe
+                let pdb_path_for_exe = exe_path.with_extension("pdb");
+
+                // Process this exe/pdb pair
+                let result = (|| -> Result<()> {
+                    let mut analyzer = PdbAnalyzer::new(&exe_path, &pdb_path_for_exe)?;
+                    let function_guids = analyzer.compute_function_guids_with_progress(
+                        &debug_context,
+                        Some(multi_progress.clone()),
+                    )?;
+
+                    // Get just the exe filename
+                    let exe_name = exe_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+
+                    // Insert all records in a single transaction
+                    let mut conn = conn.lock().unwrap();
+                    let tx = conn.transaction()?;
+                    {
+                        let mut stmt = tx.prepare(
+                            "INSERT OR REPLACE INTO function_guids (address, guid, exe_name, function_name, timestamp) 
+                             VALUES (?1, ?2, ?3, ?4, ?5)"
                         )?;
-                        Ok(function_guids)
-                    })();
 
-                    pb.inc(1);
-                    match result {
-                        Ok(function_guids) => ExeResults {
-                            exe_path: exe_path.clone(),
-                            pdb_path: pdb_path_for_exe,
-                            function_guids,
-                            error: None,
-                        },
-                        Err(e) => ExeResults {
-                            exe_path: exe_path.clone(),
-                            pdb_path: pdb_path_for_exe,
-                            function_guids: vec![],
-                            error: Some(e.to_string()),
-                        },
+                        for func in &function_guids {
+                            stmt.execute(params![
+                                func.address as i64,
+                                func.guid.to_string(),
+                                exe_name,
+                                func.name,
+                                timestamp
+                            ])?;
+                        }
                     }
-                })
-                .collect();
+                    tx.commit()?;
+
+                    println!("Processed {}: {} functions", exe_name, function_guids.len());
+                    Ok(())
+                })();
+
+                pb.inc(1);
+
+                match result {
+                    Ok(_) => total_processed += 1,
+                    Err(e) => {
+                        eprintln!("Error processing {}: {}", exe_path.display(), e);
+                        total_failed += 1;
+                    }
+                }
+            }
+
             pb.finish();
             multi_progress.clear().unwrap();
 
-            match format.as_str() {
-                "json" => {
-                    use serde::Serialize;
-
-                    #[derive(Serialize)]
-                    struct JsonOutput {
-                        results: Vec<JsonExeResult>,
-                    }
-
-                    #[derive(Serialize)]
-                    struct JsonExeResult {
-                        exe_path: String,
-                        pdb_path: String,
-                        function_count: usize,
-                        functions: Vec<JsonFunction>,
-                        error: Option<String>,
-                    }
-
-                    #[derive(Serialize)]
-                    struct JsonFunction {
-                        name: String,
-                        address: String,
-                        size: Option<u32>,
-                        guid: String,
-                    }
-
-                    let output = JsonOutput {
-                        results: results
-                            .into_iter()
-                            .map(|result| JsonExeResult {
-                                exe_path: result.exe_path.display().to_string(),
-                                pdb_path: result.pdb_path.display().to_string(),
-                                function_count: result.function_guids.len(),
-                                functions: result
-                                    .function_guids
-                                    .into_iter()
-                                    .map(|f| JsonFunction {
-                                        name: f.name,
-                                        address: format!("0x{:x}", f.address),
-                                        size: f.size,
-                                        guid: f.guid.to_string(),
-                                    })
-                                    .collect(),
-                                error: result.error,
-                            })
-                            .collect(),
-                    };
-
-                    println!("{}", serde_json::to_string_pretty(&output)?);
-                }
-                format if format.starts_with("sqlite:") => {
-                    use rusqlite::{Connection, params};
-                    use std::time::{SystemTime, UNIX_EPOCH};
-
-                    let db_path = format.strip_prefix("sqlite:").unwrap();
-                    let mut conn = Connection::open(db_path)?;
-
-                    // Set pragmas for better performance
-                    conn.execute_batch(
-                        "PRAGMA synchronous = OFF;
-                         PRAGMA journal_mode = MEMORY;
-                         PRAGMA temp_store = MEMORY;
-                         PRAGMA mmap_size = 30000000000;",
-                    )?;
-
-                    // Create table if it doesn't exist
-                    conn.execute(
-                        "CREATE TABLE IF NOT EXISTS function_guids (
-                            address INTEGER NOT NULL,
-                            guid TEXT NOT NULL,
-                            timestamp INTEGER NOT NULL,
-                            exe_name TEXT NOT NULL,
-                            function_name TEXT NOT NULL
-                        )",
-                        [],
-                    )?;
-
-                    // Get current unix timestamp
-                    let timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64;
-
-                    // Insert all records in a single transaction
-                    let mut total_inserted = 0;
-                    let mut total_errors = 0;
-                    {
-                        let tx = conn.transaction()?;
-                        {
-                            let mut stmt = tx.prepare(
-                                "INSERT OR REPLACE INTO function_guids (address, guid, exe_name, function_name, timestamp) 
-                                 VALUES (?1, ?2, ?3, ?4, ?5)"
-                            )?;
-
-                            for result in &results {
-                                if let Some(error) = &result.error {
-                                    eprintln!(
-                                        "Error processing {}: {}",
-                                        result.exe_path.display(),
-                                        error
-                                    );
-                                    total_errors += 1;
-                                    continue;
-                                }
-
-                                let exe_name = result
-                                    .exe_path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("unknown");
-
-                                for func in &result.function_guids {
-                                    match stmt.execute(params![
-                                        func.address as i64,
-                                        func.guid.to_string(),
-                                        exe_name,
-                                        func.name,
-                                        timestamp
-                                    ]) {
-                                        Ok(_) => total_inserted += 1,
-                                        Err(e) => {
-                                            eprintln!(
-                                                "Failed to insert function {} at 0x{:x} from {}: {}",
-                                                func.name, func.address, exe_name, e
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        tx.commit()?;
-                    }
-
-                    println!("SQLite database: {}", db_path);
-                    println!(
-                        "Processed {} executables ({} succeeded, {} failed)",
-                        results.len(),
-                        results.len() - total_errors,
-                        total_errors
-                    );
-                    println!(
-                        "Inserted {} function GUIDs at timestamp {}",
-                        total_inserted, timestamp
-                    );
-                }
-                _ => {
-                    println!("PDB Analysis Results");
-                    println!("===================");
-
-                    for result in &results {
-                        println!("\nEXE: {}", result.exe_path.display());
-                        println!("PDB: {}", result.pdb_path.display());
-
-                        if let Some(error) = &result.error {
-                            println!("ERROR: {}", error);
-                            continue;
-                        }
-
-                        println!("Total functions found: {}\n", result.function_guids.len());
-
-                        for func in &result.function_guids {
-                            println!("Function: {}", func.name);
-                            println!("  Address: 0x{:x}", func.address);
-                            if let Some(size) = func.size {
-                                println!("  Size: {} bytes", size);
-                            }
-                            println!("  GUID: {}", func.guid);
-                            println!();
-                        }
-                    }
-
-                    // Summary
-                    let successful = results.iter().filter(|r| r.error.is_none()).count();
-                    let failed = results.len() - successful;
-                    let total_functions: usize = results
-                        .iter()
-                        .filter(|r| r.error.is_none())
-                        .map(|r| r.function_guids.len())
-                        .sum();
-
-                    println!("\nSummary:");
-                    println!("========");
-                    println!(
-                        "Executables processed: {} ({} succeeded, {} failed)",
-                        results.len(),
-                        successful,
-                        failed
-                    );
-                    println!("Total functions found: {}", total_functions);
-                }
-            }
+            println!("\nSummary:");
+            println!("========");
+            println!(
+                "Executables processed: {} succeeded, {} failed",
+                total_processed, total_failed
+            );
+            println!("Database: {}", database.display());
         }
     }
 
