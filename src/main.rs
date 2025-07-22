@@ -810,6 +810,41 @@ mod test {
             }
         }
 
+        // Collect detailed statistics
+        let mut block_match_distribution: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut non_matching_functions = Vec::new();
+        let mut perfect_block_no_guid = Vec::new();
+        
+        // Re-analyze for detailed stats
+        total_functions = 0;
+        for exe in &functions {
+            for (idx, function) in exe.functions.iter().enumerate() {
+                let (size_diff, blocks_matched, blocks_total, guid_match) =
+                    test_warp_function_from_binary_with_stats(
+                        &exe.path,
+                        function.start,
+                        function.guid,
+                        function
+                            .blocks
+                            .iter()
+                            .map(|b| (b.start, b.end, b.guid))
+                            .collect(),
+                    );
+                
+                total_functions += 1;
+                let match_rate = blocks_matched as f64 / blocks_total as f64 * 100.0;
+                let bucket = format!("{:.0}%", (match_rate / 10.0).floor() * 10.0);
+                *block_match_distribution.entry(bucket).or_insert(0) += 1;
+                
+                if !guid_match {
+                    non_matching_functions.push((idx + 1, function.start, blocks_matched, blocks_total, match_rate));
+                    if blocks_matched == blocks_total {
+                        perfect_block_no_guid.push((idx + 1, function.start, function.guid.clone()));
+                    }
+                }
+            }
+        }
+        
         writeln!(stats_file, "Summary").unwrap();
         writeln!(stats_file, "=======").unwrap();
         writeln!(stats_file, "Total functions analyzed: {}", total_functions).unwrap();
@@ -835,6 +870,38 @@ mod test {
             total_blocks_matched as f64 / total_blocks_analyzed as f64 * 100.0
         )
         .unwrap();
+        
+        writeln!(stats_file, "\nBlock Match Distribution:").unwrap();
+        writeln!(stats_file, "========================").unwrap();
+        let mut buckets: Vec<_> = block_match_distribution.iter().collect();
+        buckets.sort_by(|a, b| b.0.cmp(a.0));
+        for (bucket, count) in buckets {
+            writeln!(stats_file, "  {}: {} functions", bucket, count).unwrap();
+        }
+        
+        writeln!(stats_file, "\nFunctions with 100% Block Match but Wrong GUID:").unwrap();
+        writeln!(stats_file, "===============================================").unwrap();
+        writeln!(stats_file, "Count: {}", perfect_block_no_guid.len()).unwrap();
+        for (idx, addr, guid) in perfect_block_no_guid.iter().take(10) {
+            writeln!(stats_file, "  Function #{} at 0x{:x} (expected: {})", idx, addr, guid).unwrap();
+        }
+        if perfect_block_no_guid.len() > 10 {
+            writeln!(stats_file, "  ... and {} more", perfect_block_no_guid.len() - 10).unwrap();
+        }
+        
+        writeln!(stats_file, "\nAll Non-Matching Functions by Block Match Rate:").unwrap();
+        writeln!(stats_file, "==============================================").unwrap();
+        non_matching_functions.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap());
+        for (idx, addr, matched, total, rate) in non_matching_functions.iter().take(20) {
+            writeln!(
+                stats_file,
+                "  Function #{} at 0x{:x}: {}/{} blocks ({:.1}%)",
+                idx, addr, matched, total, rate
+            ).unwrap();
+        }
+        if non_matching_functions.len() > 20 {
+            writeln!(stats_file, "  ... and {} more", non_matching_functions.len() - 20).unwrap();
+        }
     }
 
     // Helper function to test WARP function from binary and return statistics

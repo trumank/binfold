@@ -1,6 +1,6 @@
 WARP Function Analysis Statistics
 ==================================
-Generated at: SystemTime { tv_sec: 1753165121, tv_nsec: 189863891 }
+Generated at: SystemTime { tv_sec: 1753166319, tv_nsec: 404704739 }
 
 Function #1 at 0x14052f518
   Expected GUID: 886b4085-ee35-5fec-aefb-7f5cec39b45d
@@ -503,7 +503,7 @@ Function #72 at 0x140ef62d0
   Expected GUID: 785dd543-d7c8-5a35-a3f0-bd3ce0dafe3b
   Expected blocks: 40
   Size difference: 0 bytes
-  Blocks matched: 38/40 (95.0%)
+  Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #73 at 0x140f021a0
@@ -559,7 +559,7 @@ Function #80 at 0x141011000
   Expected GUID: acacaca9-514f-5f5a-be30-046aca7a60aa
   Expected blocks: 150
   Size difference: 1 bytes
-  Blocks matched: 147/150 (98.0%)
+  Blocks matched: 150/150 (100.0%)
   GUID match: YES
 
 Function #81 at 0x141053ec0
@@ -3310,7 +3310,7 @@ Function #473 at 0x143fd6900
   Expected GUID: 0f64d6e0-7548-5f37-bebc-52eeea2f3e1c
   Expected blocks: 40
   Size difference: 0 bytes
-  Blocks matched: 38/40 (95.0%)
+  Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #474 at 0x143fdbf80
@@ -3625,7 +3625,7 @@ Function #518 at 0x14433f630
   Expected GUID: 69f5fb8a-287b-55d1-8dd6-a85e1795e9a6
   Expected blocks: 40
   Size difference: 0 bytes
-  Blocks matched: 38/40 (95.0%)
+  Blocks matched: 40/40 (100.0%)
   GUID match: YES
 
 Function #519 at 0x1443427f0
@@ -3674,7 +3674,7 @@ Function #525 at 0x1443d66e0
   Expected GUID: 80f187c6-5349-58f8-9f20-0955068b3c03
   Expected blocks: 40
   Size difference: 0 bytes
-  Blocks matched: 39/40 (97.5%)
+  Blocks matched: 40/40 (100.0%)
   GUID match: YES
 
 Function #526 at 0x1443e8fe0
@@ -3723,14 +3723,14 @@ Function #532 at 0x1444bfea0
   Expected GUID: 016c5cab-0329-5e50-adc1-2cf3fccf41ec
   Expected blocks: 40
   Size difference: 0 bytes
-  Blocks matched: 38/40 (95.0%)
+  Blocks matched: 39/40 (97.5%)
   GUID match: YES
 
 Function #533 at 0x1444c01d0
   Expected GUID: ddc09a76-6531-517d-accb-7b2fb994bbf9
   Expected blocks: 40
   Size difference: 0 bytes
-  Blocks matched: 38/40 (95.0%)
+  Blocks matched: 39/40 (97.5%)
   GUID match: YES
 
 Function #534 at 0x1444c2620
@@ -3842,7 +3842,7 @@ Function #549 at 0x14463efa0
   Expected GUID: af6ef63f-7577-5166-9f97-4ad3a0d0e19b
   Expected blocks: 40
   Size difference: 1 bytes
-  Blocks matched: 38/40 (95.0%)
+  Blocks matched: 40/40 (100.0%)
   GUID match: NO
 
 Function #550 at 0x1446437c0
@@ -3856,7 +3856,7 @@ Function #551 at 0x144688ea0
   Expected GUID: bc5bcb82-b1ac-523a-994f-485b045346b3
   Expected blocks: 40
   Size difference: 1 bytes
-  Blocks matched: 37/40 (92.5%)
+  Blocks matched: 40/40 (100.0%)
   GUID match: YES
 
 Function #552 at 0x144690a50
@@ -3947,7 +3947,7 @@ Function #564 at 0x1447c6890
   Expected GUID: 32458c8d-db8b-559c-93ae-a07e865514c7
   Expected blocks: 40
   Size difference: 0 bytes
-  Blocks matched: 33/40 (82.5%)
+  Blocks matched: 34/40 (85.0%)
   GUID match: NO
 
 Function #565 at 0x1447e62d0
@@ -4004,4 +4004,50 @@ Summary
 Total functions analyzed: 571
 Functions with exact GUID match: 398/571 (69.7%)
 Functions with size mismatch: 4
-Total basic blocks matched: 24255/24380 (99.5%)
+Total basic blocks matched: 24271/24380 (99.6%)
+
+Block Match Distribution:
+========================
+  90%: 65 functions
+  80%: 2 functions
+  70%: 2 functions
+  100%: 502 functions
+
+Functions with 100% Block Match but Wrong GUID:
+===============================================
+Count: 126
+  Function #2 at 0x1405f0880 (expected: c6b36d42-1f8b-5bec-bb75-479fdd1494a5)
+  Function #17 at 0x140988f70 (expected: f1d2574e-10cf-5622-a8ed-4802328c54fd)
+  Function #23 at 0x140a6b920 (expected: 09dae178-9b30-563d-9d4f-1e8904e49c33)
+  Function #30 at 0x140b17bb0 (expected: 2c12ee86-d755-5204-8898-aa5c37598f05)
+  Function #34 at 0x140bd2780 (expected: e36bcf3e-556d-5d35-aa19-86a2aa4acb26)
+  Function #37 at 0x140c22380 (expected: f05ed3bc-ccb3-5f3b-8851-a28a4d1a4f12)
+  Function #42 at 0x140c6cb70 (expected: a1cbb635-c343-5190-8b60-c887dba0b286)
+  Function #54 at 0x140d9ca90 (expected: 44206a14-122f-5339-9113-b1f0fe28de63)
+  Function #57 at 0x140dd46f0 (expected: 54dd2d5b-aa0e-5e72-9899-4a14aa3bfb2e)
+  Function #58 at 0x140de4490 (expected: c6902588-efe9-54aa-8606-4a01e4a5f6d1)
+  ... and 116 more
+
+All Non-Matching Functions by Block Match Rate:
+==============================================
+  Function #2 at 0x1405f0880: 40/40 blocks (100.0%)
+  Function #17 at 0x140988f70: 40/40 blocks (100.0%)
+  Function #23 at 0x140a6b920: 40/40 blocks (100.0%)
+  Function #30 at 0x140b17bb0: 40/40 blocks (100.0%)
+  Function #34 at 0x140bd2780: 40/40 blocks (100.0%)
+  Function #37 at 0x140c22380: 40/40 blocks (100.0%)
+  Function #42 at 0x140c6cb70: 40/40 blocks (100.0%)
+  Function #54 at 0x140d9ca90: 40/40 blocks (100.0%)
+  Function #57 at 0x140dd46f0: 40/40 blocks (100.0%)
+  Function #58 at 0x140de4490: 40/40 blocks (100.0%)
+  Function #59 at 0x140df7e10: 40/40 blocks (100.0%)
+  Function #70 at 0x140ee5f20: 40/40 blocks (100.0%)
+  Function #81 at 0x141053ec0: 150/150 blocks (100.0%)
+  Function #83 at 0x1410bc940: 40/40 blocks (100.0%)
+  Function #84 at 0x1410bcc40: 40/40 blocks (100.0%)
+  Function #88 at 0x14115b900: 150/150 blocks (100.0%)
+  Function #89 at 0x14117c340: 40/40 blocks (100.0%)
+  Function #101 at 0x141379ec0: 40/40 blocks (100.0%)
+  Function #102 at 0x14137a230: 40/40 blocks (100.0%)
+  Function #158 at 0x1417563a0: 40/40 blocks (100.0%)
+  ... and 153 more
