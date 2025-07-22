@@ -601,10 +601,16 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
     for i in 0..instruction.op_count() {
         if instruction.op_kind(i) == OpKind::Memory {
             // Check if it's RIP-relative (no base register, or RIP as base)
-            if instruction.memory_base() == Register::RIP
-                || (instruction.memory_base() == Register::None
-                    && instruction.memory_index() == Register::None
-                    && instruction.memory_displacement64() != 0)
+            if instruction.memory_base() == Register::RIP {
+                return true;
+            }
+
+            // Also check for displacement-only addressing (no base, no index)
+            // BUT exclude segment-relative addressing (GS, FS, etc)
+            if instruction.memory_base() == Register::None
+                && instruction.memory_index() == Register::None
+                && instruction.memory_displacement64() != 0
+                && instruction.segment_prefix() == Register::None
             {
                 return true;
             }
