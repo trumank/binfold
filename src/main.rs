@@ -3,16 +3,15 @@ use clap::{Parser, Subcommand};
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, OpKind, Register,
 };
-use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use uuid::Uuid;
+use uuid::{Uuid, uuid};
 
 mod pe_loader;
 use pe_loader::PeLoader;
 
-const FUNCTION_NAMESPACE: &str = "0192a179-61ac-7cef-88ed-012296e9492f";
-const BASIC_BLOCK_NAMESPACE: &str = "0192a178-7a5f-7936-8653-3cbaa7d6afe7";
+const FUNCTION_NAMESPACE: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
+const BASIC_BLOCK_NAMESPACE: Uuid = uuid!("0192a178-7a5f-7936-8653-3cbaa7d6afe7");
 
 #[derive(Debug, Clone, Default)]
 struct DebugContext {
@@ -224,17 +223,15 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
     // Combine block UUIDs to create function UUID
     // Note: Despite WARP spec saying "highest to lowest", Binary Ninja
     // actually combines them in low-to-high address order
-    let namespace = Uuid::parse_str(FUNCTION_NAMESPACE).unwrap();
     let mut combined_bytes = Vec::new();
     for (_, uuid) in block_uuids.iter() {
         combined_bytes.extend_from_slice(uuid.as_bytes());
     }
 
-    let function_uuid = create_uuid_v5(&namespace, &combined_bytes);
+    let function_uuid = Uuid::new_v5(&FUNCTION_NAMESPACE, &combined_bytes);
 
     if ctx.debug_guid {
         println!("\nFunction UUID calculation:");
-        println!("  Namespace: {}", namespace);
         println!("  Block count: {}", block_uuids.len());
         println!("  Final UUID: {}", function_uuid);
     }
@@ -470,13 +467,12 @@ fn get_branch_target(instruction: &Instruction) -> Option<u64> {
 }
 
 fn create_basic_block_guid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
-    let namespace = Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap();
     let instruction_bytes = if ctx.debug_guid {
         get_instruction_bytes_for_guid_debug(raw_bytes, base)
     } else {
         get_instruction_bytes_for_guid(raw_bytes, base)
     };
-    create_uuid_v5(&namespace, &instruction_bytes)
+    Uuid::new_v5(&BASIC_BLOCK_NAMESPACE, &instruction_bytes)
 }
 
 fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64) -> Vec<u8> {
@@ -491,8 +487,8 @@ fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64) -> Vec<u8> {
         let end = (decoder.ip() - base) as usize;
         let instr_bytes = &raw_bytes[start..end];
 
-        // NOPs are included in the hash according to WARP spec
-        // Only skip them if they're used for hot-patching alignment
+        // NOPs handling is complex - Binary Ninja seems to include them
+        // Only skip register-to-itself NOPs for hot-patching
 
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
@@ -534,8 +530,8 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> Vec<u8> 
         output.clear();
         formatter.format(&instruction, &mut output);
 
-        // NOPs are included in the hash according to WARP spec
-        // Only skip them if they're used for hot-patching alignment
+        // NOPs handling is complex - Binary Ninja seems to include them
+        // Only skip register-to-itself NOPs for hot-patching
 
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
@@ -645,22 +641,6 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
     }
 
     false
-}
-
-fn create_uuid_v5(namespace: &Uuid, data: &[u8]) -> Uuid {
-    let mut hasher = Sha1::new();
-    hasher.update(namespace.as_bytes());
-    hasher.update(data);
-    let hash = hasher.finalize();
-
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hash[..16]);
-
-    // Set version (5) and variant bits
-    bytes[6] = (bytes[6] & 0x0f) | 0x50;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-
-    Uuid::from_bytes(bytes)
 }
 
 fn print_disassembly_with_edges(raw_bytes: &[u8], base: u64) {
@@ -813,10 +793,11 @@ mod test {
         }
 
         // Collect detailed statistics
-        let mut block_match_distribution: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut block_match_distribution: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut non_matching_functions = Vec::new();
         let mut perfect_block_no_guid = Vec::new();
-        
+
         // Re-analyze for detailed stats
         total_functions = 0;
         for exe in &functions {
@@ -832,21 +813,33 @@ mod test {
                             .map(|b| (b.start, b.end, b.guid))
                             .collect(),
                     );
-                
+
                 total_functions += 1;
                 let match_rate = blocks_matched as f64 / blocks_total as f64 * 100.0;
                 let bucket = format!("{:.0}%", (match_rate / 10.0).floor() * 10.0);
                 *block_match_distribution.entry(bucket).or_insert(0) += 1;
-                
+
                 if !guid_match {
-                    non_matching_functions.push((idx + 1, function.start, blocks_matched, blocks_total, match_rate, exe.path.clone()));
+                    non_matching_functions.push((
+                        idx + 1,
+                        function.start,
+                        blocks_matched,
+                        blocks_total,
+                        match_rate,
+                        exe.path.clone(),
+                    ));
                     if blocks_matched == blocks_total {
-                        perfect_block_no_guid.push((idx + 1, function.start, function.guid.clone(), exe.path.clone()));
+                        perfect_block_no_guid.push((
+                            idx + 1,
+                            function.start,
+                            function.guid.clone(),
+                            exe.path.clone(),
+                        ));
                     }
                 }
             }
         }
-        
+
         writeln!(stats_file, "Summary").unwrap();
         writeln!(stats_file, "=======").unwrap();
         writeln!(stats_file, "Total functions analyzed: {}", total_functions).unwrap();
@@ -872,7 +865,7 @@ mod test {
             total_blocks_matched as f64 / total_blocks_analyzed as f64 * 100.0
         )
         .unwrap();
-        
+
         writeln!(stats_file, "\nBlock Match Distribution:").unwrap();
         writeln!(stats_file, "========================").unwrap();
         let mut buckets: Vec<_> = block_match_distribution.iter().collect();
@@ -880,19 +873,41 @@ mod test {
         for (bucket, count) in buckets {
             writeln!(stats_file, "  {}: {} functions", bucket, count).unwrap();
         }
-        
-        writeln!(stats_file, "\nFunctions with 100% Block Match but Wrong GUID:").unwrap();
-        writeln!(stats_file, "===============================================").unwrap();
+
+        writeln!(
+            stats_file,
+            "\nFunctions with 100% Block Match but Wrong GUID:"
+        )
+        .unwrap();
+        writeln!(
+            stats_file,
+            "==============================================="
+        )
+        .unwrap();
         writeln!(stats_file, "Count: {}", perfect_block_no_guid.len()).unwrap();
         for (idx, addr, guid, exe_path) in perfect_block_no_guid.iter().take(10) {
-            writeln!(stats_file, "  Function #{} at 0x{:x} (expected: {})", idx, addr, guid).unwrap();
+            writeln!(
+                stats_file,
+                "  Function #{} at 0x{:x} (expected: {})",
+                idx, addr, guid
+            )
+            .unwrap();
             writeln!(stats_file, "    in: {}", exe_path).unwrap();
         }
         if perfect_block_no_guid.len() > 10 {
-            writeln!(stats_file, "  ... and {} more", perfect_block_no_guid.len() - 10).unwrap();
+            writeln!(
+                stats_file,
+                "  ... and {} more",
+                perfect_block_no_guid.len() - 10
+            )
+            .unwrap();
         }
-        
-        writeln!(stats_file, "\nAll Non-Matching Functions by Block Match Rate:").unwrap();
+
+        writeln!(
+            stats_file,
+            "\nAll Non-Matching Functions by Block Match Rate:"
+        )
+        .unwrap();
         writeln!(stats_file, "==============================================").unwrap();
         non_matching_functions.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap());
         for (idx, addr, matched, total, rate, exe_path) in non_matching_functions.iter().take(20) {
@@ -900,11 +915,17 @@ mod test {
                 stats_file,
                 "  Function #{} at 0x{:x}: {}/{} blocks ({:.1}%)",
                 idx, addr, matched, total, rate
-            ).unwrap();
+            )
+            .unwrap();
             writeln!(stats_file, "    in: {}", exe_path).unwrap();
         }
         if non_matching_functions.len() > 20 {
-            writeln!(stats_file, "  ... and {} more", non_matching_functions.len() - 20).unwrap();
+            writeln!(
+                stats_file,
+                "  ... and {} more",
+                non_matching_functions.len() - 20
+            )
+            .unwrap();
         }
     }
 
@@ -1056,13 +1077,20 @@ mod test {
                 "MISMATCH"
             }
         );
-        
+
         if !mismatched_blocks.is_empty() && exact_match {
-            println!("\nNote: Function UUID matches despite {} block mismatches:", mismatched_blocks.len());
+            println!(
+                "\nNote: Function UUID matches despite {} block mismatches:",
+                mismatched_blocks.len()
+            );
             for (start, expected_end, actual_end) in mismatched_blocks.iter().take(5) {
-                println!("  Block 0x{:x}: expected end 0x{:x}, actual end 0x{:x} (diff: {})", 
-                    start, expected_end, actual_end, 
-                    *actual_end as i64 - *expected_end as i64);
+                println!(
+                    "  Block 0x{:x}: expected end 0x{:x}, actual end 0x{:x} (diff: {})",
+                    start,
+                    expected_end,
+                    actual_end,
+                    *actual_end as i64 - *expected_end as i64
+                );
             }
         }
 

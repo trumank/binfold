@@ -1,6 +1,6 @@
 WARP Function Analysis Statistics
 ==================================
-Generated at: SystemTime { tv_sec: 1753166429, tv_nsec: 46141756 }
+Generated at: SystemTime { tv_sec: 1753171341, tv_nsec: 849595938 }
 
 
 Executable: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
@@ -13,11 +13,11 @@ Function #1 at 0x14052f518
   GUID match: YES
 
 Function #2 at 0x1405f0880
-  Expected GUID: c6b36d42-1f8b-5bec-bb75-479fdd1494a5
+  Expected GUID: 2e8229c1-8624-51e2-8d46-cf7b35ed7a0e
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #3 at 0x140603730
   Expected GUID: d4102ea4-3f51-558d-b65a-0fd257e13d7c
@@ -76,11 +76,11 @@ Function #10 at 0x14065d090
   GUID match: YES
 
 Function #11 at 0x1408ac1e0
-  Expected GUID: 29a9156c-686b-5d7f-9bfd-317c1d4f0dda
+  Expected GUID: 7809a141-52ed-5030-807b-58742de21b20
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #12 at 0x1408ad750
   Expected GUID: f7ab992a-3c2e-5a4f-bc2e-e14be3e16f05
@@ -118,11 +118,11 @@ Function #16 at 0x140980010
   GUID match: YES
 
 Function #17 at 0x140988f70
-  Expected GUID: f1d2574e-10cf-5622-a8ed-4802328c54fd
+  Expected GUID: ead620b8-654c-5139-8a48-fad6fdf5cc25
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #18 at 0x14098f530
   Expected GUID: ba0a73c7-f4de-55e2-a874-d1f679592972
@@ -160,11 +160,11 @@ Function #22 at 0x1409f6ac0
   GUID match: YES
 
 Function #23 at 0x140a6b920
-  Expected GUID: 09dae178-9b30-563d-9d4f-1e8904e49c33
+  Expected GUID: fa336fb8-b94c-5aeb-bfac-b44132518c2c
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #24 at 0x140a93000
   Expected GUID: ff66b5a1-f783-55dd-ad85-b2444d685e14
@@ -209,11 +209,11 @@ Function #29 at 0x140b17090
   GUID match: YES
 
 Function #30 at 0x140b17bb0
-  Expected GUID: 2c12ee86-d755-5204-8898-aa5c37598f05
+  Expected GUID: ba76ac95-ee86-5c44-b345-47d52ea5c8cf
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #31 at 0x140b41c80
   Expected GUID: f0edc4f4-f0f5-567f-bc66-abe27fcfde3e
@@ -230,21 +230,21 @@ Function #32 at 0x140b4b950
   GUID match: YES
 
 Function #33 at 0x140bcb2f0
-  Expected GUID: 4202cbc2-9843-59bb-abd5-a5a54ca9a1dd
+  Expected GUID: 303f0de7-1f75-5d6a-8bee-34acd739a5ed
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #34 at 0x140bd2780
-  Expected GUID: e36bcf3e-556d-5d35-aa19-86a2aa4acb26
+  Expected GUID: 2029f623-ca43-53b6-b5f8-789b0e25c6ef
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #35 at 0x140bf7110
-  Expected GUID: f608d377-64e8-5586-b496-9ae95becdf68
+  Expected GUID: 75e2521d-9802-596e-832e-7c8ef8b46781
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -258,14 +258,14 @@ Function #36 at 0x140bfc7a0
   GUID match: YES
 
 Function #37 at 0x140c22380
-  Expected GUID: f05ed3bc-ccb3-5f3b-8851-a28a4d1a4f12
+  Expected GUID: 6437a614-234b-5410-8cbb-d7614aec3eab
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #38 at 0x140c3ec00
-  Expected GUID: c530beb9-6c02-5e72-8938-125b6c0475a5
+  Expected GUID: d18140c4-e055-5e2f-9f06-2ae36f86d6b1
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -293,18 +293,18 @@ Function #41 at 0x140c55cc0
   GUID match: YES
 
 Function #42 at 0x140c6cb70
-  Expected GUID: a1cbb635-c343-5190-8b60-c887dba0b286
+  Expected GUID: d822152d-9848-56bb-b2ec-2c2620b7dae5
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #43 at 0x140c9e400
-  Expected GUID: 9bedba3a-22ab-59d3-a751-a095f704c618
+  Expected GUID: 4c6fd36a-1ad5-50cc-a430-8b8d9d86b57c
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 37/40 (92.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #44 at 0x140c9e9a0
   Expected GUID: 858bb302-9439-5e6e-98e8-b2c36ed3f644
@@ -377,11 +377,11 @@ Function #53 at 0x140d602e0
   GUID match: YES
 
 Function #54 at 0x140d9ca90
-  Expected GUID: 44206a14-122f-5339-9113-b1f0fe28de63
+  Expected GUID: dbabfc0e-c4b7-58df-bb23-b014dd4f1374
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #55 at 0x140da91f0
   Expected GUID: 1e16c16e-d2a6-5371-a302-ffc06552a7d0
@@ -398,25 +398,25 @@ Function #56 at 0x140dbec40
   GUID match: YES
 
 Function #57 at 0x140dd46f0
-  Expected GUID: 54dd2d5b-aa0e-5e72-9899-4a14aa3bfb2e
+  Expected GUID: bb2bfe7e-2764-5a98-b537-45bb850c2ee5
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #58 at 0x140de4490
-  Expected GUID: c6902588-efe9-54aa-8606-4a01e4a5f6d1
+  Expected GUID: 34be7daf-dd5a-5754-9757-fe7625031c37
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #59 at 0x140df7e10
-  Expected GUID: bfad7424-4145-51e2-9f29-efbc6d2137c3
+  Expected GUID: 960b1364-e5af-5d54-a7ec-ed9576d6d94d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #60 at 0x140e3f740
   Expected GUID: 5bdb4ae2-8a35-5158-828a-444f245a0d00
@@ -489,11 +489,11 @@ Function #69 at 0x140ec9490
   GUID match: YES
 
 Function #70 at 0x140ee5f20
-  Expected GUID: 0ef2ef27-220f-5b17-80d2-4379b2ef4562
+  Expected GUID: 4847f26b-c319-51c2-9625-cdb89f88aadb
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #71 at 0x140ee9ab0
   Expected GUID: c9228e3f-6791-528d-9758-c669d34d78a9
@@ -503,7 +503,7 @@ Function #71 at 0x140ee9ab0
   GUID match: YES
 
 Function #72 at 0x140ef62d0
-  Expected GUID: 785dd543-d7c8-5a35-a3f0-bd3ce0dafe3b
+  Expected GUID: dfac2a89-9d93-5c40-8b55-1efdd7c0d0e9
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -559,18 +559,18 @@ Function #79 at 0x140fab590
   GUID match: YES
 
 Function #80 at 0x141011000
-  Expected GUID: acacaca9-514f-5f5a-be30-046aca7a60aa
+  Expected GUID: 7c531606-9aaf-53d7-a641-9b6deae1bcbd
   Expected blocks: 150
   Size difference: 1 bytes
   Blocks matched: 150/150 (100.0%)
-  GUID match: YES
+  GUID match: NO
 
 Function #81 at 0x141053ec0
-  Expected GUID: 4705c21c-ac6c-54c2-a6f2-72e183b281f0
+  Expected GUID: 7fa602d4-b6b7-5748-9bb0-43ea5c42c87b
   Expected blocks: 150
   Size difference: 0 bytes
   Blocks matched: 150/150 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #82 at 0x141064b80
   Expected GUID: 561db413-93a9-5311-8a9a-9dbdfb549de6
@@ -580,18 +580,18 @@ Function #82 at 0x141064b80
   GUID match: YES
 
 Function #83 at 0x1410bc940
-  Expected GUID: c6902588-efe9-54aa-8606-4a01e4a5f6d1
+  Expected GUID: 34be7daf-dd5a-5754-9757-fe7625031c37
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #84 at 0x1410bcc40
-  Expected GUID: 768b58a9-3e01-574f-9233-d5cf0998f793
+  Expected GUID: 59e15741-c9b2-544d-832f-3e812cae1594
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #85 at 0x1410eba20
   Expected GUID: 6970efcd-82d2-59bf-8608-2102529507de
@@ -615,18 +615,18 @@ Function #87 at 0x14115aaf0
   GUID match: YES
 
 Function #88 at 0x14115b900
-  Expected GUID: 2e3c4e9c-ac4a-5ac2-9341-225130fc04c5
+  Expected GUID: 4226bf85-82a4-5aba-8753-cd2157dc1772
   Expected blocks: 150
   Size difference: 0 bytes
   Blocks matched: 150/150 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #89 at 0x14117c340
-  Expected GUID: 4c6ced47-a1ff-5eb0-8710-06d445466ef0
+  Expected GUID: 02e63d23-1334-5c74-a6e3-37b82bc8572c
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #90 at 0x141188e10
   Expected GUID: 0d078831-60c1-54e1-9a34-28c4c27ca680
@@ -671,18 +671,18 @@ Function #95 at 0x1411b1080
   GUID match: YES
 
 Function #96 at 0x1411cfda0
-  Expected GUID: 6a3c0e27-8dd2-501e-8547-347d36f982a6
+  Expected GUID: cd6616e4-ee20-558b-8f8b-e2ce3f393851
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #97 at 0x1411e15e0
-  Expected GUID: 69eef50d-07e4-5d2e-9977-e5b082524192
+  Expected GUID: 6ad4d616-d5f9-51e8-b4dd-8f789e06d7c3
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #98 at 0x1411ee140
   Expected GUID: 2b104ed7-4ff3-5068-b2cb-4a266a67eeb5
@@ -706,18 +706,18 @@ Function #100 at 0x141372bf0
   GUID match: YES
 
 Function #101 at 0x141379ec0
-  Expected GUID: d1459663-0de4-5bfe-a37a-b146208e78af
+  Expected GUID: 18b30320-4f46-5d65-b18e-ce9d8177e475
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #102 at 0x14137a230
-  Expected GUID: 0ef2ef27-220f-5b17-80d2-4379b2ef4562
+  Expected GUID: 4847f26b-c319-51c2-9625-cdb89f88aadb
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #103 at 0x14137c990
   Expected GUID: d8ac15f1-87a4-5e0e-bc10-0a75e7317215
@@ -1105,11 +1105,11 @@ Function #157 at 0x1415f6060
   GUID match: YES
 
 Function #158 at 0x1417563a0
-  Expected GUID: d0d59dc6-612d-57ce-a3e1-237e349b19bf
+  Expected GUID: e659180d-c82d-5768-bc05-d0c528440ad8
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #159 at 0x141778700
   Expected GUID: 11805f03-459d-5ab3-9b6b-91980367b7a9
@@ -1126,11 +1126,11 @@ Function #160 at 0x1417ae6c0
   GUID match: YES
 
 Function #161 at 0x1417d4700
-  Expected GUID: 32fcfa1c-d0cf-5c01-8a5d-db6b39bdab68
+  Expected GUID: 837fd600-12cb-5a3e-ace6-53ea5b01a4e3
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #162 at 0x1417d9a40
   Expected GUID: 3d083de5-7760-54ad-96c9-2cd8afec9772
@@ -1182,7 +1182,7 @@ Function #168 at 0x14184f430
   GUID match: YES
 
 Function #169 at 0x141850070
-  Expected GUID: 68bbbb7c-e199-5e28-9b38-4d4744342e4b
+  Expected GUID: 08f41009-1eb3-5ce9-a90a-b5348860df44
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -1259,21 +1259,21 @@ Function #179 at 0x141a1ef00
   GUID match: YES
 
 Function #180 at 0x141a40bb0
-  Expected GUID: d97635b3-e26f-59cd-aa54-46c222e0bdb9
+  Expected GUID: 8be5a549-359f-5947-b779-9bf2f7bdac02
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #181 at 0x141a40ee0
-  Expected GUID: 12d747fd-32ad-5f1c-9350-47dfd5a3ebe5
+  Expected GUID: 57a468e5-871a-565c-b915-783ff71589c7
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #182 at 0x141a511f0
-  Expected GUID: 437f7dd7-69e5-5afc-9b0c-11c36f00a762
+  Expected GUID: bbf42819-1d12-5678-b3dd-ad59feefc2c7
   Expected blocks: 40
   Size difference: 3410 bytes
   Blocks matched: 38/40 (95.0%)
@@ -1287,32 +1287,32 @@ Function #183 at 0x141a51910
   GUID match: YES
 
 Function #184 at 0x141a62fe0
-  Expected GUID: 7a2b8047-31ef-59c7-a2f8-1522c421a2b0
+  Expected GUID: d2b176c3-a76e-5d26-b717-b7c3a13c0033
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #185 at 0x141a74060
-  Expected GUID: 25467535-2605-5e82-a473-5b9d8f2c85f1
+  Expected GUID: 1dea1b75-272a-5dd5-bb2c-eed73d8d4568
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #186 at 0x141a79740
-  Expected GUID: 3629e9d6-0510-52ca-af68-d065eb3974d7
+  Expected GUID: 218d74bd-a8fb-5187-b60b-4bb7ab0001d2
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #187 at 0x141a79a50
-  Expected GUID: 80b833bc-608e-58e1-ac97-844a597aea04
+  Expected GUID: 6be8334d-a59d-527b-9edb-56789ee44ff5
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #188 at 0x141a9ac60
   Expected GUID: 8a19d6e2-aff2-5593-ac90-0d3442d83f48
@@ -1329,11 +1329,11 @@ Function #189 at 0x141aacc50
   GUID match: YES
 
 Function #190 at 0x141aafa20
-  Expected GUID: 6cd92594-1723-5a48-8781-9d2ff96f05e9
+  Expected GUID: 0d16b1e4-bd78-56b2-83cd-36f8077a5e04
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #191 at 0x141abf870
   Expected GUID: 57a78af3-4475-5945-a7ac-337a41f90c4d
@@ -1350,7 +1350,7 @@ Function #192 at 0x141ad7410
   GUID match: YES
 
 Function #193 at 0x141ae2db0
-  Expected GUID: 9ba3e219-e809-5023-a26e-4a0a509a75e6
+  Expected GUID: 55cdbd68-e0d5-5900-bb1c-89eb32fccec6
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -1371,11 +1371,11 @@ Function #195 at 0x141b3af00
   GUID match: YES
 
 Function #196 at 0x141b3f9c0
-  Expected GUID: a8935c16-e1c5-5739-a253-da150f77e1ad
+  Expected GUID: 69400eee-d91c-5809-b650-980c6e24a366
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #197 at 0x141b494a0
   Expected GUID: 46dab132-892b-5786-88c8-e1df13d325d9
@@ -1385,25 +1385,25 @@ Function #197 at 0x141b494a0
   GUID match: YES
 
 Function #198 at 0x141b6e060
-  Expected GUID: 6c80fc30-ac14-5817-9825-fdc3d5a94dc1
+  Expected GUID: b04322ec-4078-5d31-bd8a-dba30b40750e
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #199 at 0x141bba9c0
-  Expected GUID: 80d578c6-6709-57c6-a8f7-37695af4129d
+  Expected GUID: eb82ac72-fa81-5c94-9d3d-2f75ecfd8e63
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #200 at 0x141bcd5f0
-  Expected GUID: 4f06b2da-5d01-5830-8e0e-046ac54e9898
+  Expected GUID: d50ddae8-d408-563b-8e80-2ea7f953c269
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #201 at 0x141bdd2c0
   Expected GUID: 4a44af36-181b-575b-b104-a190279ec48e
@@ -1413,7 +1413,7 @@ Function #201 at 0x141bdd2c0
   GUID match: YES
 
 Function #202 at 0x141be4050
-  Expected GUID: 7dd8e05d-33ee-595e-a770-8986c6d73542
+  Expected GUID: fc3090ac-5a9c-5a34-ba28-f719d21f9674
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 38/40 (95.0%)
@@ -1525,11 +1525,11 @@ Function #217 at 0x141d4f9a0
   GUID match: YES
 
 Function #218 at 0x141d8de80
-  Expected GUID: b2eeb655-9609-5819-8e56-d96b34e09d2f
+  Expected GUID: 93cb7737-80c7-5a3a-86d0-4720ca42de37
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #219 at 0x141dbc2e0
   Expected GUID: cdd9121b-176d-5129-83eb-714c290d97c7
@@ -1581,11 +1581,11 @@ Function #225 at 0x141e73e20
   GUID match: YES
 
 Function #226 at 0x141ee2420
-  Expected GUID: 06323f94-e45a-5c36-a08d-e48dfe47dc8b
+  Expected GUID: 3a0e4bb4-5215-504a-af84-853863a2eaab
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #227 at 0x141f1a7f0
   Expected GUID: b3336bfb-1ab2-5bec-b1d9-c3d43e5cf4c8
@@ -1595,18 +1595,18 @@ Function #227 at 0x141f1a7f0
   GUID match: YES
 
 Function #228 at 0x141f294b0
-  Expected GUID: 5bb5c928-4177-5b1b-a575-3cd425398db0
+  Expected GUID: d60900f6-c24f-5178-937d-34c6f7b4262e
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 38/40 (95.0%)
-  GUID match: YES
+  GUID match: NO
 
 Function #229 at 0x141f36740
-  Expected GUID: a8f194b9-8753-5258-9135-72deeed11f1f
+  Expected GUID: 8186ef35-05d2-55a3-862b-850ec660cf81
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #230 at 0x141f3f810
   Expected GUID: 406121d4-bf49-5c2b-bbd4-142b357d39a8
@@ -1637,11 +1637,11 @@ Function #233 at 0x1420033c0
   GUID match: YES
 
 Function #234 at 0x14200dfc0
-  Expected GUID: 206f1d8c-5979-5e94-ae8c-e79ee59d63ee
+  Expected GUID: 37610ee2-88eb-5900-9b8f-4d69cb7360d7
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #235 at 0x142026d90
   Expected GUID: 0ca2a550-209c-5972-a774-758129c78018
@@ -1686,25 +1686,25 @@ Function #240 at 0x142098350
   GUID match: YES
 
 Function #241 at 0x14219ee50
-  Expected GUID: 4724a9f5-bf3a-5a82-8c58-5aa7c0ea2cff
+  Expected GUID: b70c984a-8748-5358-b14d-d47ce1eb6d26
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #242 at 0x1421bfbc0
-  Expected GUID: 75a99857-5405-5a53-8a56-adac9bffd0b2
+  Expected GUID: c72c26bf-ca23-598d-9cbc-de25433a6988
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #243 at 0x142242db0
-  Expected GUID: b648c9c4-cc84-5f18-abba-83d95f0981e4
+  Expected GUID: e0cfd69b-51e1-5db2-a012-130ced8d56a0
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #244 at 0x14224c7e0
   Expected GUID: 968ed1a3-77e7-50f4-9bc5-e9121cb66b6d
@@ -1714,11 +1714,11 @@ Function #244 at 0x14224c7e0
   GUID match: YES
 
 Function #245 at 0x14224e270
-  Expected GUID: 9fef004f-0be4-5bdd-be6c-c4816e5fe456
+  Expected GUID: 315f89fa-abcd-56f5-b922-bb8b61d893ff
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #246 at 0x14227ba50
   Expected GUID: 849bfecb-ce0e-536f-9a4a-4731fab501f6
@@ -1728,11 +1728,11 @@ Function #246 at 0x14227ba50
   GUID match: YES
 
 Function #247 at 0x1422d9940
-  Expected GUID: 9cd4fd40-efb4-54ff-b75e-bae07ad52063
+  Expected GUID: 1b2e708c-895c-55a4-a437-ba57de9ec6f0
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #248 at 0x1422e2050
   Expected GUID: 30eb8bb5-92c0-5ebd-a1f4-107894e51efe
@@ -1763,25 +1763,25 @@ Function #251 at 0x142327f50
   GUID match: YES
 
 Function #252 at 0x14232c230
-  Expected GUID: a94bc1d1-55cd-535d-b310-a3a2e9ce4c9d
+  Expected GUID: d03b2353-17cd-5a67-948a-8434ca5684ed
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #253 at 0x14232ded0
-  Expected GUID: 6466d115-14f0-5ac1-8b48-4f497116dc3a
+  Expected GUID: cad69fa9-8d64-58ff-8542-43efc0270f73
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 38/40 (95.0%)
   GUID match: NO
 
 Function #254 at 0x14233ac10
-  Expected GUID: 95eae1c4-3f4a-5d45-9b33-4fcf3cf5c322
+  Expected GUID: 1389d774-8c26-532f-b4d4-886fb16c49f4
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #255 at 0x14233dcc0
   Expected GUID: 109c081a-afb8-5faf-9ed8-b45c3439aee8
@@ -1826,7 +1826,7 @@ Function #260 at 0x14238c2b0
   GUID match: YES
 
 Function #261 at 0x14238fff0
-  Expected GUID: e3f0f497-cdc0-597f-ac39-0baef4e933b9
+  Expected GUID: d4c84569-73d7-56b8-9f81-94eb557d5b01
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -1882,11 +1882,11 @@ Function #268 at 0x14243a870
   GUID match: YES
 
 Function #269 at 0x142449a90
-  Expected GUID: 0105b5b7-c48f-5110-9533-6970d409be33
+  Expected GUID: e0785a99-cfdc-5751-b582-667c9f876c23
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #270 at 0x142449d70
   Expected GUID: 8887be44-5733-5f7e-af19-51c59b73c601
@@ -1910,11 +1910,11 @@ Function #272 at 0x142453ac0
   GUID match: YES
 
 Function #273 at 0x14245d9e0
-  Expected GUID: 8117661d-b028-5c85-899e-aa631248fc13
+  Expected GUID: f04eb858-2eba-5aa5-b479-11598572ac7b
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #274 at 0x14246c650
   Expected GUID: 6ee6abb6-80a0-56cc-83e5-8df1de4fd95a
@@ -1945,11 +1945,11 @@ Function #277 at 0x1424c50d0
   GUID match: YES
 
 Function #278 at 0x1424cf360
-  Expected GUID: d265d804-b834-5027-8d99-3133f27c9425
+  Expected GUID: 2abb3609-acc3-5c6b-94b2-26a0bda4638e
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #279 at 0x1424e6c70
   Expected GUID: 26a8ba66-dd96-52f4-82dd-38a64df42c58
@@ -1966,63 +1966,63 @@ Function #280 at 0x142530b10
   GUID match: YES
 
 Function #281 at 0x14253a5e0
-  Expected GUID: da83def2-2cf9-57f0-9d3e-008fa1dd403e
+  Expected GUID: 882731cc-182a-54ae-a1bd-95d5022e418d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #282 at 0x14253a800
-  Expected GUID: da83def2-2cf9-57f0-9d3e-008fa1dd403e
+  Expected GUID: 882731cc-182a-54ae-a1bd-95d5022e418d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #283 at 0x14253aa20
-  Expected GUID: da83def2-2cf9-57f0-9d3e-008fa1dd403e
+  Expected GUID: 882731cc-182a-54ae-a1bd-95d5022e418d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #284 at 0x14253ac40
-  Expected GUID: da83def2-2cf9-57f0-9d3e-008fa1dd403e
+  Expected GUID: 882731cc-182a-54ae-a1bd-95d5022e418d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #285 at 0x14253ae60
-  Expected GUID: da83def2-2cf9-57f0-9d3e-008fa1dd403e
+  Expected GUID: 882731cc-182a-54ae-a1bd-95d5022e418d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #286 at 0x14253b290
-  Expected GUID: da83def2-2cf9-57f0-9d3e-008fa1dd403e
+  Expected GUID: 882731cc-182a-54ae-a1bd-95d5022e418d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #287 at 0x14253b4b0
-  Expected GUID: da83def2-2cf9-57f0-9d3e-008fa1dd403e
+  Expected GUID: 882731cc-182a-54ae-a1bd-95d5022e418d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #288 at 0x14253b6d0
-  Expected GUID: da83def2-2cf9-57f0-9d3e-008fa1dd403e
+  Expected GUID: 882731cc-182a-54ae-a1bd-95d5022e418d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #289 at 0x14253bb20
-  Expected GUID: da83def2-2cf9-57f0-9d3e-008fa1dd403e
+  Expected GUID: 882731cc-182a-54ae-a1bd-95d5022e418d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -2036,7 +2036,7 @@ Function #290 at 0x14256b3f0
   GUID match: NO
 
 Function #291 at 0x142582cd0
-  Expected GUID: 03a3ac43-451e-51ed-9763-0faf45edf465
+  Expected GUID: 6657d62f-b849-5d43-98d3-b89794faf323
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -2050,7 +2050,7 @@ Function #292 at 0x1425ac850
   GUID match: YES
 
 Function #293 at 0x1427731e0
-  Expected GUID: c1e14748-8de7-5b4d-bfaf-814dc527f594
+  Expected GUID: a86b3f71-550d-5f1d-a12f-3aa9d4926cf9
   Expected blocks: 150
   Size difference: 0 bytes
   Blocks matched: 148/150 (98.7%)
@@ -2064,25 +2064,25 @@ Function #294 at 0x1428788d0
   GUID match: YES
 
 Function #295 at 0x1428c47d0
-  Expected GUID: 59f483e2-8a07-5dfc-9f04-ac5fabfbbbe0
+  Expected GUID: 107cc177-4a8e-5281-ad18-5d53b3995a79
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #296 at 0x1428d9df0
-  Expected GUID: 16d0b8ad-e64b-55b3-a2c6-032c9725a01b
+  Expected GUID: 54775b06-1176-5673-a8c7-5915ee4a5d03
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #297 at 0x1428f1fb0
-  Expected GUID: f4331661-ad37-536f-a833-31945af09cdc
+  Expected GUID: 74d84445-a0d9-5bd1-9ac3-a26515b01bdf
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #298 at 0x142931b20
   Expected GUID: 82480c96-397a-5d80-90d5-e55a6397e001
@@ -2099,7 +2099,7 @@ Function #299 at 0x142933020
   GUID match: YES
 
 Function #300 at 0x1429d4e10
-  Expected GUID: 756441c3-dd12-5cb4-b8f0-f781ea476e61
+  Expected GUID: e51e48c7-3042-5959-99aa-3e26c9cb82bd
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 38/40 (95.0%)
@@ -2127,18 +2127,18 @@ Function #303 at 0x142e04850
   GUID match: YES
 
 Function #304 at 0x142e8cc30
-  Expected GUID: 223963e7-cd30-58fc-b601-8661be0d6e67
+  Expected GUID: d0cc6e73-8359-5531-afc4-3c2594a64af9
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #305 at 0x142ef2880
-  Expected GUID: fbd5e7e6-a40b-5a9c-a6e8-1287a55fbda5
+  Expected GUID: 1164d571-e3d4-5695-a3c3-b10a6e6574e1
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #306 at 0x142ef7c10
   Expected GUID: 837dc138-5176-5373-a7c5-0e4b2f241f06
@@ -2169,11 +2169,11 @@ Function #309 at 0x142f1eaa0
   GUID match: YES
 
 Function #310 at 0x142f3b770
-  Expected GUID: dd595586-ae25-5145-88dd-088f97f45856
+  Expected GUID: 55cf85af-f493-540d-a63d-03effb904847
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #311 at 0x142fa8f60
   Expected GUID: d2a08ec2-7168-5837-a46e-3c1117df4d3e
@@ -2183,18 +2183,18 @@ Function #311 at 0x142fa8f60
   GUID match: YES
 
 Function #312 at 0x142fb8700
-  Expected GUID: a6644091-ac34-5f5b-9dec-32a808de66e5
+  Expected GUID: 67231e78-0bc7-5efe-9e40-796a670addf8
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #313 at 0x142fb9250
-  Expected GUID: d5bd5974-511e-580e-bbe3-f5cd42741754
+  Expected GUID: 5b154181-17cc-5a42-8efa-2fb2302c8682
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #314 at 0x142fe37f0
   Expected GUID: 5c705443-e5a5-5811-8f8b-48b618b250b3
@@ -2204,18 +2204,18 @@ Function #314 at 0x142fe37f0
   GUID match: YES
 
 Function #315 at 0x142ff95b0
-  Expected GUID: 33eacb22-40be-5b67-86c3-7b22d65e0b04
+  Expected GUID: 6d678c58-63df-5570-a981-129f0efec454
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #316 at 0x142ff9f40
-  Expected GUID: 98dfd18a-e296-5d37-9065-166a332f097b
+  Expected GUID: 7b7d28c3-a332-5a67-8c9c-7cfc8ef64882
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #317 at 0x143002a60
   Expected GUID: 45fe1dc0-df09-5485-814e-6beb3125c707
@@ -2232,11 +2232,11 @@ Function #318 at 0x143003210
   GUID match: YES
 
 Function #319 at 0x143021170
-  Expected GUID: 909f5aff-571e-5dc1-b6e1-7d6b2bdd69f5
+  Expected GUID: 3ae6b7be-6a0c-55f8-b9d0-b31fcbc3a621
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #320 at 0x143054b30
   Expected GUID: 86fd96a3-873e-58a5-8af4-1706951be7d0
@@ -2253,18 +2253,18 @@ Function #321 at 0x1430561e0
   GUID match: YES
 
 Function #322 at 0x14306ae20
-  Expected GUID: 30928dd6-c8dc-5a24-8487-247b553bc7df
+  Expected GUID: 75749d2e-00e6-5719-806e-8a116546b4b1
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #323 at 0x14306b080
-  Expected GUID: 231c3c83-5ca6-5241-ad69-742e98b73e1b
+  Expected GUID: 092429fe-7ecf-5189-834f-4d0dfe0b568c
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #324 at 0x1430758c0
   Expected GUID: ee51563d-c1c8-58d9-964b-0dc883f7addd
@@ -2281,11 +2281,11 @@ Function #325 at 0x143082d50
   GUID match: YES
 
 Function #326 at 0x14308a5b0
-  Expected GUID: 25112212-eb36-5da0-a56b-2e037096505b
+  Expected GUID: 39d0dbbc-33a7-5b8f-956e-1f2b068168d6
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #327 at 0x14308e8e0
   Expected GUID: 34f998af-4c9b-5495-9d29-408e7cbffb6e
@@ -2309,39 +2309,39 @@ Function #329 at 0x143109910
   GUID match: YES
 
 Function #330 at 0x14310bba0
-  Expected GUID: 57a24b7e-cba9-595b-8a8e-426d78b3e52c
+  Expected GUID: 2fd31c93-0927-5b3a-bc2a-009e9f68d4d2
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #331 at 0x14310ebf0
-  Expected GUID: d22d2e62-6d6a-5c7a-911c-72b8131dec5e
+  Expected GUID: b016c513-edba-5cf1-b936-83170c8ae3c1
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #332 at 0x14310f3d0
-  Expected GUID: 6596467e-41d8-5859-b292-46aefdc96c27
+  Expected GUID: 2661a9c3-1676-57a9-8096-ec5a8efad142
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #333 at 0x14310fcf0
-  Expected GUID: 0d5f2f1c-579a-5390-aed0-d3fc6cc2053c
+  Expected GUID: 26e77164-af50-56c8-8798-30404aa5acc5
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #334 at 0x143143fe0
-  Expected GUID: 97636998-27f2-5bdb-b82e-98e352d33141
+  Expected GUID: 41c59388-ab9c-554a-9a4a-b801a4ba510e
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #335 at 0x143153960
   Expected GUID: a988ca20-d96e-51d7-abbf-ef9cc18d6436
@@ -2351,18 +2351,18 @@ Function #335 at 0x143153960
   GUID match: YES
 
 Function #336 at 0x143185c00
-  Expected GUID: 57ec2577-0dee-5878-b169-87de46dd2388
+  Expected GUID: 932b5d7a-1f34-5de7-aa9e-de4b65e297f9
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #337 at 0x143189960
-  Expected GUID: c8358e3f-51f9-50b1-9761-8b48a70de209
+  Expected GUID: 95ed8494-126d-5175-8c98-8ab6fb0e8193
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #338 at 0x1431da400
   Expected GUID: 1ad6c4b5-664b-53ee-9305-dec6b13aae30
@@ -2379,18 +2379,18 @@ Function #339 at 0x1431f4fb0
   GUID match: YES
 
 Function #340 at 0x143239490
-  Expected GUID: 2c12ee86-d755-5204-8898-aa5c37598f05
+  Expected GUID: ba76ac95-ee86-5c44-b345-47d52ea5c8cf
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #341 at 0x143239730
-  Expected GUID: 7d9e7ba1-235e-5306-9c1b-cd5d946b9778
+  Expected GUID: 23b09ff3-419c-590d-b8b9-0afb695d76f3
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #342 at 0x143244040
   Expected GUID: 6741e687-c1ae-50df-aa4d-9f546897149e
@@ -2400,21 +2400,21 @@ Function #342 at 0x143244040
   GUID match: YES
 
 Function #343 at 0x143297800
-  Expected GUID: 3b02ec63-13a9-502e-b219-3a6bf2f64002
+  Expected GUID: 4635ee4b-cdc1-53f1-9fac-f851e442b341
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #344 at 0x143298040
-  Expected GUID: b167c0e9-e311-5689-be25-46da612329c4
+  Expected GUID: cf3c518d-d477-5704-8981-250bc4c55228
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #345 at 0x143298430
-  Expected GUID: ec83ca05-5859-58e5-a05c-be388ead5698
+  Expected GUID: 9f2e3f9c-a73f-5ee3-8c1e-6397d68db388
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -2435,7 +2435,7 @@ Function #347 at 0x1432b9bc0
   GUID match: YES
 
 Function #348 at 0x1432c8440
-  Expected GUID: 5d4a4366-2e9c-5213-9126-6e837ba74136
+  Expected GUID: c9af5386-8adb-5e0d-8b87-33f716186944
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -2449,11 +2449,11 @@ Function #349 at 0x1432cb730
   GUID match: YES
 
 Function #350 at 0x1432cf1b0
-  Expected GUID: 8d97c5ca-c7b4-5840-a579-4015267f4f5a
+  Expected GUID: 3e110fc4-3919-5d29-a58f-c401deee12ca
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #351 at 0x1432d2840
   Expected GUID: 1bde274d-ebf0-5d21-b954-c9df79b4a6c8
@@ -2463,11 +2463,11 @@ Function #351 at 0x1432d2840
   GUID match: YES
 
 Function #352 at 0x1432efb40
-  Expected GUID: 0fae1ece-e8b9-583f-826b-f61c4354208a
+  Expected GUID: 251ca776-f384-5276-821d-7b7a33f7d5b3
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #353 at 0x1432f5bc0
   Expected GUID: b5a71934-0849-5bf8-a43f-0f72a8c262e9
@@ -2526,11 +2526,11 @@ Function #360 at 0x1433864a0
   GUID match: YES
 
 Function #361 at 0x1433c3460
-  Expected GUID: ef8ad881-92aa-5ac2-8321-9464f04d04be
+  Expected GUID: 99c0b007-0c97-5195-91eb-5175d03bb414
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #362 at 0x1433e1a10
   Expected GUID: ed36f023-7de6-5918-b437-2620fbf5465f
@@ -2561,11 +2561,11 @@ Function #365 at 0x14341ebb0
   GUID match: YES
 
 Function #366 at 0x143430080
-  Expected GUID: 3aec6ad0-aaab-5419-9804-c303d78a9f5c
+  Expected GUID: 40a3c815-5565-529c-ac32-347358de0322
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 38/40 (95.0%)
-  GUID match: YES
+  GUID match: NO
 
 Function #367 at 0x14346ad70
   Expected GUID: bd9f6f9c-e856-5b91-92d9-d7908d264057
@@ -2582,32 +2582,32 @@ Function #368 at 0x1434ed2b0
   GUID match: YES
 
 Function #369 at 0x1434f6ce0
-  Expected GUID: d1e0655b-91ef-5438-9edd-4bd706b158f0
+  Expected GUID: 80fa905f-0f06-5b6d-999a-613e7d09c2b5
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #370 at 0x1434fad10
-  Expected GUID: fae3e7e5-2d06-5db6-b8a8-bf9003dac8b0
+  Expected GUID: aaec3d5c-cc69-5c60-ba32-f9c2e3f60b72
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #371 at 0x143501a90
-  Expected GUID: 7e08f21d-881e-59ed-8ace-32e3695836cb
+  Expected GUID: b5639fd3-679d-54ca-9707-c222bc429b4d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #372 at 0x143524c90
-  Expected GUID: d81c3db9-a8ab-5f15-a552-77bef4e07398
+  Expected GUID: 320e0d5f-3fe1-5620-b70f-340b89f55f2e
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #373 at 0x143548b50
   Expected GUID: 5d70cf6f-3fbd-5a4c-b3f1-ae29bd5a1e0c
@@ -2631,7 +2631,7 @@ Function #375 at 0x143551210
   GUID match: YES
 
 Function #376 at 0x143587e00
-  Expected GUID: e4834ba8-7fc3-5e29-8b99-66244265e5cd
+  Expected GUID: b72c8a27-44ab-56fc-8bbc-0241eca2cf0c
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -2652,39 +2652,39 @@ Function #378 at 0x1435c81b0
   GUID match: YES
 
 Function #379 at 0x1435f37c0
-  Expected GUID: 81e9c8c7-967b-5f20-a292-8b28deb693a7
+  Expected GUID: bafa504d-929a-5682-a988-1672cdd6f2d4
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #380 at 0x1435f3ae0
-  Expected GUID: 0b102d63-11d4-599a-acdf-30f4dacea3b7
+  Expected GUID: 9760258f-81a4-5751-8f53-2aa359bc73d0
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #381 at 0x1435f4250
-  Expected GUID: f89e65d2-fa70-5d50-b506-00c447ae20ae
+  Expected GUID: a503a4bf-d559-5f9a-82cd-3375ea78ff1d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #382 at 0x1435f4560
-  Expected GUID: e4879ead-429b-5a4e-a258-c2f8520eddc5
+  Expected GUID: 51f84aa4-dbc1-5f9e-9a49-d04a6851eed0
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #383 at 0x1435f4880
-  Expected GUID: 17360689-9459-55ad-8e1c-6f67e98acb83
+  Expected GUID: 9d872937-7f4b-5db4-b66a-868a89ca7d31
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #384 at 0x1435fe050
   Expected GUID: fc13b5d8-81cf-5151-a69a-a54f44c1bae8
@@ -2701,11 +2701,11 @@ Function #385 at 0x1435fe4e0
   GUID match: YES
 
 Function #386 at 0x14363dda0
-  Expected GUID: 2018b725-25d2-5436-848f-92fd9e999d0a
+  Expected GUID: b5b1ac52-bf74-5071-8059-42a4dec52589
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #387 at 0x143657470
   Expected GUID: 12db4ca7-9c87-5c80-8657-2f8843bcb313
@@ -2722,14 +2722,14 @@ Function #388 at 0x143681a50
   GUID match: YES
 
 Function #389 at 0x143692c40
-  Expected GUID: 60b2b93a-a31e-5fc6-a872-055f260d2d2f
+  Expected GUID: f45a95d5-39f7-5552-b408-d36c0d8a7160
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #390 at 0x14369d940
-  Expected GUID: 92629de1-aeff-5149-a752-60fd707c6e48
+  Expected GUID: 9ac24dc6-e8bf-5ad2-8aec-832ab99d2901
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -2750,11 +2750,11 @@ Function #392 at 0x1436edef0
   GUID match: YES
 
 Function #393 at 0x1436f3450
-  Expected GUID: 3c2aac3e-dfb1-5f11-9ae5-6c96ce83b2b1
+  Expected GUID: b61ff5bb-16c2-5512-adac-5bdbaffcc4cb
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #394 at 0x1436fcc80
   Expected GUID: 2a13ba04-cedb-57f4-86c1-d48d05a007f9
@@ -2778,11 +2778,11 @@ Function #396 at 0x14370e770
   GUID match: YES
 
 Function #397 at 0x143725360
-  Expected GUID: 45c3bda0-92c1-5e3c-990e-a983648d7530
+  Expected GUID: b7a78267-ed7f-560a-a331-36dbab498a2b
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #398 at 0x143726330
   Expected GUID: 0b27dbc8-51d6-54c4-99bd-959aa9226dda
@@ -2806,18 +2806,18 @@ Function #400 at 0x143738640
   GUID match: YES
 
 Function #401 at 0x143741920
-  Expected GUID: 944fa634-a69b-546e-86c4-f46701b7259a
+  Expected GUID: 2d6d3de2-03c9-5737-91f6-aa182b2bd588
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #402 at 0x143741b80
-  Expected GUID: 824fd3ca-db00-5ed1-9364-f36d02238492
+  Expected GUID: 6665e74c-29e1-5620-a479-208ad146c3bc
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #403 at 0x143751c20
   Expected GUID: cc88a744-9d76-51f2-8ce7-818d6592a587
@@ -2834,11 +2834,11 @@ Function #404 at 0x143784df0
   GUID match: YES
 
 Function #405 at 0x14379ed00
-  Expected GUID: b9d76fd3-4a94-5989-a533-702107e34a4b
+  Expected GUID: 6ce4bfbd-75d5-5907-8315-1840f01d1b97
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #406 at 0x14379fcd0
   Expected GUID: 1a37ddc9-71ec-5f8a-94dd-8e913e3f103b
@@ -2848,32 +2848,32 @@ Function #406 at 0x14379fcd0
   GUID match: YES
 
 Function #407 at 0x1437cac60
-  Expected GUID: d2abf765-384e-5f96-a9ed-024d85abf3c5
+  Expected GUID: 1ce875dd-e418-5e0d-9de0-43cd4ef1904d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #408 at 0x1437d8330
-  Expected GUID: 749a0d38-1dcd-5394-8dec-88f6684f5040
+  Expected GUID: e9750d4e-045c-54bd-a5e6-51deee785a24
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #409 at 0x1437d8d70
-  Expected GUID: 303bcdcb-b10f-5d94-aad2-cf92f353bd83
+  Expected GUID: 6725c9ec-c797-5c5e-8e39-36d837d02638
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #410 at 0x143800f10
-  Expected GUID: 8dc00662-bf70-5014-a042-f13e72d3cf47
+  Expected GUID: 95892c86-5acc-5ce3-9c2f-c2693cb82dbd
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #411 at 0x1438042d0
   Expected GUID: ff02eb7a-fc56-5aa0-96fd-8a1f7e3c0ef0
@@ -2883,18 +2883,18 @@ Function #411 at 0x1438042d0
   GUID match: YES
 
 Function #412 at 0x143806720
-  Expected GUID: 9e4571ba-e5e5-59d9-bedb-d484cba301d7
+  Expected GUID: 49354cdf-3a26-5338-ad0c-ed9652ea9c46
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #413 at 0x14381a6b0
-  Expected GUID: 8a525871-1ee7-53a8-a237-2be06895e806
+  Expected GUID: f31ab23f-e7f6-545d-8518-250d3dceadbb
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #414 at 0x14386f870
   Expected GUID: bd460df4-71fe-549b-894d-419f22897145
@@ -2918,18 +2918,18 @@ Function #416 at 0x143870840
   GUID match: YES
 
 Function #417 at 0x143870a10
-  Expected GUID: 514d949c-a5ae-507b-81b2-463d0c6fd954
+  Expected GUID: 7ad4f10d-57a2-5af7-b062-84e5e6a26bee
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #418 at 0x143880f00
-  Expected GUID: a477b79f-d275-50e7-9f62-82d4a3393f0f
+  Expected GUID: 0ada3cf1-87e7-5d76-96af-0b47ee35a0df
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #419 at 0x14388b4a0
   Expected GUID: c203639c-c00c-58be-8eab-2ab0cfefdc06
@@ -2946,18 +2946,18 @@ Function #420 at 0x143898920
   GUID match: NO
 
 Function #421 at 0x1438a0aa0
-  Expected GUID: 9945acf3-6ddb-5a05-ab5b-aac78a16a361
+  Expected GUID: af95082f-d2e7-5089-810e-a07e63f66401
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #422 at 0x1438a0dc0
-  Expected GUID: 74bf35f6-05b1-5134-a7fa-4363ac9f8e2a
+  Expected GUID: a013be45-a3f1-55b6-ab67-2b766e2d3b9a
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #423 at 0x1438d8000
   Expected GUID: 4149ab7a-5008-5acf-bf6a-be452274c6c8
@@ -2967,18 +2967,18 @@ Function #423 at 0x1438d8000
   GUID match: YES
 
 Function #424 at 0x1439170b0
-  Expected GUID: c3a7cfe7-803d-560f-8f13-f4f36d77f64b
+  Expected GUID: 911f3d3b-5b15-528a-942d-03515f207619
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #425 at 0x14391c170
-  Expected GUID: ec4ce601-27d6-5ee6-b162-ccc77d659b38
+  Expected GUID: b0a6e124-5c4d-52cc-aa42-69af816473f4
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #426 at 0x1439276a0
   Expected GUID: 8aa93a50-84a7-5f1a-a9c4-8b08d96b9271
@@ -3016,14 +3016,14 @@ Function #430 at 0x1439be690
   GUID match: YES
 
 Function #431 at 0x1439dec20
-  Expected GUID: 593ccd85-be1b-5880-92e5-38bbb7542400
+  Expected GUID: 6e9f84b1-0c2e-5a9c-a400-e9993317657f
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #432 at 0x1439ea050
-  Expected GUID: d04ae2f1-fcfa-5da8-b742-ba819584a495
+  Expected GUID: cee06a11-5b10-57a6-b9a5-9948f8d53ed7
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 38/40 (95.0%)
@@ -3051,11 +3051,11 @@ Function #435 at 0x143a0f230
   GUID match: YES
 
 Function #436 at 0x143a16510
-  Expected GUID: 9f84e4dc-c2dd-5e34-bae4-f05a0d5fb0ee
+  Expected GUID: d593dde3-8367-5670-995d-00fdb0829270
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #437 at 0x143a194a0
   Expected GUID: 12fab6e4-9b5d-55ac-8a19-a02ebafaef7a
@@ -3065,18 +3065,18 @@ Function #437 at 0x143a194a0
   GUID match: YES
 
 Function #438 at 0x143a3b570
-  Expected GUID: 30550b44-47ee-5bcd-bb28-6bc1e491be7a
+  Expected GUID: 7a046173-1ea4-5b61-8fad-889a38bb8abb
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #439 at 0x143a5d340
-  Expected GUID: 88787841-96e5-5980-8a42-62e6896d0991
+  Expected GUID: 8fbf39dd-95f4-5823-8129-a77eb2a1409f
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #440 at 0x143a69230
   Expected GUID: 369f7f24-954a-59eb-b899-e5bb7046954d
@@ -3093,11 +3093,11 @@ Function #441 at 0x143a6f850
   GUID match: YES
 
 Function #442 at 0x143a70d00
-  Expected GUID: 86f1d38a-32b5-5bd6-a283-b00d580b867d
+  Expected GUID: 7ce06507-4a8b-52c8-806c-916dd288b495
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #443 at 0x143a716f0
   Expected GUID: 56e30b78-28bc-5bdd-bb48-4b2ceecb9d96
@@ -3114,11 +3114,11 @@ Function #444 at 0x143a73560
   GUID match: YES
 
 Function #445 at 0x143a7a310
-  Expected GUID: 0629bb97-91ae-5bee-9101-2c1e732a07d3
+  Expected GUID: acc8a5b6-0f67-539a-a310-f7e7b8d79f17
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #446 at 0x143a8bee0
   Expected GUID: 3c99ad44-3d1f-5e60-9f32-bfd5bbf3d207
@@ -3128,11 +3128,11 @@ Function #446 at 0x143a8bee0
   GUID match: YES
 
 Function #447 at 0x143ac0fb0
-  Expected GUID: e3bdd9a5-26ac-5ad7-bc85-6313c0c6d814
+  Expected GUID: 1698adcd-bb9c-5556-8d04-0a8a2dd927be
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #448 at 0x143ad6e30
   Expected GUID: 06e09acc-ffc8-5583-b9b6-944c5b9d5ca1
@@ -3142,11 +3142,11 @@ Function #448 at 0x143ad6e30
   GUID match: YES
 
 Function #449 at 0x143b004e0
-  Expected GUID: d287bb7d-e52f-528a-9ef7-ce0dcf87a92a
+  Expected GUID: ebfa1df6-2166-55f0-9ab5-1ffb4cbec865
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #450 at 0x143b4a350
   Expected GUID: a5ce9c26-b587-539c-96b9-c58f6e5c5d36
@@ -3170,11 +3170,11 @@ Function #452 at 0x143b833c0
   GUID match: YES
 
 Function #453 at 0x143b8a250
-  Expected GUID: 0bd301dc-3637-5248-9e8b-fb8e4271f8d4
+  Expected GUID: 312dc3b8-f104-57a8-a408-f9560850474a
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #454 at 0x143b91ea0
   Expected GUID: 618ec477-db0a-59db-b6f6-6e198d3ebd2f
@@ -3205,18 +3205,18 @@ Function #457 at 0x143c86840
   GUID match: YES
 
 Function #458 at 0x143cc89c0
-  Expected GUID: a1cbb635-c343-5190-8b60-c887dba0b286
+  Expected GUID: d822152d-9848-56bb-b2ec-2c2620b7dae5
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #459 at 0x143d07330
-  Expected GUID: 928f9329-42a4-5dbc-ac71-7d19a3426b8d
+  Expected GUID: 7f91a6c6-997c-5021-8b3d-5f6bca61778d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #460 at 0x143d15620
   Expected GUID: 5cf8eddf-d191-564c-b509-294dcd2e22bd
@@ -3261,7 +3261,7 @@ Function #465 at 0x143ddb390
   GUID match: YES
 
 Function #466 at 0x143ea6fb0
-  Expected GUID: c530beb9-6c02-5e72-8938-125b6c0475a5
+  Expected GUID: d18140c4-e055-5e2f-9f06-2ae36f86d6b1
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -3310,14 +3310,14 @@ Function #472 at 0x143faa4a0
   GUID match: YES
 
 Function #473 at 0x143fd6900
-  Expected GUID: 0f64d6e0-7548-5f37-bebc-52eeea2f3e1c
+  Expected GUID: 18c76169-87a9-5d6a-9bec-13ecbfaa9a0c
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
   GUID match: NO
 
 Function #474 at 0x143fdbf80
-  Expected GUID: 71f9224a-4cb7-5ae2-96e6-6ca8b09b3c79
+  Expected GUID: 41caaebf-c08b-55f5-9960-7baa46c7fdbf
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
@@ -3352,11 +3352,11 @@ Function #478 at 0x14405b520
   GUID match: YES
 
 Function #479 at 0x144073810
-  Expected GUID: 4b877677-af9a-5e4a-8b23-9e1a3bfb376d
+  Expected GUID: 813ad23f-7123-5fab-ac55-4746f8796756
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #480 at 0x14407e970
   Expected GUID: 53148f06-7f70-5451-839d-391cdf02895a
@@ -3408,46 +3408,46 @@ Function #486 at 0x1440d7460
   GUID match: YES
 
 Function #487 at 0x1440e2370
-  Expected GUID: e612888a-b569-5947-b437-c84a093dba1a
+  Expected GUID: d27ca8c0-8d28-5249-86d7-dc49b819a87e
   Expected blocks: 150
   Size difference: 0 bytes
   Blocks matched: 150/150 (100.0%)
   GUID match: NO
 
 Function #488 at 0x1440e8b00
-  Expected GUID: 3055d4d0-6abf-5194-acff-1756dd7bd47f
+  Expected GUID: c9f5488a-2a90-5bbe-8f0b-f9640b4d01e9
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #489 at 0x1440e8e70
-  Expected GUID: f8b219df-afac-55cf-bed4-6540d83f50f7
+  Expected GUID: d8bbbbe6-6484-51b7-bf31-349f7575c886
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #490 at 0x144125860
-  Expected GUID: 1a07b18d-f8d7-5f76-8303-9fcb21fac43e
+  Expected GUID: ebdc51d0-9e81-5baf-9464-310af1fdead6
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #491 at 0x144126f10
-  Expected GUID: d87f5a1e-e278-549b-a1e4-4e9a7fe1b1db
+  Expected GUID: f13cf84a-46bc-575f-bd05-dbbd83d82f6e
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #492 at 0x144127bb0
-  Expected GUID: 0af2c058-d39f-5a6b-9380-5a842c0a3c2f
+  Expected GUID: 0537d202-1348-52fc-bda0-741e376e7f6a
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #493 at 0x1441337a0
   Expected GUID: 9c4b21c6-f8c8-5ac3-a0ec-1b08b5a6d401
@@ -3464,39 +3464,39 @@ Function #494 at 0x14415aeb0
   GUID match: YES
 
 Function #495 at 0x144169410
-  Expected GUID: e5a86518-d4e0-56e7-9933-1c9d794d3d43
+  Expected GUID: 6bae5eca-968f-5026-83f2-feffefec343a
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #496 at 0x144169670
-  Expected GUID: c96869fb-b743-5371-98a7-278f45603f17
+  Expected GUID: 8de96169-5c69-5a45-abab-ac0708305c68
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #497 at 0x1441699a0
-  Expected GUID: abaf1f55-cb1e-5a28-8819-703ad2ddd55b
+  Expected GUID: e07c0002-7b75-560a-81ec-e9ad9fdca18d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #498 at 0x144169c40
-  Expected GUID: e02c7f35-469e-5c4b-8f04-8984e256fd4e
+  Expected GUID: f19a2fc5-9386-5229-a28e-b686f456ed5b
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #499 at 0x144169ef0
-  Expected GUID: 030ea8e3-0d95-54e8-9242-24315ebff148
+  Expected GUID: 864e7adc-dea0-5555-a9d1-794de3ab4c18
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #500 at 0x144174a90
   Expected GUID: 1fda4669-30cb-5a17-a1bb-69674fe02e7f
@@ -3506,25 +3506,25 @@ Function #500 at 0x144174a90
   GUID match: YES
 
 Function #501 at 0x1441d2e80
-  Expected GUID: ca73290a-165e-5933-b3be-cb1964e5ba56
+  Expected GUID: 2441e19c-ebfb-5f77-a224-9dae9527152c
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #502 at 0x1441d3dc0
-  Expected GUID: a1b18eb4-64c1-514d-9e9f-ef7afc4c9d6a
+  Expected GUID: b3181c3c-7b85-5154-ab18-78b0cf82776a
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #503 at 0x1441fe8e0
-  Expected GUID: cf03c426-a609-548d-9282-92afc0978d0f
+  Expected GUID: 052a50c8-7cf9-51b6-888e-150a2c911873
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 38/40 (95.0%)
-  GUID match: YES
+  GUID match: NO
 
 Function #504 at 0x144205180
   Expected GUID: 493e2629-3c75-5111-9dc1-58567351d7f1
@@ -3576,11 +3576,11 @@ Function #510 at 0x144261800
   GUID match: YES
 
 Function #511 at 0x1442844f0
-  Expected GUID: 8a490038-975d-54d4-b02e-5f6e9b1deea4
+  Expected GUID: bc213ff2-cf96-590b-8278-aa34f9049f96
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #512 at 0x14428fb00
   Expected GUID: 15504d0e-1d9a-5872-8e4c-a95b78422742
@@ -3590,11 +3590,11 @@ Function #512 at 0x14428fb00
   GUID match: YES
 
 Function #513 at 0x1442a5f50
-  Expected GUID: df603e4d-4c03-585e-8481-dfda6bde93e4
+  Expected GUID: ff67f515-a027-5292-afd5-f7ed9638c87e
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #514 at 0x1442a9790
   Expected GUID: 0ee52771-bfcf-5fa8-8b10-2ef438b5fd53
@@ -3611,11 +3611,11 @@ Function #515 at 0x1442bfeb0
   GUID match: YES
 
 Function #516 at 0x1442cfe40
-  Expected GUID: 2c6c4180-05f4-5a0c-8fd8-f3ed63096590
+  Expected GUID: 7bee8b56-f322-5464-9e44-36435444fd4d
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #517 at 0x144317d20
   Expected GUID: 7d350599-81a0-53c3-a2e1-dc0e1fa93428
@@ -3625,25 +3625,25 @@ Function #517 at 0x144317d20
   GUID match: YES
 
 Function #518 at 0x14433f630
-  Expected GUID: 69f5fb8a-287b-55d1-8dd6-a85e1795e9a6
+  Expected GUID: a8f46fa6-98c9-510f-90a5-c7807a203491
+  Expected blocks: 40
+  Size difference: 0 bytes
+  Blocks matched: 40/40 (100.0%)
+  GUID match: NO
+
+Function #519 at 0x1443427f0
+  Expected GUID: 140e8570-386c-5b83-ac01-60926693a372
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
   GUID match: YES
 
-Function #519 at 0x1443427f0
-  Expected GUID: 50a83f28-9b6f-5626-8652-865e5c69c5f6
-  Expected blocks: 40
-  Size difference: 0 bytes
-  Blocks matched: 40/40 (100.0%)
-  GUID match: NO
-
 Function #520 at 0x144346680
-  Expected GUID: 396f8d02-bb88-5d71-9b87-bce48dea6695
+  Expected GUID: 1101b879-505a-5e09-b2a9-86e2d281af08
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #521 at 0x14434d1a0
   Expected GUID: be4f4a44-e9bf-50b9-a908-364e2b64c111
@@ -3653,7 +3653,7 @@ Function #521 at 0x14434d1a0
   GUID match: YES
 
 Function #522 at 0x144362660
-  Expected GUID: b5a4d9cc-b0aa-5a3a-8143-a0c7b9b821d1
+  Expected GUID: a4b4e933-aac1-53db-acad-4495ef390c40
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 29/40 (72.5%)
@@ -3674,11 +3674,11 @@ Function #524 at 0x1443bde60
   GUID match: YES
 
 Function #525 at 0x1443d66e0
-  Expected GUID: 80f187c6-5349-58f8-9f20-0955068b3c03
+  Expected GUID: 10523931-8afe-59cc-8527-03ce758ff9b4
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: YES
+  GUID match: NO
 
 Function #526 at 0x1443e8fe0
   Expected GUID: 5cc8aab0-bea0-555e-a7a4-23feb6f9ee02
@@ -3709,11 +3709,11 @@ Function #529 at 0x144455b00
   GUID match: YES
 
 Function #530 at 0x14446f3d0
-  Expected GUID: 0af95f03-ea52-5a21-b5c9-655aac875d5f
+  Expected GUID: 7eda7210-0b4a-5ad7-b361-38eb09baad22
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #531 at 0x1444813c0
   Expected GUID: f6df667e-4fd3-537f-83d1-b1131cd3bdb3
@@ -3723,18 +3723,18 @@ Function #531 at 0x1444813c0
   GUID match: YES
 
 Function #532 at 0x1444bfea0
-  Expected GUID: 016c5cab-0329-5e50-adc1-2cf3fccf41ec
+  Expected GUID: c48a4a94-57ba-590b-87a3-51aa31dedd1b
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #533 at 0x1444c01d0
-  Expected GUID: ddc09a76-6531-517d-accb-7b2fb994bbf9
+  Expected GUID: c434d3d7-c504-592b-9568-0efe1e67c639
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #534 at 0x1444c2620
   Expected GUID: e63de29d-641d-55b8-929e-16a10396f687
@@ -3786,11 +3786,11 @@ Function #540 at 0x1445365f0
   GUID match: YES
 
 Function #541 at 0x1445680d0
-  Expected GUID: 629f1b6c-0f47-56c9-b6eb-52599e326062
+  Expected GUID: eecadb15-c978-57bf-8319-a2e66ce089c9
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #542 at 0x14458e930
   Expected GUID: c3c47865-7e0d-5f7a-aaf8-78f1b2fc7d92
@@ -3807,32 +3807,32 @@ Function #543 at 0x1445af4e0
   GUID match: YES
 
 Function #544 at 0x1445bdbc0
-  Expected GUID: cb282ed8-7227-5a3a-a309-d6c952fdf936
+  Expected GUID: 41a208de-52c7-557e-843a-97c3e8443782
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #545 at 0x1445dd5f0
-  Expected GUID: 1ef4b8bc-3a87-5f5f-b561-177e58a50c81
+  Expected GUID: ad881995-6e83-599d-a258-b32fa468185e
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #546 at 0x1445ef080
-  Expected GUID: 42ff42f2-c3c4-5859-b871-74b32cb84606
+  Expected GUID: 1ad90734-98d1-5c00-975b-a74caa813c15
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 33/40 (82.5%)
-  GUID match: YES
+  GUID match: NO
 
 Function #547 at 0x1445ff0a0
-  Expected GUID: 17b69416-4c0d-5b65-a629-7172ab84281c
+  Expected GUID: 7935e6de-b5a4-55a4-93fc-ea6110eb56e9
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #548 at 0x144624d70
   Expected GUID: 4794069f-8e9f-53fe-8945-32dd433f28f3
@@ -3849,18 +3849,18 @@ Function #549 at 0x14463efa0
   GUID match: NO
 
 Function #550 at 0x1446437c0
-  Expected GUID: 73c63bc8-9980-5345-a6af-35a46318cdcd
+  Expected GUID: ee3922b1-4bd5-5a68-a144-2833e6e24dec
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #551 at 0x144688ea0
-  Expected GUID: bc5bcb82-b1ac-523a-994f-485b045346b3
+  Expected GUID: b9f4f185-984e-5e81-99df-97f340686768
   Expected blocks: 40
   Size difference: 1 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: YES
+  GUID match: NO
 
 Function #552 at 0x144690a50
   Expected GUID: 42b6f475-54dd-5268-b1f2-e8d637e004e8
@@ -3933,7 +3933,7 @@ Function #561 at 0x1447aba50
   GUID match: YES
 
 Function #562 at 0x1447b5450
-  Expected GUID: 51172dfc-216b-5a9e-b576-f37501e255f6
+  Expected GUID: c1f53e50-2989-5031-84d2-242af0d94a7f
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
@@ -3947,14 +3947,14 @@ Function #563 at 0x1447babb0
   GUID match: YES
 
 Function #564 at 0x1447c6890
-  Expected GUID: 32458c8d-db8b-559c-93ae-a07e865514c7
+  Expected GUID: 673bb77f-c653-5d9c-89b5-ffea2fcfedbe
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 34/40 (85.0%)
   GUID match: NO
 
 Function #565 at 0x1447e62d0
-  Expected GUID: 34d9e6b8-aa43-53f7-946f-a6ae2d447acb
+  Expected GUID: af8f4105-bb62-5542-b910-25f9023ec451
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 31/40 (77.5%)
@@ -3975,37 +3975,37 @@ Function #567 at 0x1448067e0
   GUID match: YES
 
 Function #568 at 0x14480b360
-  Expected GUID: 14f0cedf-ef6e-5fcb-ae7c-6adca1fbbde9
+  Expected GUID: 48d6e6e8-e47b-5476-9d80-07db1c08f002
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #569 at 0x14481d200
-  Expected GUID: ce5d0818-97ad-5eb4-ae3f-81ec05781892
+  Expected GUID: f26f34f8-a607-58bb-9252-19b796f78260
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #570 at 0x14481edf0
-  Expected GUID: 757ce9ea-cfcf-55ac-9c1a-d0c26cca9beb
+  Expected GUID: 00972c41-e035-510e-b7f9-7fd07f8ff4d0
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 40/40 (100.0%)
-  GUID match: NO
+  GUID match: YES
 
 Function #571 at 0x14489fb70
-  Expected GUID: 18094574-0e26-577c-bc2f-96f63566334a
+  Expected GUID: 7e2d2143-7734-5526-9fae-9285d3201db3
   Expected blocks: 40
   Size difference: 0 bytes
   Blocks matched: 39/40 (97.5%)
-  GUID match: YES
+  GUID match: NO
 
 Summary
 =======
 Total functions analyzed: 571
-Functions with exact GUID match: 398/571 (69.7%)
+Functions with exact GUID match: 494/571 (86.5%)
 Functions with size mismatch: 4
 Total basic blocks matched: 24271/24380 (99.6%)
 
@@ -4018,69 +4018,64 @@ Block Match Distribution:
 
 Functions with 100% Block Match but Wrong GUID:
 ===============================================
-Count: 126
-  Function #2 at 0x1405f0880 (expected: c6b36d42-1f8b-5bec-bb75-479fdd1494a5)
+Count: 8
+  Function #80 at 0x141011000 (expected: 7c531606-9aaf-53d7-a641-9b6deae1bcbd)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #17 at 0x140988f70 (expected: f1d2574e-10cf-5622-a8ed-4802328c54fd)
+  Function #487 at 0x1440e2370 (expected: d27ca8c0-8d28-5249-86d7-dc49b819a87e)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #23 at 0x140a6b920 (expected: 09dae178-9b30-563d-9d4f-1e8904e49c33)
+  Function #518 at 0x14433f630 (expected: a8f46fa6-98c9-510f-90a5-c7807a203491)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #30 at 0x140b17bb0 (expected: 2c12ee86-d755-5204-8898-aa5c37598f05)
+  Function #525 at 0x1443d66e0 (expected: 10523931-8afe-59cc-8527-03ce758ff9b4)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #34 at 0x140bd2780 (expected: e36bcf3e-556d-5d35-aa19-86a2aa4acb26)
+  Function #537 at 0x1444fda00 (expected: 242c1eff-a0a1-5069-872c-d0997e6fe3e3)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #37 at 0x140c22380 (expected: f05ed3bc-ccb3-5f3b-8851-a28a4d1a4f12)
+  Function #549 at 0x14463efa0 (expected: af6ef63f-7577-5166-9f97-4ad3a0d0e19b)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #42 at 0x140c6cb70 (expected: a1cbb635-c343-5190-8b60-c887dba0b286)
+  Function #551 at 0x144688ea0 (expected: b9f4f185-984e-5e81-99df-97f340686768)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #54 at 0x140d9ca90 (expected: 44206a14-122f-5339-9113-b1f0fe28de63)
+  Function #562 at 0x1447b5450 (expected: c1f53e50-2989-5031-84d2-242af0d94a7f)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #57 at 0x140dd46f0 (expected: 54dd2d5b-aa0e-5e72-9899-4a14aa3bfb2e)
-    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #58 at 0x140de4490 (expected: c6902588-efe9-54aa-8606-4a01e4a5f6d1)
-    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  ... and 116 more
 
 All Non-Matching Functions by Block Match Rate:
 ==============================================
-  Function #2 at 0x1405f0880: 40/40 blocks (100.0%)
+  Function #80 at 0x141011000: 150/150 blocks (100.0%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #17 at 0x140988f70: 40/40 blocks (100.0%)
+  Function #487 at 0x1440e2370: 150/150 blocks (100.0%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #23 at 0x140a6b920: 40/40 blocks (100.0%)
+  Function #518 at 0x14433f630: 40/40 blocks (100.0%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #30 at 0x140b17bb0: 40/40 blocks (100.0%)
+  Function #525 at 0x1443d66e0: 40/40 blocks (100.0%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #34 at 0x140bd2780: 40/40 blocks (100.0%)
+  Function #537 at 0x1444fda00: 40/40 blocks (100.0%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #37 at 0x140c22380: 40/40 blocks (100.0%)
+  Function #549 at 0x14463efa0: 40/40 blocks (100.0%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #42 at 0x140c6cb70: 40/40 blocks (100.0%)
+  Function #551 at 0x144688ea0: 40/40 blocks (100.0%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #54 at 0x140d9ca90: 40/40 blocks (100.0%)
+  Function #562 at 0x1447b5450: 40/40 blocks (100.0%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #57 at 0x140dd46f0: 40/40 blocks (100.0%)
+  Function #420 at 0x143898920: 149/150 blocks (99.3%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #58 at 0x140de4490: 40/40 blocks (100.0%)
+  Function #293 at 0x1427731e0: 148/150 blocks (98.7%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #59 at 0x140df7e10: 40/40 blocks (100.0%)
+  Function #11 at 0x1408ac1e0: 39/40 blocks (97.5%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #70 at 0x140ee5f20: 40/40 blocks (100.0%)
+  Function #33 at 0x140bcb2f0: 39/40 blocks (97.5%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #81 at 0x141053ec0: 150/150 blocks (100.0%)
+  Function #35 at 0x140bf7110: 39/40 blocks (97.5%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #83 at 0x1410bc940: 40/40 blocks (100.0%)
+  Function #38 at 0x140c3ec00: 39/40 blocks (97.5%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #84 at 0x1410bcc40: 40/40 blocks (100.0%)
+  Function #72 at 0x140ef62d0: 39/40 blocks (97.5%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #88 at 0x14115b900: 150/150 blocks (100.0%)
+  Function #90 at 0x141188e10: 39/40 blocks (97.5%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #89 at 0x14117c340: 40/40 blocks (100.0%)
+  Function #96 at 0x1411cfda0: 39/40 blocks (97.5%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #101 at 0x141379ec0: 40/40 blocks (100.0%)
+  Function #97 at 0x1411e15e0: 39/40 blocks (97.5%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #102 at 0x14137a230: 40/40 blocks (100.0%)
+  Function #98 at 0x1411ee140: 39/40 blocks (97.5%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  Function #158 at 0x1417563a0: 40/40 blocks (100.0%)
+  Function #169 at 0x141850070: 39/40 blocks (97.5%)
     in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
-  ... and 153 more
+  ... and 57 more
