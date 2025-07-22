@@ -4,6 +4,7 @@ use object::pe::ImageNtHeaders64;
 use object::read::pe::{ImageNtHeaders, ImageOptionalHeader, PeFile};
 use std::fs::File;
 use std::path::Path;
+use crate::DebugContext;
 
 pub struct PeLoader {
     mmap: Mmap,
@@ -69,7 +70,7 @@ impl PeLoader {
 
     /// Find a function at the given address and return its approximate size
     /// Uses recursive descent to follow all code paths
-    pub fn find_function_size(&self, va: u64) -> Result<usize> {
+    pub fn find_function_size(&self, va: u64, ctx: &DebugContext) -> Result<usize> {
         use iced_x86::{Decoder, DecoderOptions, FlowControl};
         use std::collections::{HashSet, VecDeque};
 
@@ -86,11 +87,42 @@ impl PeLoader {
 
         let bytes = &self.mmap[start_offset..start_offset + scan_size];
 
+        if ctx.debug_size {
+            println!("Scanning function size starting at 0x{:x}", va);
+            println!("  Scan range: 0x{:x} bytes", scan_size);
+        }
+
         // First decode all instructions in the scan range
         let mut all_instructions = std::collections::BTreeMap::new();
         let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
 
-        // println!("\nDecoding instructions from 0x{:x}:", va);
+        if ctx.debug_instructions {
+            use iced_x86::Formatter;
+            
+            println!("\nDecoding instructions from 0x{:x}:", va);
+            let mut formatter = iced_x86::NasmFormatter::new();
+            let mut output = String::new();
+            
+            while decoder.can_decode() && all_instructions.len() < 50 {
+                let addr = decoder.ip();
+                let instruction = decoder.decode();
+                let next_addr = decoder.ip();
+                
+                output.clear();
+                formatter.format(&instruction, &mut output);
+                println!("  0x{:x}: {} (flow: {:?})", addr, output, instruction.flow_control());
+                
+                all_instructions.insert(addr, (instruction, next_addr));
+            }
+            
+            if decoder.can_decode() {
+                println!("  ... (showing first 50 instructions)");
+            }
+            
+            // Reset decoder for full scan
+            decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
+            all_instructions.clear();
+        }
 
         let mut decode_count = 0;
         while decoder.can_decode() {
@@ -98,22 +130,23 @@ impl PeLoader {
             let instruction = decoder.decode();
             let next_addr = decoder.ip();
 
-            // Format and print the instruction
-            // output.clear();
-            // formatter.format(&instruction, &mut output);
-            // println!("  0x{:x}: {} (flow: {:?})", addr, output, instruction.flow_control());
-
             all_instructions.insert(addr, (instruction, next_addr));
             decode_count += 1;
 
             // Stop if we've decoded enough instructions (safety limit)
             if decode_count > 2000 {
-                println!("  ... stopping at instruction limit");
+                if ctx.debug_size {
+                    println!("  ... stopping at instruction limit (2000)");
+                }
                 break;
             }
         }
 
         // Note: decoder.can_decode() returning false is expected at the scan limit
+
+        if ctx.debug_size {
+            println!("  Decoded {} instructions", all_instructions.len());
+        }
 
         // Now do recursive descent to find all reachable instructions
         let mut visited = HashSet::new();
@@ -122,7 +155,9 @@ impl PeLoader {
 
         let mut max_address = va;
 
-        // println!("\nStarting recursive descent from 0x{:x}", va);
+        if ctx.debug_size {
+            println!("\nStarting recursive descent from 0x{:x}", va);
+        }
 
         while let Some(addr) = queue.pop_front() {
             if visited.contains(&addr) {
@@ -193,6 +228,14 @@ impl PeLoader {
         let size = (max_address - va) as usize;
         if size == 0 {
             bail!("Could not determine function size")
+        }
+
+        if ctx.debug_size {
+            println!("\nFunction size analysis complete:");
+            println!("  Start: 0x{:x}", va);
+            println!("  End: 0x{:x}", max_address);
+            println!("  Size: 0x{:x} bytes", size);
+            println!("  Visited {} instructions", visited.len());
         }
 
         Ok(size)

@@ -14,6 +14,14 @@ use pe_loader::PeLoader;
 const FUNCTION_NAMESPACE: &str = "0192a179-61ac-7cef-88ed-012296e9492f";
 const BASIC_BLOCK_NAMESPACE: &str = "0192a178-7a5f-7936-8653-3cbaa7d6afe7";
 
+#[derive(Debug, Clone, Default)]
+struct DebugContext {
+    debug_size: bool,
+    debug_blocks: bool,
+    debug_instructions: bool,
+    debug_guid: bool,
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -32,6 +40,25 @@ enum Commands {
         /// Virtual address of the function
         #[arg(short, long, value_parser = parse_hex)]
         address: u64,
+
+        /// Optional function size (will auto-detect if not provided)
+        #[arg(short, long)]
+        size: Option<usize>,
+    },
+
+    /// Debug analysis of a function
+    Debug {
+        /// Path to the PE file
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Virtual address of the function
+        #[arg(short, long, value_parser = parse_hex)]
+        address: u64,
+
+        /// Debug flags (size, blocks, instructions, guid, all)
+        #[arg(short = 'D', long)]
+        debug: Vec<String>,
 
         /// Optional function size (will auto-detect if not provided)
         #[arg(short, long)]
@@ -59,9 +86,39 @@ fn main() -> Result<()> {
             address,
             size,
         } => {
-            let warp_uuid = compute_warp_uuid_from_pe(&file, address, size)?;
+            let warp_uuid = compute_warp_uuid_from_pe(&file, address, size, &DebugContext::default())?;
             println!("Function at 0x{address:x}:");
             println!("WARP UUID: {warp_uuid}");
+        }
+        Commands::Debug {
+            file,
+            address,
+            debug,
+            size,
+        } => {
+            let mut ctx = DebugContext::default();
+            for flag in debug {
+                match flag.as_str() {
+                    "size" => ctx.debug_size = true,
+                    "blocks" => ctx.debug_blocks = true,
+                    "instructions" => ctx.debug_instructions = true,
+                    "guid" => ctx.debug_guid = true,
+                    "all" => {
+                        ctx.debug_size = true;
+                        ctx.debug_blocks = true;
+                        ctx.debug_instructions = true;
+                        ctx.debug_guid = true;
+                    }
+                    _ => eprintln!("Unknown debug flag: {}", flag),
+                }
+            }
+            
+            println!("Debug analysis for function at 0x{:x}", address);
+            println!("Debug flags: {:?}", ctx);
+            println!("========================================\n");
+            
+            let warp_uuid = compute_warp_uuid_from_pe(&file, address, size, &ctx)?;
+            println!("\nFinal WARP UUID: {warp_uuid}");
         }
         Commands::Example => {
             // Example x86_64 function bytes
@@ -76,7 +133,7 @@ fn main() -> Result<()> {
                 0xc3, // ret
             ];
 
-            let warp_uuid = compute_warp_uuid(&function_bytes, 0x1000);
+            let warp_uuid = compute_warp_uuid(&function_bytes, 0x1000, &DebugContext::default());
             println!("WARP UUID: {warp_uuid}");
         }
     }
@@ -84,62 +141,79 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn compute_warp_uuid_from_pe(path: &PathBuf, address: u64, size: Option<usize>) -> Result<Uuid> {
+fn compute_warp_uuid_from_pe(path: &PathBuf, address: u64, size: Option<usize>, ctx: &DebugContext) -> Result<Uuid> {
     let pe = PeLoader::load(path)?;
 
     // Determine function size if not provided
     let func_size = match size {
         Some(s) => s,
         None => {
-            println!("Auto-detecting function size...");
-            pe.find_function_size(address)?
+            if ctx.debug_size {
+                println!("Auto-detecting function size...");
+            }
+            let detected_size = pe.find_function_size(address, ctx)?;
+            if ctx.debug_size {
+                println!("Detected function size: 0x{:x} bytes", detected_size);
+            }
+            detected_size
         }
     };
 
-    println!("Function size: 0x{func_size:x} bytes");
+    if !ctx.debug_size {
+        println!("Function size: 0x{func_size:x} bytes");
+    }
 
     // Read function bytes
     let func_bytes = pe.read_at_va(address, func_size)?;
 
     // Compute WARP UUID
-    Ok(compute_warp_uuid(func_bytes, address))
+    Ok(compute_warp_uuid(func_bytes, address, ctx))
 }
 
-fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> Uuid {
+fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
     // Disassemble and identify basic blocks
-    let basic_blocks = identify_basic_blocks(raw_bytes, base);
+    let basic_blocks = identify_basic_blocks(raw_bytes, base, ctx);
+
+    if ctx.debug_blocks {
+        println!("Identified {} basic blocks", basic_blocks.len());
+    }
 
     // Create UUID for each basic block
     let mut block_uuids = Vec::new();
     for (&start_addr, &end_addr) in basic_blocks.iter() {
-        let uuid = create_basic_block_guid(
-            &raw_bytes[(start_addr - base) as usize..(end_addr - base) as usize],
-            start_addr,
-        );
+        let block_bytes = &raw_bytes[(start_addr - base) as usize..(end_addr - base) as usize];
+        let uuid = create_basic_block_guid(block_bytes, start_addr, ctx);
         block_uuids.push((start_addr, uuid));
+        
+        if ctx.debug_guid {
+            println!("Block 0x{:x}-0x{:x}: UUID {}", start_addr, end_addr, uuid);
+        }
     }
 
-    // Print disassembly for each basic block
-    // for (&start_addr, &end_addr) in &basic_blocks {
-    //     println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
-    //     println!("----------------------------------------");
+    // Print disassembly for each basic block if requested
+    if ctx.debug_blocks {
+        for (&start_addr, &end_addr) in &basic_blocks {
+            println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
+            println!("----------------------------------------");
 
-    //     // Disassemble the block
-    //     let block_start_offset = (start_addr - base) as usize;
-    //     let block_end_offset = (end_addr - base) as usize;
-    //     let block_bytes = &raw_bytes[block_start_offset..block_end_offset];
+            // Disassemble the block
+            let block_start_offset = (start_addr - base) as usize;
+            let block_end_offset = (end_addr - base) as usize;
+            let block_bytes = &raw_bytes[block_start_offset..block_end_offset];
 
-    //     let mut decoder = Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
-    //     let mut formatter = iced_x86::NasmFormatter::new();
-    //     let mut output = String::new();
+            let mut decoder = Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
+            let mut formatter = iced_x86::NasmFormatter::new();
+            let mut output = String::new();
 
-    //     while decoder.can_decode() {
-    //         let instruction = decoder.decode();
-    //         output.clear();
-    //         formatter.format(&instruction, &mut output);
-    //         println!("  0x{:x}: {}", instruction.ip(), output);
-    //     }
-    // }
+            while decoder.can_decode() {
+                let instruction = decoder.decode();
+                output.clear();
+                formatter.format(&instruction, &mut output);
+                println!("  0x{:x}: {}", instruction.ip(), output);
+            }
+        }
+    }
+    
     // Combine block UUIDs to create function UUID
     // Note: Despite WARP spec saying "highest to lowest", Binary Ninja
     // actually combines them in low-to-high address order
@@ -149,7 +223,16 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> Uuid {
         combined_bytes.extend_from_slice(uuid.as_bytes());
     }
 
-    create_uuid_v5(&namespace, &combined_bytes)
+    let function_uuid = create_uuid_v5(&namespace, &combined_bytes);
+    
+    if ctx.debug_guid {
+        println!("\nFunction UUID calculation:");
+        println!("  Namespace: {}", namespace);
+        println!("  Block count: {}", block_uuids.len());
+        println!("  Final UUID: {}", function_uuid);
+    }
+    
+    function_uuid
 }
 
 // Helper function to decode all instructions in a byte array
@@ -270,15 +353,27 @@ fn identify_block_boundaries(
     block_starts
 }
 
-fn identify_basic_blocks(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, u64> {
+fn identify_basic_blocks(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> BTreeMap<u64, u64> {
     let instructions = decode_instructions(raw_bytes, base);
+
+    if ctx.debug_blocks {
+        println!("Decoded {} instructions starting at 0x{:x}", instructions.len(), base);
+    }
 
     // Build control flow graph edges and find reachable instructions
     let (incoming_edges, outgoing_edges, visited) = build_control_flow_graph(&instructions, base);
 
+    if ctx.debug_blocks {
+        println!("Found {} reachable instructions", visited.len());
+    }
+
     // Identify basic block boundaries
     let block_starts =
         identify_block_boundaries(&instructions, &incoming_edges, &outgoing_edges, base);
+
+    if ctx.debug_blocks {
+        println!("Identified {} block start addresses", block_starts.len());
+    }
 
     // Build basic blocks (only for reachable code)
     let mut basic_blocks = BTreeMap::new();
@@ -337,9 +432,13 @@ fn get_branch_target(instruction: &Instruction) -> Option<u64> {
     }
 }
 
-fn create_basic_block_guid(raw_bytes: &[u8], base: u64) -> Uuid {
+fn create_basic_block_guid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
     let namespace = Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap();
-    let instruction_bytes = get_instruction_bytes_for_guid(raw_bytes, base);
+    let instruction_bytes = if ctx.debug_guid {
+        get_instruction_bytes_for_guid_debug(raw_bytes, base)
+    } else {
+        get_instruction_bytes_for_guid(raw_bytes, base)
+    };
     create_uuid_v5(&namespace, &instruction_bytes)
 }
 
@@ -376,15 +475,18 @@ fn get_instruction_bytes_for_guid(raw_bytes: &[u8], base: u64) -> Vec<u8> {
     bytes
 }
 
-fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> (Vec<u8>, Vec<String>) {
+fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> Vec<u8> {
+    use iced_x86::Formatter;
+    
     let mut bytes = Vec::new();
-    let mut debug_info = Vec::new();
 
     let mut decoder = Decoder::new(64, raw_bytes, DecoderOptions::NONE);
     decoder.set_ip(base);
 
     let mut formatter = iced_x86::NasmFormatter::new();
     let mut output = String::new();
+
+    println!("  Instruction processing for GUID:");
 
     while decoder.can_decode() {
         let start = (decoder.ip() - base) as usize;
@@ -400,11 +502,11 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> (Vec<u8>
 
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
-            debug_info.push(format!(
-                "SKIP REG2REG: 0x{:x}: {}",
+            println!(
+                "    SKIP REG2REG: 0x{:x}: {}",
                 instruction.ip(),
                 output
-            ));
+            );
             continue;
         }
 
@@ -412,25 +514,25 @@ fn get_instruction_bytes_for_guid_debug(raw_bytes: &[u8], base: u64) -> (Vec<u8>
         if is_relocatable_instruction(&instruction) {
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
-            debug_info.push(format!(
-                "ZERO RELOC: 0x{:x}: {} | {:02x?}",
+            println!(
+                "    ZERO RELOC: 0x{:x}: {} | {:02x?}",
                 instruction.ip(),
                 output,
                 instr_bytes
-            ));
+            );
         } else {
             // Use actual instruction bytes
             bytes.extend_from_slice(instr_bytes);
-            debug_info.push(format!(
-                "KEEP: 0x{:x}: {} | {:02x?}",
+            println!(
+                "    KEEP: 0x{:x}: {} | {:02x?}",
                 instruction.ip(),
                 output,
                 instr_bytes
-            ));
+            );
         }
     }
 
-    (bytes, debug_info)
+    bytes
 }
 
 fn is_register_to_itself_nop(instruction: &Instruction) -> bool {
@@ -690,7 +792,7 @@ mod test {
 
         // Use the heuristic to find function size
         let function_size = pe
-            .find_function_size(function_address)
+            .find_function_size(function_address, &DebugContext::default())
             .expect("Failed to determine function size");
 
         // Calculate expected size from the blocks
@@ -718,7 +820,7 @@ mod test {
             .expect("Failed to read function bytes");
 
         // Compute basic blocks
-        let blocks = identify_basic_blocks(function_bytes, function_address);
+        let blocks = identify_basic_blocks(function_bytes, function_address, &DebugContext::default());
 
         println!("\nComparing basic blocks:");
         println!(
@@ -734,7 +836,7 @@ mod test {
             let our_guid = if our_end == Some(&end) {
                 let block_bytes = &function_bytes
                     [(start - function_address) as usize..(end - function_address) as usize];
-                Some(create_basic_block_guid(block_bytes, start))
+                Some(create_basic_block_guid(block_bytes, start, &DebugContext::default()))
             } else {
                 None
             };
@@ -757,7 +859,7 @@ mod test {
         }
 
         // Compute WARP UUID
-        let warp_uuid = compute_warp_uuid(function_bytes, function_address);
+        let warp_uuid = compute_warp_uuid(function_bytes, function_address, &DebugContext::default());
         println!("\nWARP UUID: {}", warp_uuid);
         println!("Expected:  {}", expected_function_guid);
 
