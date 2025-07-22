@@ -120,26 +120,26 @@ fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> Uuid {
     }
 
     // Print disassembly for each basic block
-    for (&start_addr, &end_addr) in &basic_blocks {
-        println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
-        println!("----------------------------------------");
+    // for (&start_addr, &end_addr) in &basic_blocks {
+    //     println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
+    //     println!("----------------------------------------");
 
-        // Disassemble the block
-        let block_start_offset = (start_addr - base) as usize;
-        let block_end_offset = (end_addr - base) as usize;
-        let block_bytes = &raw_bytes[block_start_offset..block_end_offset];
+    //     // Disassemble the block
+    //     let block_start_offset = (start_addr - base) as usize;
+    //     let block_end_offset = (end_addr - base) as usize;
+    //     let block_bytes = &raw_bytes[block_start_offset..block_end_offset];
 
-        let mut decoder = Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
-        let mut formatter = iced_x86::NasmFormatter::new();
-        let mut output = String::new();
+    //     let mut decoder = Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
+    //     let mut formatter = iced_x86::NasmFormatter::new();
+    //     let mut output = String::new();
 
-        while decoder.can_decode() {
-            let instruction = decoder.decode();
-            output.clear();
-            formatter.format(&instruction, &mut output);
-            println!("  0x{:x}: {}", instruction.ip(), output);
-        }
-    }
+    //     while decoder.can_decode() {
+    //         let instruction = decoder.decode();
+    //         output.clear();
+    //         formatter.format(&instruction, &mut output);
+    //         println!("  0x{:x}: {}", instruction.ip(), output);
+    //     }
+    // }
     // Combine block UUIDs to create function UUID
     // Note: Despite WARP spec saying "highest to lowest", Binary Ninja
     // actually combines them in low-to-high address order
@@ -260,9 +260,10 @@ fn identify_block_boundaries(
             && matches!(
                 prev.flow_control(),
                 FlowControl::UnconditionalBranch | FlowControl::Return
-            ) {
-                block_starts.insert(addr);
-            }
+            )
+        {
+            block_starts.insert(addr);
+        }
         prev_instruction = Some(instruction);
     }
 
@@ -481,16 +482,15 @@ fn has_implicit_extension(reg: Register) -> bool {
 
 fn is_relocatable_instruction(instruction: &Instruction) -> bool {
     // Check for direct calls - but only forward calls are relocatable
-    if instruction.mnemonic() == Mnemonic::Call
-        && instruction.op_count() > 0 {
-            match instruction.op_kind(0) {
-                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-                    // All direct calls are relocatable
-                    return true;
-                }
-                _ => {}
+    if instruction.mnemonic() == Mnemonic::Call && instruction.op_count() > 0 {
+        match instruction.op_kind(0) {
+            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                // All direct calls are relocatable
+                return true;
             }
+            _ => {}
         }
+    }
 
     // Jumps are not considered relocatable in WARP
     // This includes both short and long jumps
@@ -565,9 +565,7 @@ fn print_disassembly_with_edges(raw_bytes: &[u8], base: u64) {
         output.clear();
         formatter.format(&instruction, &mut output);
 
-        println!(
-            "0x{addr:08x}  | {in_edges:3} | {out_edges:3} | {output}"
-        );
+        println!("0x{addr:08x}  | {in_edges:3} | {out_edges:3} | {output}");
     }
 }
 
@@ -703,33 +701,33 @@ mod test {
         );
 
         // Show a few basic blocks for debugging
-        if !exact_match || block_match_rate < 1.0 {
-            println!("\nFirst 3 basic blocks:");
-            let block_vec: Vec<_> = blocks.iter().take(3).collect();
-            for &(&start_addr, &end_addr) in &block_vec {
-                println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
-                println!("----------------------------------------");
+        // if !exact_match || block_match_rate < 1.0 {
+        //     println!("\nFirst 3 basic blocks:");
+        //     let block_vec: Vec<_> = blocks.iter().take(3).collect();
+        //     for &(&start_addr, &end_addr) in &block_vec {
+        //         println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
+        //         println!("----------------------------------------");
 
-                let block_start_offset = (start_addr - function_address) as usize;
-                let block_end_offset = (end_addr - function_address) as usize;
+        //         let block_start_offset = (start_addr - function_address) as usize;
+        //         let block_end_offset = (end_addr - function_address) as usize;
 
-                if block_end_offset <= function_bytes.len() {
-                    let block_bytes = &function_bytes[block_start_offset..block_end_offset];
+        //         if block_end_offset <= function_bytes.len() {
+        //             let block_bytes = &function_bytes[block_start_offset..block_end_offset];
 
-                    let mut decoder =
-                        Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
-                    let mut formatter = iced_x86::NasmFormatter::new();
-                    let mut output = String::new();
+        //             let mut decoder =
+        //                 Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
+        //             let mut formatter = iced_x86::NasmFormatter::new();
+        //             let mut output = String::new();
 
-                    while decoder.can_decode() {
-                        let instruction = decoder.decode();
-                        output.clear();
-                        formatter.format(&instruction, &mut output);
-                        println!("  0x{:x}: {}", instruction.ip(), output);
-                    }
-                }
-            }
-        }
+        //             while decoder.can_decode() {
+        //                 let instruction = decoder.decode();
+        //                 output.clear();
+        //                 formatter.format(&instruction, &mut output);
+        //                 println!("  0x{:x}: {}", instruction.ip(), output);
+        //             }
+        //         }
+        //     }
+        // }
 
         // Assertions for test validation
         assert!(function_size > 0, "Function size should be greater than 0");
