@@ -708,6 +708,12 @@ mod test {
         let mut total_blocks_matched = 0;
         let mut total_functions = 0;
 
+        // Collect detailed statistics
+        let mut block_match_distribution: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut non_matching_functions = Vec::new();
+        let mut perfect_block_no_guid = Vec::new();
+
         for exe in &functions {
             writeln!(stats_file, "\nExecutable: {}", exe.path).unwrap();
             writeln!(stats_file, "==========================================").unwrap();
@@ -722,24 +728,27 @@ mod test {
                 writeln!(stats_file, "  Expected GUID: {}", function.guid).unwrap();
                 writeln!(stats_file, "  Expected blocks: {}", function.blocks.len()).unwrap();
 
-                let (size_diff, blocks_matched, blocks_total, guid_match) =
-                    test_warp_function_from_binary_with_stats(
-                        &exe.path,
-                        function.start,
-                        function.guid,
-                        function
-                            .blocks
-                            .iter()
-                            .map(|b| (b.start, b.end, b.guid))
-                            .collect(),
-                    );
+                let Stats {
+                    size_diff,
+                    matching_blocks: blocks_matched,
+                    found_blocks,
+                    expected_blocks: blocks_total,
+                    exact_match: guid_match,
+                } = test_warp_function_from_binary(
+                    &exe.path,
+                    function.start,
+                    function.guid,
+                    function
+                        .blocks
+                        .iter()
+                        .map(|b| (b.start, b.end, b.guid))
+                        .collect(),
+                );
 
                 writeln!(stats_file, "  Size difference: {} bytes", size_diff).unwrap();
                 writeln!(
                     stats_file,
-                    "  Blocks matched: {}/{} ({:.1}%)",
-                    blocks_matched,
-                    blocks_total,
+                    "  Blocks matched (equal/found/expected): {blocks_matched}/{found_blocks}/{blocks_total} ({:.1}%)",
                     blocks_matched as f64 / blocks_total as f64 * 100.0
                 )
                 .unwrap();
@@ -760,32 +769,7 @@ mod test {
                 total_blocks_analyzed += blocks_total;
                 total_blocks_matched += blocks_matched;
                 total_functions += 1;
-            }
-        }
 
-        // Collect detailed statistics
-        let mut block_match_distribution: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut non_matching_functions = Vec::new();
-        let mut perfect_block_no_guid = Vec::new();
-
-        // Re-analyze for detailed stats
-        total_functions = 0;
-        for exe in &functions {
-            for (idx, function) in exe.functions.iter().enumerate() {
-                let (size_diff, blocks_matched, blocks_total, guid_match) =
-                    test_warp_function_from_binary_with_stats(
-                        &exe.path,
-                        function.start,
-                        function.guid,
-                        function
-                            .blocks
-                            .iter()
-                            .map(|b| (b.start, b.end, b.guid))
-                            .collect(),
-                    );
-
-                total_functions += 1;
                 let match_rate = blocks_matched as f64 / blocks_total as f64 * 100.0;
                 let bucket = format!("{:.0}%", (match_rate / 10.0).floor() * 10.0);
                 *block_match_distribution.entry(bucket).or_insert(0) += 1;
@@ -799,7 +783,7 @@ mod test {
                         match_rate,
                         exe.path.clone(),
                     ));
-                    if blocks_matched == blocks_total {
+                    if blocks_matched == blocks_total && blocks_total == found_blocks {
                         perfect_block_no_guid.push((
                             idx + 1,
                             function.start,
@@ -900,45 +884,21 @@ mod test {
         }
     }
 
-    // Helper function to test WARP function from binary and return statistics
-    fn test_warp_function_from_binary_with_stats(
-        exe_path: impl AsRef<std::path::Path>,
-        function_address: u64,
-        expected_function_guid: Uuid,
-        expected_blocks: Vec<(u64, u64, Uuid)>,
-    ) -> (i64, usize, usize, bool) {
-        let (size_diff, blocks_matched, blocks_total, guid_match) =
-            test_warp_function_from_binary_impl(
-                exe_path,
-                function_address,
-                expected_function_guid,
-                expected_blocks,
-            );
-        (size_diff, blocks_matched, blocks_total, guid_match)
+    struct Stats {
+        size_diff: i64,
+        matching_blocks: usize,
+        found_blocks: usize,
+        expected_blocks: usize,
+        exact_match: bool,
     }
 
-    // Helper function to test WARP function from binary
+    // Implementation of test WARP function from binary
     fn test_warp_function_from_binary(
         exe_path: impl AsRef<std::path::Path>,
         function_address: u64,
         expected_function_guid: Uuid,
         expected_blocks: Vec<(u64, u64, Uuid)>,
-    ) {
-        test_warp_function_from_binary_impl(
-            exe_path,
-            function_address,
-            expected_function_guid,
-            expected_blocks,
-        );
-    }
-
-    // Implementation of test WARP function from binary
-    fn test_warp_function_from_binary_impl(
-        exe_path: impl AsRef<std::path::Path>,
-        function_address: u64,
-        expected_function_guid: Uuid,
-        expected_blocks: Vec<(u64, u64, Uuid)>,
-    ) -> (i64, usize, usize, bool) {
+    ) -> Stats {
         // Load main.exe from root directory
         let pe = PeLoader::load(exe_path).expect("Failed to load main.exe");
 
@@ -1094,11 +1054,12 @@ mod test {
 
         // Return statistics: (size_diff, blocks_matched, blocks_total, guid_match)
         let size_diff = function_size as i64 - expected_size as i64;
-        (
+        Stats {
             size_diff,
             matching_blocks,
-            expected_blocks.len(),
+            found_blocks: blocks.len(),
+            expected_blocks: expected_blocks.len(),
             exact_match,
-        )
+        }
     }
 }
