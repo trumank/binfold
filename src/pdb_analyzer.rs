@@ -64,7 +64,7 @@ impl PdbAnalyzer {
 
         // Remove duplicates (same address)
         results.sort_by_key(|f| f.address);
-        results.dedup_by_key(|f| f.address);
+        // results.dedup_by_key(|f| f.address);
 
         Ok(results)
     }

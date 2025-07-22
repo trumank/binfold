@@ -83,7 +83,7 @@ enum Commands {
         #[arg(short, long)]
         debug: bool,
 
-        /// Output format (json or text)
+        /// Output format (json, text, or sqlite:<path>)
         #[arg(short = 'f', long = "format", default_value = "text")]
         format: String,
 
@@ -232,6 +232,99 @@ fn main() -> Result<()> {
                     };
 
                     println!("{}", serde_json::to_string_pretty(&output)?);
+                }
+                format if format.starts_with("sqlite:") => {
+                    use indicatif::{ProgressBar, ProgressStyle};
+                    use rusqlite::{Connection, params};
+                    use std::time::{SystemTime, UNIX_EPOCH};
+
+                    let db_path = format.strip_prefix("sqlite:").unwrap();
+                    let mut conn = Connection::open(db_path)?;
+
+                    // Set pragmas for better performance
+                    conn.execute_batch(
+                        "PRAGMA synchronous = OFF;
+                         PRAGMA journal_mode = MEMORY;
+                         PRAGMA temp_store = MEMORY;
+                         PRAGMA mmap_size = 30000000000;",
+                    )?;
+
+                    // Create table if it doesn't exist
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS function_guids (
+                            address INTEGER PRIMARY KEY,
+                            guid TEXT NOT NULL,
+                            exe_name TEXT NOT NULL,
+                            function_name TEXT NOT NULL,
+                            timestamp INTEGER NOT NULL
+                        )",
+                        [],
+                    )?;
+
+                    // Get just the exe filename
+                    let exe_name = exe_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+
+                    // Get current unix timestamp
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
+
+                    // Create progress bar
+                    let pb = ProgressBar::new(function_guids.len() as u64);
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta})")
+                            .expect("Failed to set progress style")
+                            .progress_chars("#>-")
+                    );
+                    pb.set_message("Inserting function GUIDs");
+
+                    // Insert all records in a single transaction
+                    let mut inserted = 0;
+                    {
+                        let tx = conn.transaction()?;
+                        {
+                            let mut stmt = tx.prepare(
+                                "INSERT OR REPLACE INTO function_guids (address, guid, exe_name, function_name, timestamp) 
+                                 VALUES (?1, ?2, ?3, ?4, ?5)"
+                            )?;
+
+                            for func in &function_guids {
+                                match stmt.execute(params![
+                                    func.address as i64,
+                                    func.guid.to_string(),
+                                    exe_name,
+                                    func.name,
+                                    timestamp
+                                ]) {
+                                    Ok(_) => {
+                                        inserted += 1;
+                                        pb.inc(1);
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "Failed to insert function {} at 0x{:x}: {}",
+                                            func.name, func.address, e
+                                        );
+                                        pb.inc(1);
+                                    }
+                                }
+                            }
+                        }
+                        tx.commit()?;
+                    }
+
+                    pb.finish_with_message("Done!");
+
+                    println!("\nSQLite database: {}", db_path);
+                    println!(
+                        "Inserted {} function GUIDs for {} at timestamp {}",
+                        inserted, exe_name, timestamp
+                    );
                 }
                 _ => {
                     println!("PDB Analysis Results");
