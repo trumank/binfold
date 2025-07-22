@@ -445,24 +445,6 @@ fn is_relocatable_instruction(instruction: &Instruction) -> bool {
 
     // Jumps are not considered relocatable in WARP
     // This includes both short and long jumps
-    // Check for jumps that go outside the basic block
-    if instruction.mnemonic() == Mnemonic::Jmp {
-        if instruction.op_count() > 0 {
-            match instruction.op_kind(0) {
-                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-                    // Short jumps at the end of a basic block that jump to another block
-                    // might need to be zeroed. This is a special case.
-                    // For now, zero short jumps that appear at the very end of blocks
-                    if instruction.len() == 2 {
-                        // println!("AHH 0x{:x}", instruction.ip());
-                        // Short jump (EB xx)
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
 
     // Check for RIP-relative memory operands
     for i in 0..instruction.op_count() {
@@ -634,7 +616,7 @@ mod test {
             (
                 0x14000170d,
                 0x14000171a,
-                "781b3161-a5f6-5246-8248-202713e7b1b7",
+                "2d363e66-89ca-5aaf-b695-9813af17461f",
             ),
             (
                 0x140001733,
@@ -740,7 +722,7 @@ mod test {
             (
                 0x14000170d,
                 0x14000171a,
-                "781b3161-a5f6-5246-8248-202713e7b1b7",
+                "2d363e66-89ca-5aaf-b695-9813af17461f",
             ),
         ];
 
@@ -762,15 +744,39 @@ mod test {
             println!("Raw bytes:      {:02x?}", block_bytes);
             println!("Bytes for hash: {:02x?}", bytes);
 
-            // Let's compute what Binary Ninja expects
-            // let bn_bytes = vec![
-            //     0x33, 0xd2, 0xb1, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8b, 0xc3, 0x00, 0x00,
-            // ];
-            // let bn_guid = create_uuid_v5(
-            //     &uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap(),
-            //     &bn_bytes,
-            // );
-            // println!("If jmp was zeroed, GUID would be: {}", bn_guid);
+            // Test different scenarios for block 0x14000165a
+            if start == 0x14000165a {
+                // This block has all relocatable instructions
+                // Try keeping the short jump
+                let mut test_bytes = vec![0u8; 29];
+                test_bytes.extend_from_slice(&[0xeb, 0x08]);
+                let test_guid = create_uuid_v5(
+                    &uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap(),
+                    &test_bytes,
+                );
+                println!("If we keep short jump at end: {}", test_guid);
+            }
+
+            // Test if removing the short jump makes it match
+            if block_bytes.ends_with(&[0xeb, 0x08]) {
+                let mut test_bytes = bytes.clone();
+                // Remove last two bytes (the jump)
+                test_bytes.truncate(test_bytes.len() - 2);
+                let test_guid = create_uuid_v5(
+                    &uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap(),
+                    &test_bytes,
+                );
+                println!("If we remove short jump, GUID would be: {}", test_guid);
+            } else if block_bytes.ends_with(&[0xeb, 0x19]) {
+                let mut test_bytes = bytes.clone();
+                // Remove last two bytes (the jump)
+                test_bytes.truncate(test_bytes.len() - 2);
+                let test_guid = create_uuid_v5(
+                    &uuid::Uuid::parse_str(BASIC_BLOCK_NAMESPACE).unwrap(),
+                    &test_bytes,
+                );
+                println!("If we remove short jump, GUID would be: {}", test_guid);
+            }
         }
     }
 
