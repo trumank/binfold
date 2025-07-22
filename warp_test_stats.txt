@@ -1,7 +1,10 @@
 WARP Function Analysis Statistics
 ==================================
-Generated at: SystemTime { tv_sec: 1753166319, tv_nsec: 404704739 }
+Generated at: SystemTime { tv_sec: 1753166429, tv_nsec: 46141756 }
 
+
+Executable: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
+==========================================
 Function #1 at 0x14052f518
   Expected GUID: 886b4085-ee35-5fec-aefb-7f5cec39b45d
   Expected blocks: 40
@@ -4017,37 +4020,67 @@ Functions with 100% Block Match but Wrong GUID:
 ===============================================
 Count: 126
   Function #2 at 0x1405f0880 (expected: c6b36d42-1f8b-5bec-bb75-479fdd1494a5)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #17 at 0x140988f70 (expected: f1d2574e-10cf-5622-a8ed-4802328c54fd)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #23 at 0x140a6b920 (expected: 09dae178-9b30-563d-9d4f-1e8904e49c33)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #30 at 0x140b17bb0 (expected: 2c12ee86-d755-5204-8898-aa5c37598f05)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #34 at 0x140bd2780 (expected: e36bcf3e-556d-5d35-aa19-86a2aa4acb26)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #37 at 0x140c22380 (expected: f05ed3bc-ccb3-5f3b-8851-a28a4d1a4f12)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #42 at 0x140c6cb70 (expected: a1cbb635-c343-5190-8b60-c887dba0b286)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #54 at 0x140d9ca90 (expected: 44206a14-122f-5339-9113-b1f0fe28de63)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #57 at 0x140dd46f0 (expected: 54dd2d5b-aa0e-5e72-9899-4a14aa3bfb2e)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #58 at 0x140de4490 (expected: c6902588-efe9-54aa-8606-4a01e4a5f6d1)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   ... and 116 more
 
 All Non-Matching Functions by Block Match Rate:
 ==============================================
   Function #2 at 0x1405f0880: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #17 at 0x140988f70: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #23 at 0x140a6b920: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #30 at 0x140b17bb0: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #34 at 0x140bd2780: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #37 at 0x140c22380: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #42 at 0x140c6cb70: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #54 at 0x140d9ca90: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #57 at 0x140dd46f0: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #58 at 0x140de4490: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #59 at 0x140df7e10: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #70 at 0x140ee5f20: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #81 at 0x141053ec0: 150/150 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #83 at 0x1410bc940: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #84 at 0x1410bcc40: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #88 at 0x14115b900: 150/150 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #89 at 0x14117c340: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #101 at 0x141379ec0: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #102 at 0x14137a230: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   Function #158 at 0x1417563a0: 40/40 blocks (100.0%)
+    in: /home/truman/projects/ue/patternsleuth/games/427S_Texas_Chainsaw_Massacre/BBQClient-Win64-Shipping.exe
   ... and 153 more

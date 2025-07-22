@@ -758,6 +758,8 @@ mod test {
         let mut total_functions = 0;
 
         for exe in &functions {
+            writeln!(stats_file, "\nExecutable: {}", exe.path).unwrap();
+            writeln!(stats_file, "==========================================").unwrap();
             for (idx, function) in exe.functions.iter().enumerate() {
                 writeln!(
                     stats_file,
@@ -837,9 +839,9 @@ mod test {
                 *block_match_distribution.entry(bucket).or_insert(0) += 1;
                 
                 if !guid_match {
-                    non_matching_functions.push((idx + 1, function.start, blocks_matched, blocks_total, match_rate));
+                    non_matching_functions.push((idx + 1, function.start, blocks_matched, blocks_total, match_rate, exe.path.clone()));
                     if blocks_matched == blocks_total {
-                        perfect_block_no_guid.push((idx + 1, function.start, function.guid.clone()));
+                        perfect_block_no_guid.push((idx + 1, function.start, function.guid.clone(), exe.path.clone()));
                     }
                 }
             }
@@ -882,8 +884,9 @@ mod test {
         writeln!(stats_file, "\nFunctions with 100% Block Match but Wrong GUID:").unwrap();
         writeln!(stats_file, "===============================================").unwrap();
         writeln!(stats_file, "Count: {}", perfect_block_no_guid.len()).unwrap();
-        for (idx, addr, guid) in perfect_block_no_guid.iter().take(10) {
+        for (idx, addr, guid, exe_path) in perfect_block_no_guid.iter().take(10) {
             writeln!(stats_file, "  Function #{} at 0x{:x} (expected: {})", idx, addr, guid).unwrap();
+            writeln!(stats_file, "    in: {}", exe_path).unwrap();
         }
         if perfect_block_no_guid.len() > 10 {
             writeln!(stats_file, "  ... and {} more", perfect_block_no_guid.len() - 10).unwrap();
@@ -892,12 +895,13 @@ mod test {
         writeln!(stats_file, "\nAll Non-Matching Functions by Block Match Rate:").unwrap();
         writeln!(stats_file, "==============================================").unwrap();
         non_matching_functions.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap());
-        for (idx, addr, matched, total, rate) in non_matching_functions.iter().take(20) {
+        for (idx, addr, matched, total, rate, exe_path) in non_matching_functions.iter().take(20) {
             writeln!(
                 stats_file,
                 "  Function #{} at 0x{:x}: {}/{} blocks ({:.1}%)",
                 idx, addr, matched, total, rate
             ).unwrap();
+            writeln!(stats_file, "    in: {}", exe_path).unwrap();
         }
         if non_matching_functions.len() > 20 {
             writeln!(stats_file, "  ... and {} more", non_matching_functions.len() - 20).unwrap();
