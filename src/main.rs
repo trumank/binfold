@@ -319,8 +319,6 @@ fn main() -> Result<()> {
                         }
                     }
                     tx.commit()?;
-
-                    println!("Processed {}: {} functions", exe_name, function_guids.len());
                     Ok(())
                 })();
 
