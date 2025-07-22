@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
 use pdb::{FallibleIterator, PDB, SymbolData};
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::mmap_source::MmapSource;
@@ -13,6 +12,7 @@ use crate::{DebugContext, compute_warp_uuid};
 pub struct PdbAnalyzer {
     pe_loader: PeLoader,
     pdb: PDB<'static, MmapSource>,
+    exe_name: String,
 }
 
 #[derive(Debug)]
@@ -41,43 +41,38 @@ impl PdbAnalyzer {
         let pdb = PDB::open(mmap_source)
             .with_context(|| format!("Failed to parse PDB file: {:?}", pdb_path))?;
 
-        Ok(Self { pe_loader, pdb })
-    }
+        let exe_name = exe_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
 
-    pub fn compute_function_guids(
-        &mut self,
-        debug_context: &DebugContext,
-    ) -> Result<Vec<FunctionGuid>> {
-        self.compute_function_guids_with_progress(debug_context, None)
+        Ok(Self {
+            pe_loader,
+            pdb,
+            exe_name,
+        })
     }
 
     pub fn compute_function_guids_with_progress(
         &mut self,
         debug_context: &DebugContext,
-        progress_bar: Option<ProgressBar>,
+        progress_bar: Option<MultiProgress>,
     ) -> Result<Vec<FunctionGuid>> {
         let address_map = self.pdb.address_map()?;
 
         // Create progress bar for collection phase
-        let collection_pb = match &progress_bar {
-            Some(pb) => {
-                pb.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.green} [{elapsed_precise}] Collecting procedures from PDB...")
-                        .expect("Failed to set progress style")
-                );
-                pb.clone()
-            }
-            None => {
-                let pb = ProgressBar::new_spinner();
-                pb.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.green} [{elapsed_precise}] Collecting procedures from PDB...")
-                        .expect("Failed to set progress style")
-                );
-                pb.enable_steady_tick(std::time::Duration::from_millis(100));
-                pb
-            }
+        let collection_pb = ProgressBar::new_spinner().with_style(
+            ProgressStyle::default_spinner()
+                .template(&format!(
+                    "{{spinner:.green}} [{{elapsed_precise}}] Collecting procedures from PDB for {}...",
+                    self.exe_name
+                ))
+                .unwrap(),
+        );
+        collection_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+        if let Some(multi) = &progress_bar {
+            multi.insert_from_back(1, collection_pb.clone());
         };
 
         let mut procedures = Vec::new();
@@ -94,61 +89,66 @@ impl PdbAnalyzer {
                         rva: rva.0,
                         len: proc.len,
                     });
-                    collection_pb.tick();
                 }
             }
         }
 
-        // Collect module symbols
+        // Collect all modules first
         let dbi = self.pdb.debug_information()?;
+        let mut modules_vec = Vec::new();
         let mut modules = dbi.modules()?;
         while let Some(module) = modules.next()? {
-            if let Some(module_info) = self.pdb.module_info(&module)? {
-                let mut module_symbols = module_info.symbols()?;
-                while let Some(symbol) = module_symbols.next()? {
-                    if let Ok(SymbolData::Procedure(proc)) = symbol.parse() {
-                        if let Some(rva) = proc.offset.to_rva(&address_map) {
-                            procedures.push(ProcedureData {
-                                name: proc.name.to_string().to_string(),
-                                rva: rva.0,
-                                len: proc.len,
-                            });
-                            collection_pb.tick();
+            if let Ok(Some(module_info)) = self.pdb.module_info(&module) {
+                modules_vec.push(module_info);
+            }
+        }
+
+        // Process modules in parallel to collect their symbols
+        let module_procedures: Vec<Vec<ProcedureData>> = modules_vec
+            .par_iter()
+            .filter_map(|module_info| {
+                let mut module_procs = Vec::new();
+                if let Ok(mut module_symbols) = module_info.symbols() {
+                    while let Ok(Some(symbol)) = module_symbols.next() {
+                        if let Ok(SymbolData::Procedure(proc)) = symbol.parse() {
+                            if let Some(rva) = proc.offset.to_rva(&address_map) {
+                                module_procs.push(ProcedureData {
+                                    name: proc.name.to_string().to_string(),
+                                    rva: rva.0,
+                                    len: proc.len,
+                                });
+                            }
                         }
                     }
                 }
-            }
+                Some(module_procs)
+            })
+            .collect();
+
+        // Extend procedures with all module procedures
+        for module_procs in module_procedures {
+            procedures.extend(module_procs);
         }
 
-        let total_procedures = procedures.len();
-        collection_pb.finish_and_clear();
-
         // Now create/update progress bar for analysis phase
-        let pb = match progress_bar {
-            Some(pb) => {
-                pb.set_length(total_procedures as u64);
-                pb
-            }
-            None => {
-                let pb = ProgressBar::new(total_procedures as u64);
-                pb.set_style(
-                    ProgressStyle::default_bar()
-                        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) Analyzing functions")
-                        .expect("Failed to set progress style")
-                        .progress_chars("#>-")
-                );
-                pb
-            }
-        };
+        let pb = ProgressBar::new(procedures.len() as u64).with_style(
+                        ProgressStyle::default_bar()
+                            .template(&format!("{{spinner:.green}} [{{elapsed_precise}}] [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{per_sec}}, {{eta}}) {}", self.exe_name))
+                            .expect("Failed to set progress style")
+                            .progress_chars("#>-"));
+        if let Some(multi) = &progress_bar {
+            collection_pb.disable_steady_tick();
+            multi.remove(&collection_pb);
+            multi.insert_from_back(1, pb.clone());
+        }
 
         // Create thread-safe references
-        let pe_loader = Arc::new(&self.pe_loader);
-        let debug_context = Arc::new(debug_context);
-        let progress_bar = Arc::new(Mutex::new(pb));
+        let pe_loader = &self.pe_loader;
 
         // Process procedures in parallel
         let results: Vec<_> = procedures
             .par_iter()
+            .progress_with(pb.clone())
             .filter_map(|proc_data| {
                 let address = proc_data.rva as u64 + pe_loader.image_base;
 
@@ -188,17 +188,13 @@ impl PdbAnalyzer {
                     None
                 };
 
-                // Update progress bar
-                if let Ok(pb) = progress_bar.lock() {
-                    pb.inc(1);
-                }
-
                 result
             })
             .collect();
 
-        if let Ok(pb) = progress_bar.lock() {
+        if let Some(multi) = progress_bar {
             pb.finish_and_clear();
+            multi.remove(&pb);
         }
 
         Ok(results)

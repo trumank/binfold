@@ -160,7 +160,7 @@ fn main() -> Result<()> {
             debug,
             format,
         } => {
-            use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+            use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
             use pdb_analyzer::PdbAnalyzer;
 
             let debug_context = if debug {
@@ -186,6 +186,14 @@ fn main() -> Result<()> {
             // Create multi-progress for parallel progress bars
             let multi_progress = MultiProgress::new();
 
+            let pb = ProgressBar::new(exe_paths.len() as u64).with_style(
+                        ProgressStyle::default_bar()
+                            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta})")
+                            .unwrap()
+                            .progress_chars("#>-"));
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            multi_progress.add(pb.clone());
+
             // Process all executables in parallel
             let results: Vec<ExeResults> = exe_paths
                 .par_iter()
@@ -193,27 +201,17 @@ fn main() -> Result<()> {
                     // Derive PDB path for this exe if not explicitly provided
                     let pdb_path_for_exe = exe_path.with_extension("pdb");
 
-                    // Create a progress bar for this executable
-                    let pb = multi_progress.add(ProgressBar::new(0));
-                    let exe_name = exe_path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-                    pb.set_style(
-                        ProgressStyle::default_bar()
-                            .template(&format!("{{spinner:.green}} [{{elapsed_precise}}] [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{per_sec}}, {{eta}}) {}", exe_name))
-                            .expect("Failed to set progress style")
-                            .progress_chars("#>-")
-                    );
-
                     // Process this exe/pdb pair
                     let result = (|| -> Result<Vec<pdb_analyzer::FunctionGuid>> {
                         let mut analyzer = PdbAnalyzer::new(exe_path, &pdb_path_for_exe)?;
-                        let function_guids = analyzer.compute_function_guids_with_progress(&debug_context, Some(pb.clone()))?;
-
-                        pb.finish_with_message(format!("{} - Complete!", exe_name));
+                        let function_guids = analyzer.compute_function_guids_with_progress(
+                            &debug_context,
+                            Some(multi_progress.clone()),
+                        )?;
                         Ok(function_guids)
                     })();
 
+                    pb.inc(1);
                     match result {
                         Ok(function_guids) => ExeResults {
                             exe_path: exe_path.clone(),
@@ -230,6 +228,8 @@ fn main() -> Result<()> {
                     }
                 })
                 .collect();
+            pb.finish();
+            multi_progress.clear().unwrap();
 
             match format.as_str() {
                 "json" => {
