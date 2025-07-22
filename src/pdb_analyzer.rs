@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use pdb::{FallibleIterator, PDB, SymbolData};
+use rayon::prelude::*;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::mmap_source::MmapSource;
@@ -19,6 +21,14 @@ pub struct FunctionGuid {
     pub address: u64,
     pub size: Option<u32>,
     pub guid: Uuid,
+}
+
+// Structure to hold procedure data for parallel processing
+#[derive(Clone)]
+struct ProcedureData {
+    name: String,
+    rva: u32,
+    len: u32,
 }
 
 impl PdbAnalyzer {
@@ -46,36 +56,74 @@ impl PdbAnalyzer {
         debug_context: &DebugContext,
         progress_bar: Option<ProgressBar>,
     ) -> Result<Vec<FunctionGuid>> {
-        let mut results = Vec::new();
         let address_map = self.pdb.address_map()?;
 
-        // First, count total procedures for progress bar
-        let mut total_procedures = 0;
+        // Create progress bar for collection phase
+        let collection_pb = match &progress_bar {
+            Some(pb) => {
+                pb.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner:.green} [{elapsed_precise}] Collecting procedures from PDB...")
+                        .expect("Failed to set progress style")
+                );
+                pb.clone()
+            }
+            None => {
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner:.green} [{elapsed_precise}] Collecting procedures from PDB...")
+                        .expect("Failed to set progress style")
+                );
+                pb.enable_steady_tick(std::time::Duration::from_millis(100));
+                pb
+            }
+        };
 
-        // Count global symbols
+        let mut procedures = Vec::new();
+
+        // Collect all procedures in a single pass
+        // Collect global symbols
         let symbol_table = self.pdb.global_symbols()?;
         let mut symbols = symbol_table.iter();
         while let Some(symbol) = symbols.next()? {
-            if let Ok(SymbolData::Procedure(_)) = symbol.parse() {
-                total_procedures += 1;
+            if let Ok(SymbolData::Procedure(proc)) = symbol.parse() {
+                if let Some(rva) = proc.offset.to_rva(&address_map) {
+                    procedures.push(ProcedureData {
+                        name: proc.name.to_string().to_string(),
+                        rva: rva.0,
+                        len: proc.len,
+                    });
+                    collection_pb.tick();
+                }
             }
         }
 
-        // Count module symbols
+        // Collect module symbols
         let dbi = self.pdb.debug_information()?;
         let mut modules = dbi.modules()?;
         while let Some(module) = modules.next()? {
             if let Some(module_info) = self.pdb.module_info(&module)? {
                 let mut module_symbols = module_info.symbols()?;
                 while let Some(symbol) = module_symbols.next()? {
-                    if let Ok(SymbolData::Procedure(_)) = symbol.parse() {
-                        total_procedures += 1;
+                    if let Ok(SymbolData::Procedure(proc)) = symbol.parse() {
+                        if let Some(rva) = proc.offset.to_rva(&address_map) {
+                            procedures.push(ProcedureData {
+                                name: proc.name.to_string().to_string(),
+                                rva: rva.0,
+                                len: proc.len,
+                            });
+                            collection_pb.tick();
+                        }
                     }
                 }
             }
         }
 
-        // Use provided progress bar or create a new one
+        let total_procedures = procedures.len();
+        collection_pb.finish_and_clear();
+
+        // Now create/update progress bar for analysis phase
         let pb = match progress_bar {
             Some(pb) => {
                 pb.set_length(total_procedures as u64);
@@ -93,90 +141,77 @@ impl PdbAnalyzer {
             }
         };
 
-        // Process global symbols
-        let symbol_table = self.pdb.global_symbols()?;
-        let mut symbols = symbol_table.iter();
-        while let Some(symbol) = symbols.next()? {
-            if let Ok(SymbolData::Procedure(proc)) = symbol.parse() {
-                self.process_procedure(&proc, &address_map, debug_context, &mut results);
-                pb.inc(1);
-            }
-        }
+        // Create thread-safe references
+        let pe_loader = Arc::new(&self.pe_loader);
+        let debug_context = Arc::new(debug_context);
+        let progress_bar = Arc::new(Mutex::new(pb));
 
-        // Process module symbols
-        let dbi = self.pdb.debug_information()?;
-        let mut modules = dbi.modules()?;
-        while let Some(module) = modules.next()? {
-            if let Some(module_info) = self.pdb.module_info(&module)? {
-                let mut module_symbols = module_info.symbols()?;
-                while let Some(symbol) = module_symbols.next()? {
-                    if let Ok(SymbolData::Procedure(proc)) = symbol.parse() {
-                        self.process_procedure(&proc, &address_map, debug_context, &mut results);
-                        pb.inc(1);
+        // Process procedures in parallel
+        let results: Vec<_> = procedures
+            .par_iter()
+            .filter_map(|proc_data| {
+                let address = proc_data.rva as u64 + pe_loader.image_base;
+
+                let size = if proc_data.len > 0 {
+                    Some(proc_data.len)
+                } else {
+                    match pe_loader.find_function_size(address, &debug_context) {
+                        Ok(sz) => Some(sz as u32),
+                        Err(_) => None,
                     }
-                }
-            }
-        }
+                };
 
-        pb.finish_with_message("Analysis complete!");
+                let result = if let Some(size) = size {
+                    match Self::compute_function_guid_static(
+                        &pe_loader,
+                        address,
+                        size as usize,
+                        &debug_context,
+                    ) {
+                        Ok(guid) => Some(FunctionGuid {
+                            name: proc_data.name.clone(),
+                            address,
+                            size: Some(size),
+                            guid,
+                        }),
+                        Err(e) => {
+                            if debug_context.debug_guid {
+                                eprintln!(
+                                    "Failed to compute GUID for function {} at 0x{:x}: {}",
+                                    proc_data.name, address, e
+                                );
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Update progress bar
+                if let Ok(pb) = progress_bar.lock() {
+                    pb.inc(1);
+                }
+
+                result
+            })
+            .collect();
+
+        if let Ok(pb) = progress_bar.lock() {
+            pb.finish_and_clear();
+        }
 
         Ok(results)
     }
 
-    fn process_procedure(
-        &self,
-        proc: &pdb::ProcedureSymbol,
-        address_map: &pdb::AddressMap,
-        debug_context: &DebugContext,
-        results: &mut Vec<FunctionGuid>,
-    ) {
-        let name = proc.name.to_string().to_string();
-
-        if let Some(rva) = proc.offset.to_rva(address_map) {
-            let address = rva.0 as u64 + self.pe_loader.image_base;
-
-            let size = if proc.len > 0 {
-                Some(proc.len)
-            } else {
-                match self.pe_loader.find_function_size(address, debug_context) {
-                    Ok(sz) => Some(sz as u32),
-                    Err(_) => None,
-                }
-            };
-
-            if let Some(size) = size {
-                match self.compute_function_guid(address, size as usize, debug_context) {
-                    Ok(guid) => {
-                        results.push(FunctionGuid {
-                            name: name.clone(),
-                            address,
-                            size: Some(size),
-                            guid,
-                        });
-                    }
-                    Err(e) => {
-                        if debug_context.debug_guid {
-                            eprintln!(
-                                "Failed to compute GUID for function {} at 0x{:x}: {}",
-                                name, address, e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn compute_function_guid(
-        &self,
+    fn compute_function_guid_static(
+        pe_loader: &PeLoader,
         address: u64,
         size: usize,
         debug_context: &DebugContext,
     ) -> Result<Uuid> {
-        let function_bytes = self.pe_loader.read_at_va(address, size)?;
-
+        let function_bytes = pe_loader.read_at_va(address, size)?;
         let guid = compute_warp_uuid(&function_bytes, address, debug_context);
-
         Ok(guid)
     }
 }
