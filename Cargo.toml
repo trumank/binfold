@@ -7,3 +7,7 @@ edition = "2024"
 iced-x86 = "1.21"
 sha1 = "0.10"
 uuid = { version = "1.10", features = ["v5"] }
+object = { version = "0.36", features = ["read", "pe"] }
+memmap2 = "0.9"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0.98"

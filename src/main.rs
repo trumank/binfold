@@ -4,6 +4,9 @@ use iced_x86::{
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
+mod pe_loader;
+use pe_loader::PeLoader;
+
 const FUNCTION_NAMESPACE: &str = "0192a179-61ac-7cef-88ed-012296e9492f";
 const BASIC_BLOCK_NAMESPACE: &str = "0192a178-7a5f-7936-8653-3cbaa7d6afe7";
 
@@ -34,21 +37,102 @@ const TEST_FUNCTION_BYTES: &[u8] = &[
     0x11, 0x00, 0x00,
 ];
 
-fn main() {
-    // Example x86_64 function bytes
-    let function_bytes = vec![
-        0x55, // push rbp
-        0x48, 0x89, 0xe5, // mov rbp, rsp
-        0x48, 0x83, 0xec, 0x10, // sub rsp, 0x10
-        0x89, 0x7d, 0xfc, // mov [rbp-4], edi
-        0x8b, 0x45, 0xfc, // mov eax, [rbp-4]
-        0x83, 0xc0, 0x01, // add eax, 1
-        0xc9, // leave
-        0xc3, // ret
-    ];
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
-    let warp_uuid = compute_warp_uuid(&function_bytes, 0x1000);
-    println!("WARP UUID: {}", warp_uuid);
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Compute WARP UUID for a function in a PE file
+    Pe {
+        /// Path to the PE file
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Virtual address of the function
+        #[arg(short, long, value_parser = parse_hex)]
+        address: u64,
+
+        /// Optional function size (will auto-detect if not provided)
+        #[arg(short, long)]
+        size: Option<usize>,
+    },
+
+    /// Run the example function
+    Example,
+}
+
+fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16)
+    } else {
+        s.parse()
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Pe {
+            file,
+            address,
+            size,
+        } => {
+            let warp_uuid = compute_warp_uuid_from_pe(&file, address, size)?;
+            println!("Function at 0x{:x}:", address);
+            println!("WARP UUID: {}", warp_uuid);
+        }
+        Commands::Example => {
+            // Example x86_64 function bytes
+            let function_bytes = vec![
+                0x55, // push rbp
+                0x48, 0x89, 0xe5, // mov rbp, rsp
+                0x48, 0x83, 0xec, 0x10, // sub rsp, 0x10
+                0x89, 0x7d, 0xfc, // mov [rbp-4], edi
+                0x8b, 0x45, 0xfc, // mov eax, [rbp-4]
+                0x83, 0xc0, 0x01, // add eax, 1
+                0xc9, // leave
+                0xc3, // ret
+            ];
+
+            let warp_uuid = compute_warp_uuid(&function_bytes, 0x1000);
+            println!("WARP UUID: {}", warp_uuid);
+        }
+    }
+
+    Ok(())
+}
+
+fn compute_warp_uuid_from_pe(
+    path: &PathBuf,
+    address: u64,
+    size: Option<usize>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let pe = PeLoader::load(path)?;
+
+    // Determine function size if not provided
+    let func_size = match size {
+        Some(s) => s,
+        None => {
+            println!("Auto-detecting function size...");
+            pe.find_function_size(address)?
+        }
+    };
+
+    println!("Function size: 0x{:x} bytes", func_size);
+
+    // Read function bytes
+    let func_bytes = pe.read_at_va(address, func_size)?;
+
+    // Compute WARP UUID
+    Ok(compute_warp_uuid(func_bytes, address))
 }
 
 fn compute_warp_uuid(raw_bytes: &[u8], base: u64) -> String {
@@ -687,7 +771,7 @@ mod test {
         // Compute WARP UUID
         let warp_uuid = compute_warp_uuid(TEST_FUNCTION_BYTES, base);
         println!("\nWARP UUID: {}", warp_uuid);
-        
+
         // Verify the WARP UUID matches Binary Ninja's result
         assert_eq!(warp_uuid, "1e607388-3f66-59cd-8e32-89dd0df7925f");
     }
