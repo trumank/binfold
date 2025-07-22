@@ -223,8 +223,24 @@ impl PeLoader {
                         // Return instruction - path ends here
                         // println!("    -> Return: path ends");
                     }
+                    FlowControl::IndirectBranch => {
+                        // Indirect jump (like jmp rax or jmp [rax])
+                        // We can't determine the target statically, but we should
+                        // at least handle known patterns
+                        if ctx.debug_size {
+                            println!("  Found indirect branch at 0x{:x}", addr);
+                        }
+                        // For now, we can't follow indirect jumps
+                        // This is a limitation that might cause us to miss code
+                    }
                     _ => {
-                        // println!("    -> {:?}: not handled", instruction.flow_control());
+                        if ctx.debug_size {
+                            println!(
+                                "  Unhandled flow control {:?} at 0x{:x}",
+                                instruction.flow_control(),
+                                addr
+                            );
+                        }
                     }
                 }
             }

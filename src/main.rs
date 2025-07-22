@@ -326,7 +326,13 @@ fn identify_block_boundaries(
     let mut block_starts = BTreeSet::new();
     block_starts.insert(base); // Entry point is always a block start
 
-    for &addr in instructions.keys() {
+    // Linear sweep approach - more aggressive block identification
+    let sorted_addrs: Vec<u64> = instructions.keys().copied().collect();
+
+    for i in 0..sorted_addrs.len() {
+        let addr = sorted_addrs[i];
+        let (instruction, _) = &instructions[&addr];
+
         // Block start if multiple incoming edges
         if incoming_edges.get(&addr).map(|s| s.len()).unwrap_or(0) > 1 {
             block_starts.insert(addr);
@@ -340,20 +346,31 @@ fn identify_block_boundaries(
                 }
             }
         }
-    }
 
-    // Block starts after returns and unconditional jumps
-    let mut prev_instruction: Option<&Instruction> = None;
-    for (&addr, (instruction, _)) in instructions {
-        if let Some(prev) = prev_instruction
-            && matches!(
-                prev.flow_control(),
-                FlowControl::UnconditionalBranch | FlowControl::Return
-            )
-        {
-            block_starts.insert(addr);
+        // Mark targets of all branches as block starts
+        match instruction.flow_control() {
+            FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
+                if let Some(target) = get_branch_target(instruction) {
+                    block_starts.insert(target);
+                }
+                // Also mark the instruction after a branch as a block start
+                if i + 1 < sorted_addrs.len() {
+                    block_starts.insert(sorted_addrs[i + 1]);
+                }
+            }
+            FlowControl::Return | FlowControl::IndirectBranch => {
+                // Mark the next instruction as a block start (if it exists)
+                if i + 1 < sorted_addrs.len() {
+                    block_starts.insert(sorted_addrs[i + 1]);
+                }
+            }
+            FlowControl::Call | FlowControl::IndirectCall => {
+                // Don't mark after every call as a block start
+                // Calls don't typically create new blocks unless there's
+                // a branch to the return address
+            }
+            _ => {}
         }
-        prev_instruction = Some(instruction);
     }
 
     block_starts
@@ -374,10 +391,14 @@ fn identify_basic_blocks(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> BTr
     let (incoming_edges, outgoing_edges, visited) = build_control_flow_graph(&instructions, base);
 
     if ctx.debug_blocks {
-        println!("Found {} reachable instructions", visited.len());
+        println!(
+            "Found {} reachable instructions via control flow",
+            visited.len()
+        );
     }
 
-    // Identify basic block boundaries
+    // Identify basic block boundaries using both reachable and all instructions
+    // This matches Binary Ninja's approach of finding all blocks in the function
     let block_starts =
         identify_block_boundaries(&instructions, &incoming_edges, &outgoing_edges, base);
 
@@ -385,17 +406,16 @@ fn identify_basic_blocks(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> BTr
         println!("Identified {} block start addresses", block_starts.len());
     }
 
-    // Build basic blocks (only for reachable code)
+    // Build basic blocks for ALL code (not just reachable)
+    // This is key - Binary Ninja identifies blocks even in unreachable code
     let mut basic_blocks = BTreeMap::new();
     let starts: Vec<u64> = block_starts.iter().cloned().collect();
 
     for i in 0..starts.len() {
         let start = starts[i];
 
-        // Skip if this block is not reachable
-        if !visited.contains(&start) {
-            continue;
-        }
+        // Include ALL blocks, not just reachable ones
+        // Binary Ninja includes unreachable blocks in its analysis
 
         let mut end = start;
 
