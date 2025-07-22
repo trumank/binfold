@@ -1,18 +1,19 @@
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use pdb::{FallibleIterator, PDB, SymbolData};
-use std::fs::File;
 use std::path::Path;
 use uuid::Uuid;
 
+use crate::mmap_source::MmapSource;
 use crate::pe_loader::PeLoader;
 use crate::{DebugContext, compute_warp_uuid};
 
 pub struct PdbAnalyzer {
     pe_loader: PeLoader,
-    pdb: PDB<'static, File>,
+    pdb: PDB<'static, MmapSource>,
 }
 
+#[derive(Debug)]
 pub struct FunctionGuid {
     pub name: String,
     pub address: u64,
@@ -24,11 +25,11 @@ impl PdbAnalyzer {
     pub fn new(exe_path: &Path, pdb_path: &Path) -> Result<Self> {
         let pe_loader = PeLoader::load(exe_path)?;
 
-        let file = File::open(pdb_path)
-            .with_context(|| format!("Failed to open PDB file: {:?}", pdb_path))?;
+        let mmap_source = MmapSource::new(pdb_path)
+            .with_context(|| format!("Failed to memory-map PDB file: {:?}", pdb_path))?;
 
-        let pdb =
-            PDB::open(file).with_context(|| format!("Failed to parse PDB file: {:?}", pdb_path))?;
+        let pdb = PDB::open(mmap_source)
+            .with_context(|| format!("Failed to parse PDB file: {:?}", pdb_path))?;
 
         Ok(Self { pe_loader, pdb })
     }
@@ -36,6 +37,14 @@ impl PdbAnalyzer {
     pub fn compute_function_guids(
         &mut self,
         debug_context: &DebugContext,
+    ) -> Result<Vec<FunctionGuid>> {
+        self.compute_function_guids_with_progress(debug_context, None)
+    }
+
+    pub fn compute_function_guids_with_progress(
+        &mut self,
+        debug_context: &DebugContext,
+        progress_bar: Option<ProgressBar>,
     ) -> Result<Vec<FunctionGuid>> {
         let mut results = Vec::new();
         let address_map = self.pdb.address_map()?;
@@ -66,14 +75,23 @@ impl PdbAnalyzer {
             }
         }
 
-        // Create progress bar
-        let pb = ProgressBar::new(total_procedures as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) Analyzing functions")
-                .expect("Failed to set progress style")
-                .progress_chars("#>-")
-        );
+        // Use provided progress bar or create a new one
+        let pb = match progress_bar {
+            Some(pb) => {
+                pb.set_length(total_procedures as u64);
+                pb
+            }
+            None => {
+                let pb = ProgressBar::new(total_procedures as u64);
+                pb.set_style(
+                    ProgressStyle::default_bar()
+                        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) Analyzing functions")
+                        .expect("Failed to set progress style")
+                        .progress_chars("#>-")
+                );
+                pb
+            }
+        };
 
         // Process global symbols
         let symbol_table = self.pdb.global_symbols()?;

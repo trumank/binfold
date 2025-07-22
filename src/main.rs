@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, OpKind, Register,
 };
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -10,6 +11,7 @@ use uuid::{Uuid, uuid};
 
 mod pe_loader;
 use pe_loader::PeLoader;
+mod mmap_source;
 mod pdb_analyzer;
 
 const FUNCTION_NAMESPACE: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
@@ -71,13 +73,9 @@ enum Commands {
 
     /// Analyze PDB file and compute GUIDs for all functions
     Pdb {
-        /// Path to the PE/EXE file
-        #[arg(short = 'e', long = "exe")]
-        exe_path: PathBuf,
-
-        /// Path to the PDB file (defaults to exe path with .pdb extension)
-        #[arg(short = 'p', long = "pdb")]
-        pdb_path: Option<PathBuf>,
+        /// Paths to PE/EXE files (can specify multiple)
+        #[arg(short = 'e', long = "exe", required = true, num_args = 1..)]
+        exe_paths: Vec<PathBuf>,
 
         /// Enable debug output
         #[arg(short, long)]
@@ -86,10 +84,6 @@ enum Commands {
         /// Output format (json, text, or sqlite:<path>)
         #[arg(short = 'f', long = "format", default_value = "text")]
         format: String,
-
-        /// Limit number of functions to process (for testing)
-        #[arg(short = 'l', long = "limit")]
-        limit: Option<usize>,
     },
 }
 
@@ -162,20 +156,12 @@ fn main() -> Result<()> {
             println!("WARP UUID: {warp_uuid}");
         }
         Commands::Pdb {
-            exe_path,
-            pdb_path,
+            exe_paths,
             debug,
             format,
-            limit,
         } => {
+            use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
             use pdb_analyzer::PdbAnalyzer;
-
-            // Derive PDB path from EXE path if not provided
-            let pdb_path = pdb_path.unwrap_or_else(|| {
-                let mut path = exe_path.clone();
-                path.set_extension("pdb");
-                path
-            });
 
             let debug_context = if debug {
                 DebugContext {
@@ -188,13 +174,62 @@ fn main() -> Result<()> {
                 DebugContext::default()
             };
 
-            let mut analyzer = PdbAnalyzer::new(&exe_path, &pdb_path)?;
-            let mut function_guids = analyzer.compute_function_guids(&debug_context)?;
-
-            // Apply limit if specified
-            if let Some(limit) = limit {
-                function_guids.truncate(limit);
+            // Structure to hold results from each executable
+            #[derive(Debug)]
+            struct ExeResults {
+                exe_path: PathBuf,
+                pdb_path: PathBuf,
+                function_guids: Vec<pdb_analyzer::FunctionGuid>,
+                error: Option<String>,
             }
+
+            // Create multi-progress for parallel progress bars
+            let multi_progress = MultiProgress::new();
+
+            // Process all executables in parallel
+            let results: Vec<ExeResults> = exe_paths
+                .par_iter()
+                .map(|exe_path| {
+                    // Derive PDB path for this exe if not explicitly provided
+                    let pdb_path_for_exe = exe_path.with_extension("pdb");
+
+                    // Create a progress bar for this executable
+                    let pb = multi_progress.add(ProgressBar::new(0));
+                    let exe_name = exe_path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template(&format!("{{spinner:.green}} [{{elapsed_precise}}] [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{per_sec}}, {{eta}}) {}", exe_name))
+                            .expect("Failed to set progress style")
+                            .progress_chars("#>-")
+                    );
+
+                    // Process this exe/pdb pair
+                    let result = (|| -> Result<Vec<pdb_analyzer::FunctionGuid>> {
+                        let mut analyzer = PdbAnalyzer::new(exe_path, &pdb_path_for_exe)?;
+                        let function_guids = analyzer.compute_function_guids_with_progress(&debug_context, Some(pb.clone()))?;
+
+                        pb.finish_with_message(format!("{} - Complete!", exe_name));
+                        Ok(function_guids)
+                    })();
+
+                    match result {
+                        Ok(function_guids) => ExeResults {
+                            exe_path: exe_path.clone(),
+                            pdb_path: pdb_path_for_exe,
+                            function_guids,
+                            error: None,
+                        },
+                        Err(e) => ExeResults {
+                            exe_path: exe_path.clone(),
+                            pdb_path: pdb_path_for_exe,
+                            function_guids: vec![],
+                            error: Some(e.to_string()),
+                        },
+                    }
+                })
+                .collect();
 
             match format.as_str() {
                 "json" => {
@@ -202,10 +237,16 @@ fn main() -> Result<()> {
 
                     #[derive(Serialize)]
                     struct JsonOutput {
+                        results: Vec<JsonExeResult>,
+                    }
+
+                    #[derive(Serialize)]
+                    struct JsonExeResult {
                         exe_path: String,
                         pdb_path: String,
                         function_count: usize,
                         functions: Vec<JsonFunction>,
+                        error: Option<String>,
                     }
 
                     #[derive(Serialize)]
@@ -217,16 +258,23 @@ fn main() -> Result<()> {
                     }
 
                     let output = JsonOutput {
-                        exe_path: exe_path.display().to_string(),
-                        pdb_path: pdb_path.display().to_string(),
-                        function_count: function_guids.len(),
-                        functions: function_guids
+                        results: results
                             .into_iter()
-                            .map(|f| JsonFunction {
-                                name: f.name,
-                                address: format!("0x{:x}", f.address),
-                                size: f.size,
-                                guid: f.guid.to_string(),
+                            .map(|result| JsonExeResult {
+                                exe_path: result.exe_path.display().to_string(),
+                                pdb_path: result.pdb_path.display().to_string(),
+                                function_count: result.function_guids.len(),
+                                functions: result
+                                    .function_guids
+                                    .into_iter()
+                                    .map(|f| JsonFunction {
+                                        name: f.name,
+                                        address: format!("0x{:x}", f.address),
+                                        size: f.size,
+                                        guid: f.guid.to_string(),
+                                    })
+                                    .collect(),
+                                error: result.error,
                             })
                             .collect(),
                     };
@@ -260,12 +308,6 @@ fn main() -> Result<()> {
                         [],
                     )?;
 
-                    // Get just the exe filename
-                    let exe_name = exe_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-
                     // Get current unix timestamp
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -273,7 +315,8 @@ fn main() -> Result<()> {
                         .as_secs() as i64;
 
                     // Insert all records in a single transaction
-                    let mut inserted = 0;
+                    let mut total_inserted = 0;
+                    let mut total_errors = 0;
                     {
                         let tx = conn.transaction()?;
                         {
@@ -282,20 +325,38 @@ fn main() -> Result<()> {
                                  VALUES (?1, ?2, ?3, ?4, ?5)"
                             )?;
 
-                            for func in &function_guids {
-                                match stmt.execute(params![
-                                    func.address as i64,
-                                    func.guid.to_string(),
-                                    exe_name,
-                                    func.name,
-                                    timestamp
-                                ]) {
-                                    Ok(_) => inserted += 1,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "Failed to insert function {} at 0x{:x}: {}",
-                                            func.name, func.address, e
-                                        );
+                            for result in &results {
+                                if let Some(error) = &result.error {
+                                    eprintln!(
+                                        "Error processing {}: {}",
+                                        result.exe_path.display(),
+                                        error
+                                    );
+                                    total_errors += 1;
+                                    continue;
+                                }
+
+                                let exe_name = result
+                                    .exe_path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("unknown");
+
+                                for func in &result.function_guids {
+                                    match stmt.execute(params![
+                                        func.address as i64,
+                                        func.guid.to_string(),
+                                        exe_name,
+                                        func.name,
+                                        timestamp
+                                    ]) {
+                                        Ok(_) => total_inserted += 1,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Failed to insert function {} at 0x{:x} from {}: {}",
+                                                func.name, func.address, exe_name, e
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -305,26 +366,60 @@ fn main() -> Result<()> {
 
                     println!("SQLite database: {}", db_path);
                     println!(
-                        "Inserted {} function GUIDs for {} at timestamp {}",
-                        inserted, exe_name, timestamp
+                        "Processed {} executables ({} succeeded, {} failed)",
+                        results.len(),
+                        results.len() - total_errors,
+                        total_errors
+                    );
+                    println!(
+                        "Inserted {} function GUIDs at timestamp {}",
+                        total_inserted, timestamp
                     );
                 }
                 _ => {
                     println!("PDB Analysis Results");
                     println!("===================");
-                    println!("EXE: {}", exe_path.display());
-                    println!("PDB: {}", pdb_path.display());
-                    println!("Total functions found: {}\n", function_guids.len());
 
-                    for func in &function_guids {
-                        println!("Function: {}", func.name);
-                        println!("  Address: 0x{:x}", func.address);
-                        if let Some(size) = func.size {
-                            println!("  Size: {} bytes", size);
+                    for result in &results {
+                        println!("\nEXE: {}", result.exe_path.display());
+                        println!("PDB: {}", result.pdb_path.display());
+
+                        if let Some(error) = &result.error {
+                            println!("ERROR: {}", error);
+                            continue;
                         }
-                        println!("  GUID: {}", func.guid);
-                        println!();
+
+                        println!("Total functions found: {}\n", result.function_guids.len());
+
+                        for func in &result.function_guids {
+                            println!("Function: {}", func.name);
+                            println!("  Address: 0x{:x}", func.address);
+                            if let Some(size) = func.size {
+                                println!("  Size: {} bytes", size);
+                            }
+                            println!("  GUID: {}", func.guid);
+                            println!();
+                        }
                     }
+
+                    // Summary
+                    let successful = results.iter().filter(|r| r.error.is_none()).count();
+                    let failed = results.len() - successful;
+                    let total_functions: usize = results
+                        .iter()
+                        .filter(|r| r.error.is_none())
+                        .map(|r| r.function_guids.len())
+                        .sum();
+
+                    println!("\nSummary:");
+                    println!("========");
+                    println!(
+                        "Executables processed: {} ({} succeeded, {} failed)",
+                        results.len(),
+                        successful,
+                        failed
+                    );
+                    println!("Total functions found: {}", total_functions);
                 }
             }
         }
