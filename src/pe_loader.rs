@@ -1,10 +1,24 @@
 use crate::DebugContext;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
-use object::pe::ImageNtHeaders64;
+use object::pe::{IMAGE_DIRECTORY_ENTRY_EXCEPTION, ImageNtHeaders64};
 use object::read::pe::{ImageNtHeaders, ImageOptionalHeader, PeFile};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::ops::Range;
 use std::path::Path;
+
+#[derive(Debug, Clone)]
+pub struct RuntimeFunction {
+    pub range: Range<usize>,
+    pub unwind: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionRange {
+    pub start: u64,
+    pub end: u64,
+}
 
 pub struct PeLoader {
     mmap: Mmap,
@@ -251,6 +265,166 @@ impl PeLoader {
         }
 
         Ok(size)
+    }
+
+    /// Get the exception directory range
+    pub fn get_exception_directory_range(&self) -> Result<Range<usize>> {
+        let pe_file = PeFile::<ImageNtHeaders64>::parse(&*self.mmap)?;
+        let exception_directory = pe_file
+            .data_directory(IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+            .context("No exception directory")?;
+
+        let (address, size) = exception_directory.address_range();
+        let start_offset = self.rva_to_file_offset(address as u64)?;
+        let end_offset = start_offset + size as usize;
+
+        Ok(start_offset..end_offset)
+    }
+
+    /// Read a u32 little-endian value at the given offset
+    fn read_u32_le(&self, offset: usize) -> Result<u32> {
+        if offset + 4 > self.mmap.len() {
+            bail!("Read would go past end of file");
+        }
+        Ok(u32::from_le_bytes([
+            self.mmap[offset],
+            self.mmap[offset + 1],
+            self.mmap[offset + 2],
+            self.mmap[offset + 3],
+        ]))
+    }
+
+    /// Read a u8 value at the given offset
+    fn read_u8(&self, offset: usize) -> Result<u8> {
+        if offset >= self.mmap.len() {
+            bail!("Read would go past end of file");
+        }
+        Ok(self.mmap[offset])
+    }
+
+    /// Parse a runtime function entry from the exception directory
+    fn parse_runtime_function(&self, offset: usize) -> Result<RuntimeFunction> {
+        let start_rva = self.read_u32_le(offset)?;
+        let end_rva = self.read_u32_le(offset + 4)?;
+        let unwind_rva = self.read_u32_le(offset + 8)?;
+
+        Ok(RuntimeFunction {
+            range: (self.image_base + start_rva as u64) as usize
+                ..(self.image_base + end_rva as u64) as usize,
+            unwind: (self.image_base + unwind_rva as u64) as usize,
+        })
+    }
+
+    /// Find all functions from the exception directory
+    pub fn find_all_functions_from_exception_directory(&self) -> Result<Vec<FunctionRange>> {
+        let exception_range = self.get_exception_directory_range()?;
+        let entry_size = 12; // Each RUNTIME_FUNCTION entry is 12 bytes
+
+        // First pass: parse all runtime functions
+        let mut runtime_functions = Vec::new();
+        let mut exception_children_cache: HashMap<usize, Vec<RuntimeFunction>> = HashMap::new();
+
+        // Parse all entries in the exception directory
+        let mut offset = exception_range.start;
+        while offset + entry_size <= exception_range.end {
+            let func = self.parse_runtime_function(offset)?;
+            exception_children_cache.insert(func.range.start, vec![]);
+            runtime_functions.push(func.clone());
+            offset += entry_size;
+        }
+
+        // Second pass: build parent-child relationships based on unwind info
+        for func in &runtime_functions {
+            // Try to parse unwind info to find chained exceptions
+            if let Ok(unwind_offset) =
+                self.rva_to_file_offset((func.unwind as u64).saturating_sub(self.image_base))
+            {
+                // Check if this has chain info (first byte's upper 5 bits == 0x4)
+                if let Ok(flags) = self.read_u8(unwind_offset) {
+                    let has_chain_info = (flags >> 3) == 0x4;
+
+                    if has_chain_info {
+                        // Read unwind code count
+                        if let Ok(unwind_code_count) = self.read_u8(unwind_offset + 2) {
+                            let mut chain_offset =
+                                unwind_offset + 4 + 2 * unwind_code_count as usize;
+
+                            // Align to 4 bytes
+                            if chain_offset % 4 != 0 {
+                                chain_offset += 2;
+                            }
+
+                            // Parse chained runtime function
+                            if chain_offset + 12 <= self.mmap.len() {
+                                if let Ok(chained) = self.parse_runtime_function(chain_offset) {
+                                    exception_children_cache
+                                        .entry(chained.range.start)
+                                        .or_default()
+                                        .push(func.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Find root functions (functions that are not children of any other function)
+        let mut root_functions = HashSet::new();
+        for start_addr in exception_children_cache.keys() {
+            root_functions.insert(*start_addr);
+        }
+
+        for children in exception_children_cache.values() {
+            for child in children {
+                root_functions.remove(&child.range.start);
+            }
+        }
+
+        // For each root function, find all its children and determine the complete range
+        let mut function_ranges = Vec::new();
+
+        for &root_start in &root_functions {
+            let mut all_functions = vec![];
+            let mut queue = vec![root_start];
+            let mut visited = HashSet::new();
+
+            // Find all children recursively
+            while let Some(addr) = queue.pop() {
+                if visited.contains(&addr) {
+                    continue;
+                }
+                visited.insert(addr);
+
+                // Find the runtime function for this address
+                if let Some(func) = runtime_functions.iter().find(|f| f.range.start == addr) {
+                    all_functions.push(func.clone());
+
+                    // Add children to queue
+                    if let Some(children) = exception_children_cache.get(&addr) {
+                        for child in children {
+                            queue.push(child.range.start);
+                        }
+                    }
+                }
+            }
+
+            // Calculate the overall range
+            if !all_functions.is_empty() {
+                let min_start = all_functions.iter().map(|f| f.range.start).min().unwrap();
+                let max_end = all_functions.iter().map(|f| f.range.end).max().unwrap();
+
+                function_ranges.push(FunctionRange {
+                    start: min_start as u64,
+                    end: max_end as u64,
+                });
+            }
+        }
+
+        // Sort by start address
+        function_ranges.sort_by_key(|f| f.start);
+
+        Ok(function_ranges)
     }
 }
 

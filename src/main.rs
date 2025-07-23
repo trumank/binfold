@@ -84,6 +84,21 @@ enum Commands {
         #[arg(short = 'd', long = "database", required = true)]
         database: PathBuf,
     },
+
+    /// Compute GUIDs for functions from PE exception directory
+    Exception {
+        /// Path to the PE file
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Output format (json, text)
+        #[arg(short = 'o', long, default_value = "text")]
+        format: String,
+
+        /// Enable debug output
+        #[arg(short, long)]
+        debug: bool,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
@@ -345,6 +360,49 @@ fn main() -> Result<()> {
                 total_processed, total_failed
             );
             println!("Database: {}", database.display());
+        }
+        Commands::Exception {
+            file,
+            format,
+            debug,
+        } => {
+            let debug_context = if debug {
+                DebugContext {
+                    debug_size: false,
+                    debug_blocks: false,
+                    debug_instructions: false,
+                    debug_guid: false,
+                }
+            } else {
+                DebugContext::default()
+            };
+
+            let pe = PeLoader::load(&file)?;
+            let functions = pe.find_all_functions_from_exception_directory()?;
+
+            println!("Found {} functions in exception directory", functions.len());
+
+            let mut results = Vec::new();
+
+            for (idx, func) in functions.iter().enumerate() {
+                let size = (func.end - func.start) as usize;
+                let func_bytes = pe.read_at_va(func.start, size)?;
+                let guid = compute_warp_uuid(func_bytes, func.start, &debug_context);
+
+                results.push(serde_json::json!({
+                    "address": format!("0x{:x}", func.start),
+                    "size": size,
+                    "guid": guid.to_string(),
+                }));
+
+                if format == "text" {
+                    println!("Function {} at 0x{:x}: GUID {}", idx + 1, func.start, guid);
+                }
+            }
+
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            }
         }
     }
 
