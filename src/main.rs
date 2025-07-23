@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,6 +31,28 @@ struct FunctionResult {
     match_info: Option<MatchInfo>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DebugFlag {
+    /// Debug function size analysis
+    Size,
+    /// Debug basic block identification
+    Blocks,
+    /// Debug instruction disassembly
+    Instructions,
+    /// Debug GUID calculation
+    Guid,
+    /// Enable all debug output
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    /// Plain text output
+    Text,
+    /// JSON output
+    Json,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DebugContext {
     pub debug_size: bool,
@@ -42,6 +64,10 @@ pub struct DebugContext {
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    /// Debug flags
+    #[arg(short = 'D', long, value_enum)]
+    debug: Vec<DebugFlag>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -73,10 +99,6 @@ enum Commands {
         #[arg(short, long, value_parser = parse_hex)]
         address: u64,
 
-        /// Debug flags (size, blocks, instructions, guid, all)
-        #[arg(short = 'D', long)]
-        debug: Vec<String>,
-
         /// Optional function size (will auto-detect if not provided)
         #[arg(short, long)]
         size: Option<usize>,
@@ -91,10 +113,6 @@ enum Commands {
         #[arg(short = 'e', long = "exe", required = true, num_args = 1..)]
         exe_paths: Vec<PathBuf>,
 
-        /// Enable debug output
-        #[arg(long)]
-        debug: bool,
-
         /// SQLite database path
         #[arg(short = 'd', long = "database", required = true)]
         database: PathBuf,
@@ -106,13 +124,9 @@ enum Commands {
         #[arg(short, long)]
         file: PathBuf,
 
-        /// Output format (json, text)
-        #[arg(short = 'o', long, default_value = "text")]
-        format: String,
-
-        /// Enable debug output
-        #[arg(short, long)]
-        debug: bool,
+        /// Output format
+        #[arg(short = 'o', long, default_value_t = OutputFormat::Text, value_enum)]
+        format: OutputFormat,
 
         /// Optional SQLite database path for GUID lookups
         #[arg(long = "database")]
@@ -132,8 +146,29 @@ fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
     }
 }
 
+fn build_debug_context(flags: &[DebugFlag]) -> DebugContext {
+    let mut ctx = DebugContext::default();
+    for flag in flags {
+        match flag {
+            DebugFlag::Size => ctx.debug_size = true,
+            DebugFlag::Blocks => ctx.debug_blocks = true,
+            DebugFlag::Instructions => ctx.debug_instructions = true,
+            DebugFlag::Guid => ctx.debug_guid = true,
+            DebugFlag::All => {
+                ctx.debug_size = true;
+                ctx.debug_blocks = true;
+                ctx.debug_instructions = true;
+                ctx.debug_guid = true;
+            }
+        }
+    }
+    ctx
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    let ctx = build_debug_context(&cli.debug);
 
     match cli.command {
         Commands::Pe {
@@ -141,34 +176,15 @@ fn main() -> Result<()> {
             address,
             size,
         } => {
-            let warp_uuid =
-                compute_warp_uuid_from_pe(&file, address, size, &DebugContext::default())?;
+            let warp_uuid = compute_warp_uuid_from_pe(&file, address, size, &ctx)?;
             println!("Function at 0x{address:x}:");
             println!("WARP UUID: {warp_uuid}");
         }
         Commands::Debug {
             file,
             address,
-            debug,
             size,
         } => {
-            let mut ctx = DebugContext::default();
-            for flag in debug {
-                match flag.as_str() {
-                    "size" => ctx.debug_size = true,
-                    "blocks" => ctx.debug_blocks = true,
-                    "instructions" => ctx.debug_instructions = true,
-                    "guid" => ctx.debug_guid = true,
-                    "all" => {
-                        ctx.debug_size = true;
-                        ctx.debug_blocks = true;
-                        ctx.debug_instructions = true;
-                        ctx.debug_guid = true;
-                    }
-                    _ => eprintln!("Unknown debug flag: {flag}"),
-                }
-            }
-
             println!("Debug analysis for function at 0x{address:x}");
             println!("Debug flags: {ctx:?}");
             println!("========================================\n");
@@ -194,7 +210,6 @@ fn main() -> Result<()> {
         }
         Commands::Pdb {
             exe_paths,
-            debug,
             database,
         } => {
             use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -250,17 +265,6 @@ fn main() -> Result<()> {
                 expanded_exe_paths.len()
             );
             let exe_paths = expanded_exe_paths;
-
-            let debug_context = if debug {
-                DebugContext {
-                    debug_size: true,
-                    debug_blocks: true,
-                    debug_instructions: false,
-                    debug_guid: true,
-                }
-            } else {
-                DebugContext::default()
-            };
 
             use rusqlite::{Connection, params};
             use std::sync::{Arc, Mutex};
@@ -351,10 +355,8 @@ fn main() -> Result<()> {
                 // Process this exe/pdb pair
                 let result = (|| -> Result<()> {
                     let mut analyzer = PdbAnalyzer::new(&exe_path, &pdb_path_for_exe)?;
-                    let function_guids = analyzer.compute_function_guids_with_progress(
-                        &debug_context,
-                        Some(multi_progress.clone()),
-                    )?;
+                    let function_guids = analyzer
+                        .compute_function_guids_with_progress(&ctx, Some(multi_progress.clone()))?;
 
                     // Get just the exe filename
                     let exe_name = exe_path
@@ -445,21 +447,9 @@ fn main() -> Result<()> {
         Commands::Exception {
             file,
             format,
-            debug,
             database,
             generate_pdb,
         } => {
-            let debug_context = if debug {
-                DebugContext {
-                    debug_size: false,
-                    debug_blocks: false,
-                    debug_instructions: false,
-                    debug_guid: false,
-                }
-            } else {
-                DebugContext::default()
-            };
-
             let pe = PeLoader::load(&file)?;
             let functions = pe.find_all_functions_from_exception_directory()?;
 
@@ -500,9 +490,9 @@ fn main() -> Result<()> {
             for (idx, func) in functions.iter().enumerate() {
                 // let size = (func.end - func.start) as usize;
 
-                let size = pe.find_function_size(func.start, &debug_context)?;
+                let size = pe.find_function_size(func.start, &ctx)?;
                 let func_bytes = pe.read_at_va(func.start, size)?;
-                let guid = compute_warp_uuid(func_bytes, func.start, &debug_context);
+                let guid = compute_warp_uuid(func_bytes, func.start, &ctx);
 
                 // Look up GUID in database if available
                 let (text_match_info, struct_match_info) = if stmt.is_some() {
@@ -557,7 +547,7 @@ fn main() -> Result<()> {
                     (String::new(), None)
                 };
 
-                if format == "text"
+                if format == OutputFormat::Text
                     && struct_match_info
                         .as_ref()
                         .is_some_and(|i| i.unique_name.is_some())
@@ -581,7 +571,7 @@ fn main() -> Result<()> {
                 results.push(result);
             }
 
-            if format == "json" {
+            if format == OutputFormat::Json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
             }
 
