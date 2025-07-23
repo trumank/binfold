@@ -385,7 +385,9 @@ fn main() -> Result<()> {
             let mut results = Vec::new();
 
             for (idx, func) in functions.iter().enumerate() {
-                let size = (func.end - func.start) as usize;
+                // let size = (func.end - func.start) as usize;
+
+                let size = pe.find_function_size(func.start, &debug_context)?;
                 let func_bytes = pe.read_at_va(func.start, size)?;
                 let guid = compute_warp_uuid(func_bytes, func.start, &debug_context);
 
