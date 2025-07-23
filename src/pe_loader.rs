@@ -127,8 +127,8 @@ impl PeLoader {
         let bytes = &self.mmap[start_offset..start_offset + scan_size];
 
         if ctx.debug_size {
-            println!("Scanning function size starting at 0x{:x}", va);
-            println!("  Scan range: 0x{:x} bytes", scan_size);
+            println!("Scanning function size starting at 0x{va:x}");
+            println!("  Scan range: 0x{scan_size:x} bytes");
         }
 
         // First decode all instructions in the scan range
@@ -145,7 +145,7 @@ impl PeLoader {
         let mut max_address = va;
 
         if ctx.debug_size {
-            println!("\nStarting recursive descent from 0x{:x}", va);
+            println!("\nStarting recursive descent from 0x{va:x}");
         }
 
         while let Some((ip, from)) = queue.pop_front() {
@@ -245,7 +245,7 @@ impl PeLoader {
                         // We can't determine the target statically, but we should
                         // at least handle known patterns
                         if ctx.debug_size {
-                            println!("  Found indirect branch at 0x{:x}", ip);
+                            println!("  Found indirect branch at 0x{ip:x}");
                         }
                         // For now, we can't follow indirect jumps
                         // This is a limitation that might cause us to miss code
@@ -266,7 +266,7 @@ impl PeLoader {
 
             tailcall_queue.retain(|item| {
                 if item.0 < max_address + tail_call_threshold {
-                    queue.push_back(item.clone());
+                    queue.push_back(*item);
                     false
                 } else {
                     true
@@ -281,9 +281,9 @@ impl PeLoader {
 
         if ctx.debug_size {
             println!("\nFunction size analysis complete:");
-            println!("  Start: 0x{:x}", va);
-            println!("  End: 0x{:x}", max_address);
-            println!("  Size: 0x{:x} bytes", size);
+            println!("  Start: 0x{va:x}");
+            println!("  End: 0x{max_address:x}");
+            println!("  Size: 0x{size:x} bytes");
             println!("  Visited {} instructions", visited.len());
         }
 
@@ -375,13 +375,13 @@ impl PeLoader {
                             }
 
                             // Parse chained runtime function
-                            if chain_offset + 12 <= self.mmap.len() {
-                                if let Ok(chained) = self.parse_runtime_function(chain_offset) {
-                                    exception_children_cache
-                                        .entry(chained.range.start)
-                                        .or_default()
-                                        .push(func.clone());
-                                }
+                            if chain_offset + 12 <= self.mmap.len()
+                                && let Ok(chained) = self.parse_runtime_function(chain_offset)
+                            {
+                                exception_children_cache
+                                    .entry(chained.range.start)
+                                    .or_default()
+                                    .push(func.clone());
                             }
                         }
                     }

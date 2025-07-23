@@ -36,10 +36,10 @@ impl PdbAnalyzer {
         let pe_loader = PeLoader::load(exe_path)?;
 
         let mmap_source = MmapSource::new(pdb_path)
-            .with_context(|| format!("Failed to memory-map PDB file: {:?}", pdb_path))?;
+            .with_context(|| format!("Failed to memory-map PDB file: {pdb_path:?}"))?;
 
         let pdb = PDB::open(mmap_source)
-            .with_context(|| format!("Failed to parse PDB file: {:?}", pdb_path))?;
+            .with_context(|| format!("Failed to parse PDB file: {pdb_path:?}"))?;
 
         let exe_name = exe_path
             .file_name()
@@ -82,14 +82,14 @@ impl PdbAnalyzer {
         let symbol_table = self.pdb.global_symbols()?;
         let mut symbols = symbol_table.iter();
         while let Some(symbol) = symbols.next()? {
-            if let Ok(SymbolData::Procedure(proc)) = symbol.parse() {
-                if let Some(rva) = proc.offset.to_rva(&address_map) {
-                    procedures.push(ProcedureData {
-                        name: proc.name.to_string().to_string(),
-                        rva: rva.0,
-                        len: proc.len,
-                    });
-                }
+            if let Ok(SymbolData::Procedure(proc)) = symbol.parse()
+                && let Some(rva) = proc.offset.to_rva(&address_map)
+            {
+                procedures.push(ProcedureData {
+                    name: proc.name.to_string().to_string(),
+                    rva: rva.0,
+                    len: proc.len,
+                });
             }
         }
 
@@ -110,14 +110,14 @@ impl PdbAnalyzer {
                 let mut module_procs = Vec::new();
                 if let Ok(mut module_symbols) = module_info.symbols() {
                     while let Ok(Some(symbol)) = module_symbols.next() {
-                        if let Ok(SymbolData::Procedure(proc)) = symbol.parse() {
-                            if let Some(rva) = proc.offset.to_rva(&address_map) {
-                                module_procs.push(ProcedureData {
-                                    name: proc.name.to_string().to_string(),
-                                    rva: rva.0,
-                                    len: proc.len,
-                                });
-                            }
+                        if let Ok(SymbolData::Procedure(proc)) = symbol.parse()
+                            && let Some(rva) = proc.offset.to_rva(&address_map)
+                        {
+                            module_procs.push(ProcedureData {
+                                name: proc.name.to_string().to_string(),
+                                rva: rva.0,
+                                len: proc.len,
+                            });
                         }
                     }
                 }
@@ -155,18 +155,18 @@ impl PdbAnalyzer {
                 let size = if proc_data.len > 0 {
                     Some(proc_data.len)
                 } else {
-                    match pe_loader.find_function_size(address, &debug_context) {
+                    match pe_loader.find_function_size(address, debug_context) {
                         Ok(sz) => Some(sz as u32),
                         Err(_) => None,
                     }
                 };
 
-                let result = if let Some(size) = size {
+                if let Some(size) = size {
                     match Self::compute_function_guid_static(
-                        &pe_loader,
+                        pe_loader,
                         address,
                         size as usize,
-                        &debug_context,
+                        debug_context,
                     ) {
                         Ok(guid) => Some(FunctionGuid {
                             name: proc_data.name.clone(),
@@ -186,9 +186,7 @@ impl PdbAnalyzer {
                     }
                 } else {
                     None
-                };
-
-                result
+                }
             })
             .collect();
 
@@ -207,7 +205,7 @@ impl PdbAnalyzer {
         debug_context: &DebugContext,
     ) -> Result<Uuid> {
         let function_bytes = pe_loader.read_at_va(address, size)?;
-        let guid = compute_warp_uuid(&function_bytes, address, debug_context);
+        let guid = compute_warp_uuid(function_bytes, address, debug_context);
         Ok(guid)
     }
 }

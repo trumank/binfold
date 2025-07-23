@@ -170,12 +170,12 @@ fn main() -> Result<()> {
                         ctx.debug_instructions = true;
                         ctx.debug_guid = true;
                     }
-                    _ => eprintln!("Unknown debug flag: {}", flag),
+                    _ => eprintln!("Unknown debug flag: {flag}"),
                 }
             }
 
-            println!("Debug analysis for function at 0x{:x}", address);
-            println!("Debug flags: {:?}", ctx);
+            println!("Debug analysis for function at 0x{address:x}");
+            println!("Debug flags: {ctx:?}");
             println!("========================================\n");
 
             let warp_uuid = compute_warp_uuid_from_pe(&file, address, size, &ctx)?;
@@ -220,13 +220,13 @@ fn main() -> Result<()> {
                     if path.is_dir() {
                         // Recursively search subdirectories
                         let _ = find_exe_files_recursive(&path, exe_files);
-                    } else if let Some(ext) = path.extension() {
-                        if ext.eq_ignore_ascii_case("exe") {
-                            // Check if corresponding PDB exists
-                            let pdb_path = path.with_extension("pdb");
-                            if pdb_path.exists() {
-                                exe_files.push(path);
-                            }
+                    } else if let Some(ext) = path.extension()
+                        && ext.eq_ignore_ascii_case("exe")
+                    {
+                        // Check if corresponding PDB exists
+                        let pdb_path = path.with_extension("pdb");
+                        if pdb_path.exists() {
+                            exe_files.push(path);
                         }
                     }
                 }
@@ -322,7 +322,7 @@ fn main() -> Result<()> {
             )?;
 
             // Create string cache for fast lookups
-            let mut string_cache: HashMap<String, i64> = HashMap::new();
+            let string_cache: HashMap<String, i64> = HashMap::new();
 
             // Wrap connection and cache in Arc<Mutex> for thread-safe access
             let conn = Arc::new(Mutex::new(conn));
@@ -444,10 +444,7 @@ fn main() -> Result<()> {
 
             println!("\nSummary:");
             println!("========");
-            println!(
-                "Executables processed: {} succeeded, {} failed",
-                total_processed, total_failed
-            );
+            println!("Executables processed: {total_processed} succeeded, {total_failed} failed");
             println!("Database: {}", database.display());
         }
         Commands::Exception {
@@ -533,7 +530,7 @@ fn main() -> Result<()> {
 
                             match row_result {
                                 Ok((total_count, _, Some(func_name))) => {
-                                    let text = format!(" [{} matches: {}]", total_count, func_name);
+                                    let text = format!(" [{total_count} matches: {func_name}]");
                                     let match_info = MatchInfo {
                                         unique_name: Some(func_name),
                                         total_matches: total_count,
@@ -543,8 +540,7 @@ fn main() -> Result<()> {
                                 }
                                 Ok((total_count, unique_count, None)) => {
                                     let text = format!(
-                                        " [{} matches across {} unique names]",
-                                        total_count, unique_count
+                                        " [{total_count} matches across {unique_count} unique names]"
                                     );
                                     let match_info = MatchInfo {
                                         unique_name: None,
@@ -648,7 +644,7 @@ fn compute_warp_uuid_from_pe(
             }
             let detected_size = pe.find_function_size(address, ctx)?;
             if ctx.debug_size {
-                println!("Detected function size: 0x{:x} bytes", detected_size);
+                println!("Detected function size: 0x{detected_size:x} bytes");
             }
             detected_size
         }
@@ -687,7 +683,7 @@ pub fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uui
         block_uuids.push((start_addr, uuid));
 
         if ctx.debug_guid {
-            println!("Block 0x{:x}-0x{:x}: UUID {}", start_addr, end_addr, uuid);
+            println!("Block 0x{start_addr:x}-0x{end_addr:x}: UUID {uuid}");
         }
     }
 
@@ -728,7 +724,7 @@ pub fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uui
     if ctx.debug_guid {
         println!("\nFunction UUID calculation:");
         println!("  Block count: {}", block_uuids.len());
-        println!("  Final UUID: {}", function_uuid);
+        println!("  Final UUID: {function_uuid}");
     }
 
     function_uuid
@@ -749,15 +745,14 @@ fn decode_instructions(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, (Instructio
     instructions
 }
 
+struct Graph {
+    incoming_edges: HashMap<u64, HashSet<u64>>,
+    outgoing_edges: HashMap<u64, HashSet<u64>>,
+    visited: HashSet<u64>,
+}
+
 // Helper function to build control flow graph
-fn build_control_flow_graph(
-    instructions: &BTreeMap<u64, (Instruction, u64)>,
-    base: u64,
-) -> (
-    HashMap<u64, HashSet<u64>>,
-    HashMap<u64, HashSet<u64>>,
-    HashSet<u64>,
-) {
+fn build_control_flow_graph(instructions: &BTreeMap<u64, (Instruction, u64)>, base: u64) -> Graph {
     let mut incoming_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut outgoing_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut visited = HashSet::new();
@@ -810,7 +805,11 @@ fn build_control_flow_graph(
         }
     }
 
-    (incoming_edges, outgoing_edges, visited)
+    Graph {
+        incoming_edges,
+        outgoing_edges,
+        visited,
+    }
 }
 
 // Helper function to identify block boundaries
@@ -889,7 +888,11 @@ pub fn identify_basic_blocks(
     }
 
     // Build control flow graph edges and find reachable instructions
-    let (incoming_edges, outgoing_edges, visited) = build_control_flow_graph(&instructions, base);
+    let Graph {
+        incoming_edges,
+        outgoing_edges,
+        visited,
+    } = build_control_flow_graph(&instructions, base);
 
     if ctx.debug_blocks {
         println!(
@@ -912,9 +915,7 @@ pub fn identify_basic_blocks(
     let mut basic_blocks = BTreeMap::new();
     let starts: Vec<u64> = block_starts.iter().cloned().collect();
 
-    for i in 0..starts.len() {
-        let start = starts[i];
-
+    for start in starts {
         // Include ALL blocks, not just reachable ones
         // Binary Ninja includes unreachable blocks in its analysis
 
@@ -1152,7 +1153,11 @@ fn print_disassembly_with_edges(raw_bytes: &[u8], base: u64) {
     let instructions = decode_instructions(raw_bytes, base);
 
     // Build control flow graph edges (we don't need visited for display)
-    let (incoming_edges, outgoing_edges, _) = build_control_flow_graph(&instructions, base);
+    let Graph {
+        incoming_edges,
+        outgoing_edges,
+        ..
+    } = build_control_flow_graph(&instructions, base);
 
     // Identify block boundaries
     let block_starts =
