@@ -189,7 +189,7 @@ fn build_functions(
                 function_type: void_fn_type,
                 code_offset: DataRegionOffset::new(func_offset, section_idx),
                 properties: ProcedureProperties::new(),
-                name: StrBuf::new(format!("pdb_{}", function.name)),
+                name: StrBuf::new(function.name.clone()),
             }));
             let end_idx = module.add_symbol(SymbolRecord::ProcEnd);
             match &mut module.symbols[proc_idx] {
@@ -201,7 +201,7 @@ fn build_functions(
             builder.dbi().symbols().add(Public {
                 properties: PublicProperties::new().with_is_function(true),
                 offset: DataRegionOffset::new(func_offset, section_idx),
-                name: StrBuf::new(format!("pdb_{}", function.name)),
+                name: StrBuf::new(function.name.clone()),
             });
         }
 
