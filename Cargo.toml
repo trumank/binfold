@@ -19,3 +19,4 @@ pdb = { version = "0.8.0", path = "../../../src/third/pdb" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 indicatif = { version = "0.17", features = ["rayon"] }
 rayon = "1.10"
+pdb-sdk = { git = "https://github.com/jac3km4/pdb-sdk", version = "0.1.0" }

@@ -20,6 +20,29 @@ pub struct FunctionRange {
     pub end: u64,
 }
 
+#[derive(Debug)]
+pub struct PdbDebugInfo {
+    pub guid: [u8; 16],
+    pub age: u32,
+}
+
+#[derive(Debug)]
+pub struct SectionInfo {
+    pub name_bytes: [u8; 8],
+    pub virtual_address: u32,
+    pub virtual_size: u32,
+    pub size_of_raw_data: u32,
+    pub pointer_to_raw_data: u32,
+    pub characteristics: u32,
+}
+
+impl SectionInfo {
+    pub fn name(&self) -> Result<&str> {
+        let end = self.name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
+        std::str::from_utf8(&self.name_bytes[..end]).context("Invalid section name")
+    }
+}
+
 pub struct PeLoader {
     mmap: Mmap,
     pub image_base: u64,
@@ -422,6 +445,99 @@ impl PeLoader {
         function_ranges.sort_by_key(|f| f.start);
 
         Ok(function_ranges)
+    }
+
+    /// Get the timestamp from the PE header
+    pub fn timestamp(&self) -> Result<u32> {
+        let pe_file = PeFile::<ImageNtHeaders64>::parse(&*self.mmap)?;
+        Ok(pe_file
+            .nt_headers()
+            .file_header()
+            .time_date_stamp
+            .get(object::LittleEndian))
+    }
+
+    /// Get PDB debug info from the PE file
+    pub fn pdb_info(&self) -> Result<PdbDebugInfo> {
+        use object::LittleEndian as LE;
+        use object::pe::{
+            IMAGE_DEBUG_TYPE_CODEVIEW, IMAGE_DIRECTORY_ENTRY_DEBUG, ImageDebugDirectory,
+        };
+
+        let pe_file = PeFile::<ImageNtHeaders64>::parse(&*self.mmap)?;
+        let data_dirs = pe_file.data_directories();
+
+        // Get debug directory
+        let debug_dir = data_dirs
+            .get(IMAGE_DIRECTORY_ENTRY_DEBUG)
+            .ok_or_else(|| anyhow::anyhow!("No debug directory"))?;
+
+        // Convert RVA to file offset
+        let debug_rva = debug_dir.virtual_address.get(LE);
+        let debug_offset = self.rva_to_file_offset(debug_rva as u64)?;
+        let debug_size = debug_dir.size.get(LE) as usize;
+
+        if debug_offset + debug_size > self.mmap.len() {
+            bail!("Debug directory extends past end of file");
+        }
+
+        let debug_data = &self.mmap[debug_offset..debug_offset + debug_size];
+
+        // Parse debug directory entries
+        let num_entries =
+            debug_dir.size.get(LE) as usize / std::mem::size_of::<ImageDebugDirectory>();
+        let entries = object::slice_from_bytes::<ImageDebugDirectory>(debug_data, num_entries)
+            .map_err(|_| anyhow::anyhow!("Failed to parse debug directory entries"))?
+            .0;
+
+        // Find CodeView entry
+        for entry in entries {
+            if entry.typ.get(LE) == IMAGE_DEBUG_TYPE_CODEVIEW {
+                let offset = entry.pointer_to_raw_data.get(LE) as usize;
+                let size = entry.size_of_data.get(LE) as usize;
+
+                if offset + size > self.mmap.len() {
+                    bail!("Invalid debug data offset");
+                }
+
+                let debug_data = &self.mmap[offset..offset + size];
+
+                // Parse CodeView data
+                if debug_data.len() < 24 {
+                    bail!("CodeView data too small");
+                }
+
+                let signature = u32::from_le_bytes(debug_data[0..4].try_into()?);
+                if signature != 0x53445352 {
+                    // "RSDS"
+                    bail!("Invalid CodeView signature");
+                }
+
+                let mut guid = [0u8; 16];
+                guid.copy_from_slice(&debug_data[4..20]);
+                let age = u32::from_le_bytes(debug_data[20..24].try_into()?);
+
+                return Ok(PdbDebugInfo { guid, age });
+            }
+        }
+
+        bail!("No CodeView debug info found")
+    }
+
+    /// Get an iterator over PE sections
+    pub fn sections(&self) -> impl Iterator<Item = SectionInfo> + '_ {
+        let pe_file = PeFile::<ImageNtHeaders64>::parse(&*self.mmap).unwrap();
+        pe_file
+            .section_table()
+            .iter()
+            .map(move |section| SectionInfo {
+                name_bytes: section.name,
+                virtual_address: section.virtual_address.get(object::LittleEndian),
+                virtual_size: section.virtual_size.get(object::LittleEndian),
+                size_of_raw_data: section.size_of_raw_data.get(object::LittleEndian),
+                pointer_to_raw_data: section.pointer_to_raw_data.get(object::LittleEndian),
+                characteristics: section.characteristics.get(object::LittleEndian),
+            })
     }
 }
 

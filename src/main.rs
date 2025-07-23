@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, OpKind, Register,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -12,9 +13,28 @@ mod pe_loader;
 use pe_loader::PeLoader;
 mod mmap_source;
 mod pdb_analyzer;
+mod pdb_writer;
 
 const FUNCTION_NAMESPACE: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
 const BASIC_BLOCK_NAMESPACE: Uuid = uuid!("0192a178-7a5f-7936-8653-3cbaa7d6afe7");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MatchInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unique_name: Option<String>,
+    total_matches: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unique_count: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FunctionResult {
+    address: String,
+    size: usize,
+    guid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_info: Option<MatchInfo>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct DebugContext {
@@ -102,6 +122,10 @@ enum Commands {
         /// Optional SQLite database path for GUID lookups
         #[arg(long = "database")]
         database: Option<PathBuf>,
+
+        /// Generate PDB file with matched function names
+        #[arg(long = "generate-pdb")]
+        generate_pdb: bool,
     },
 }
 
@@ -431,6 +455,7 @@ fn main() -> Result<()> {
             format,
             debug,
             database,
+            generate_pdb,
         } => {
             let debug_context = if debug {
                 DebugContext {
@@ -475,10 +500,10 @@ fn main() -> Result<()> {
             };
 
             // Cache for GUID lookups to avoid repeated queries
-            let mut guid_cache: std::collections::HashMap<String, String> =
+            let mut guid_cache: std::collections::HashMap<String, (String, Option<MatchInfo>)> =
                 std::collections::HashMap::new();
 
-            let mut results = Vec::new();
+            let mut results: Vec<FunctionResult> = Vec::new();
 
             for (idx, func) in functions.iter().enumerate() {
                 // let size = (func.end - func.start) as usize;
@@ -488,87 +513,65 @@ fn main() -> Result<()> {
                 let guid = compute_warp_uuid(func_bytes, func.start, &debug_context);
 
                 // Look up GUID in database if available
-                let match_info = if stmt.is_some() {
+                let (text_match_info, struct_match_info) = if stmt.is_some() {
                     let guid_str = guid.to_string();
 
                     // Check cache first
-                    if let Some(cached_info) = guid_cache.get(&guid_str) {
-                        cached_info.clone()
+                    if let Some(cached_info) = guid_cache.get(&guid_str).cloned() {
+                        cached_info
                     } else {
                         // Query database if not in cache
                         let info = if let Some(ref mut stmt) = stmt {
                             use rusqlite::params;
-                            let row = stmt.query_row(params![&guid_str], |row| {
+                            let row_result = stmt.query_row(params![&guid_str], |row| {
                                 Ok((
                                     row.get::<_, i64>(0)?,            // total_count
                                     row.get::<_, i64>(1)?,            // unique_count
                                     row.get::<_, Option<String>>(2)?, // unique_function_name
                                 ))
-                            })?;
+                            });
 
-                            match row {
-                                (total_count, _, Some(func_name)) => {
-                                    format!(" [{} matches: {}]", total_count, func_name)
+                            match row_result {
+                                Ok((total_count, _, Some(func_name))) => {
+                                    let text = format!(" [{} matches: {}]", total_count, func_name);
+                                    let match_info = MatchInfo {
+                                        unique_name: Some(func_name),
+                                        total_matches: total_count,
+                                        unique_count: None,
+                                    };
+                                    (text, Some(match_info))
                                 }
-                                (total_count, unique_count, None) => {
-                                    format!(
+                                Ok((total_count, unique_count, None)) => {
+                                    let text = format!(
                                         " [{} matches across {} unique names]",
                                         total_count, unique_count
-                                    )
+                                    );
+                                    let match_info = MatchInfo {
+                                        unique_name: None,
+                                        total_matches: total_count,
+                                        unique_count: Some(unique_count),
+                                    };
+                                    (text, Some(match_info))
                                 }
+                                Err(_) => (String::new(), None),
                             }
                         } else {
-                            String::new()
+                            (String::new(), None)
                         };
 
                         guid_cache.insert(guid_str, info.clone());
                         info
                     }
                 } else {
-                    String::new()
+                    (String::new(), None)
                 };
 
-                // Build JSON matches if needed
-                let json_match_info =
-                    if format == "json" && stmt.is_some() && !match_info.is_empty() {
-                        // Use the cached query result for JSON output
-                        if let Some(ref mut stmt) = stmt {
-                            use rusqlite::params;
-                            let row = stmt.query_row(params![guid.to_string()], |row| {
-                                Ok((
-                                    row.get::<_, i64>(0)?,            // total_count
-                                    row.get::<_, i64>(1)?,            // unique_count
-                                    row.get::<_, Option<String>>(2)?, // unique_function_name
-                                ))
-                            })?;
-
-                            match row {
-                                (total_count, _, Some(func_name)) => Some(serde_json::json!({
-                                    "unique_name": func_name,
-                                    "total_matches": total_count
-                                })),
-                                (total_count, unique_count, None) => Some(serde_json::json!({
-                                    "unique_name": null,
-                                    "unique_count": unique_count,
-                                    "total_matches": total_count
-                                })),
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                let mut result = serde_json::json!({
-                    "address": format!("0x{:x}", func.start),
-                    "size": size,
-                    "guid": guid.to_string(),
-                });
-
-                if let Some(match_info) = json_match_info {
-                    result["match_info"] = match_info;
-                }
+                let result = FunctionResult {
+                    address: format!("0x{:x}", func.start),
+                    size,
+                    guid: guid.to_string(),
+                    match_info: struct_match_info,
+                };
 
                 results.push(result);
 
@@ -578,13 +581,49 @@ fn main() -> Result<()> {
                         idx + 1,
                         func.start,
                         guid,
-                        match_info
+                        text_match_info
                     );
                 }
             }
 
             if format == "json" {
                 println!("{}", serde_json::to_string_pretty(&results)?);
+            }
+
+            // Generate PDB if requested
+            if generate_pdb {
+                let pdb_info = pdb_writer::extract_pdb_info(&pe)?;
+
+                // Build function info list from results
+                let mut pdb_functions = Vec::new();
+
+                for result in &results {
+                    let address = parse_hex(&result.address).unwrap_or(0);
+                    let size = result.size as u32;
+
+                    if let Some(name) = result
+                        .match_info
+                        .as_ref()
+                        .and_then(|mi| mi.unique_name.clone())
+                    {
+                        pdb_functions.push(pdb_writer::FunctionInfo {
+                            address,
+                            size,
+                            name,
+                        });
+                    }
+                }
+
+                // Generate PDB file
+                let pdb_path = file.with_extension("pdb");
+                println!("\nGenerating PDB file at: {}", pdb_path.display());
+
+                pdb_writer::generate_pdb(&pe, &pdb_info, &pdb_functions, &pdb_path)?;
+
+                println!(
+                    "PDB file generated successfully with {} functions",
+                    pdb_functions.len()
+                );
             }
         }
     }
