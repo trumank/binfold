@@ -100,7 +100,7 @@ enum Commands {
         debug: bool,
 
         /// Optional SQLite database path for GUID lookups
-        #[arg(short = 'd', long = "database")]
+        #[arg(long = "database")]
         database: Option<PathBuf>,
     },
 }
@@ -260,26 +260,45 @@ fn main() -> Result<()> {
                  PRAGMA mmap_size = 30000000000;",
             )?;
 
-            // Create table if it doesn't exist
+            // Create string table if it doesn't exist
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS strings (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT UNIQUE NOT NULL
+                )",
+                [],
+            )?;
+
+            // Create table if it doesn't exist (with integer references to strings)
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS function_guids (
                     address INTEGER NOT NULL,
                     guid TEXT NOT NULL,
                     timestamp INTEGER NOT NULL,
-                    exe_name TEXT NOT NULL,
-                    function_name TEXT NOT NULL
+                    exe_name_id INTEGER NOT NULL,
+                    function_name_id INTEGER NOT NULL,
+                    FOREIGN KEY (exe_name_id) REFERENCES strings(id),
+                    FOREIGN KEY (function_name_id) REFERENCES strings(id)
                 )",
                 [],
             )?;
 
-            // Create index on guid column for fast lookups
+            // Create indices for fast lookups
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_function_guids_guid ON function_guids(guid)",
                 [],
             )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_strings_value ON strings(value)",
+                [],
+            )?;
 
-            // Wrap connection in Arc<Mutex> for thread-safe access
+            // Create string cache for fast lookups
+            let mut string_cache: HashMap<String, i64> = HashMap::new();
+
+            // Wrap connection and cache in Arc<Mutex> for thread-safe access
             let conn = Arc::new(Mutex::new(conn));
+            let string_cache = Arc::new(Mutex::new(string_cache));
 
             // Create multi-progress for parallel progress bars
             let multi_progress = MultiProgress::new();
@@ -322,19 +341,57 @@ fn main() -> Result<()> {
 
                     // Insert all records in a single transaction
                     let mut conn = conn.lock().unwrap();
+                    let mut cache = string_cache.lock().unwrap();
                     let tx = conn.transaction()?;
                     {
+                        // Helper function to get or insert string
+                        let get_or_insert_string = |tx: &rusqlite::Transaction,
+                                                    cache: &mut HashMap<String, i64>,
+                                                    value: &str|
+                         -> Result<i64> {
+                            if let Some(&id) = cache.get(value) {
+                                return Ok(id);
+                            }
+
+                            // Try to find existing string
+                            let id = match tx.query_row(
+                                "SELECT id FROM strings WHERE value = ?1",
+                                params![value],
+                                |row| row.get(0),
+                            ) {
+                                Ok(id) => id,
+                                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                                    // Insert new string
+                                    tx.execute(
+                                        "INSERT INTO strings (value) VALUES (?1)",
+                                        params![value],
+                                    )?;
+                                    tx.last_insert_rowid()
+                                }
+                                Err(e) => return Err(e.into()),
+                            };
+
+                            cache.insert(value.to_string(), id);
+                            Ok(id)
+                        };
+
+                        // Get exe_name_id once for this executable
+                        let exe_name_id = get_or_insert_string(&tx, &mut cache, exe_name)?;
+
                         let mut stmt = tx.prepare(
-                            "INSERT OR REPLACE INTO function_guids (address, guid, exe_name, function_name, timestamp) 
+                            "INSERT OR REPLACE INTO function_guids (address, guid, exe_name_id, function_name_id, timestamp) 
                              VALUES (?1, ?2, ?3, ?4, ?5)"
                         )?;
 
                         for func in &function_guids {
+                            let function_name_id =
+                                get_or_insert_string(&tx, &mut cache, &func.name)?;
+
                             stmt.execute(params![
                                 func.address as i64,
                                 func.guid.to_string(),
-                                exe_name,
-                                func.name,
+                                exe_name_id,
+                                function_name_id,
                                 timestamp
                             ])?;
                         }
@@ -398,7 +455,11 @@ fn main() -> Result<()> {
             // Prepare statement for GUID lookups if database is provided
             let mut stmt = if let Some(ref conn) = db_conn {
                 Some(conn.prepare(
-                    "SELECT DISTINCT exe_name, function_name FROM function_guids WHERE guid = ?1",
+                    "SELECT DISTINCT s1.value as exe_name, s2.value as function_name 
+                     FROM function_guids fg 
+                     JOIN strings s1 ON fg.exe_name_id = s1.id 
+                     JOIN strings s2 ON fg.function_name_id = s2.id 
+                     WHERE fg.guid = ?1",
                 )?)
             } else {
                 None
