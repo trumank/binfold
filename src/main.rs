@@ -562,16 +562,11 @@ fn main() -> Result<()> {
                     (String::new(), None)
                 };
 
-                let result = FunctionResult {
-                    address: format!("0x{:x}", func.start),
-                    size,
-                    guid: guid.to_string(),
-                    match_info: struct_match_info,
-                };
-
-                results.push(result);
-
-                if format == "text" {
+                if format == "text"
+                    && struct_match_info
+                        .as_ref()
+                        .is_some_and(|i| i.unique_name.is_some())
+                {
                     println!(
                         "Function {} at 0x{:x}: GUID {}{}",
                         idx + 1,
@@ -580,6 +575,15 @@ fn main() -> Result<()> {
                         text_match_info
                     );
                 }
+
+                let result = FunctionResult {
+                    address: format!("0x{:x}", func.start),
+                    size,
+                    guid: guid.to_string(),
+                    match_info: struct_match_info,
+                };
+
+                results.push(result);
             }
 
             if format == "json" {
