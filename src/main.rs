@@ -236,6 +236,8 @@ fn main() -> Result<()> {
                 "PRAGMA synchronous = OFF;
                  PRAGMA journal_mode = MEMORY;
                  PRAGMA temp_store = MEMORY;
+                 PRAGMA cache_size = 1000000;
+                 PRAGMA temp_store = MEMORY;
                  PRAGMA mmap_size = 30000000000;",
             )?;
 
