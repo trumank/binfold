@@ -455,11 +455,16 @@ fn main() -> Result<()> {
             // Prepare statement for GUID lookups if database is provided
             let mut stmt = if let Some(ref conn) = db_conn {
                 Some(conn.prepare(
-                    "SELECT DISTINCT s1.value as exe_name, s2.value as function_name 
-                     FROM function_guids fg 
-                     JOIN strings s1 ON fg.exe_name_id = s1.id 
-                     JOIN strings s2 ON fg.function_name_id = s2.id 
-                     WHERE fg.guid = ?1",
+                    "SELECT 
+                        COUNT(*) as total_count,
+                        COUNT(DISTINCT function_name_id) as unique_count,
+                        CASE 
+                            WHEN COUNT(DISTINCT function_name_id) = 1 
+                            THEN (SELECT value FROM strings WHERE id = function_name_id LIMIT 1)
+                            ELSE NULL
+                        END as unique_function_name
+                    FROM function_guids 
+                    WHERE guid = ?1",
                 )?)
             } else {
                 None
@@ -487,35 +492,26 @@ fn main() -> Result<()> {
                         cached_info.clone()
                     } else {
                         // Query database if not in cache
-                        let mut matches = Vec::new();
-                        if let Some(ref mut stmt) = stmt {
+                        let info = if let Some(ref mut stmt) = stmt {
                             use rusqlite::params;
-                            let mut rows = stmt.query(params![&guid_str])?;
+                            let row = stmt.query_row(params![&guid_str], |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,            // total_count
+                                    row.get::<_, i64>(1)?,            // unique_count
+                                    row.get::<_, Option<String>>(2)?, // unique_function_name
+                                ))
+                            })?;
 
-                            while let Some(row) = rows.next()? {
-                                let exe_name: String = row.get(0)?;
-                                let func_name: String = row.get(1)?;
-                                matches.push((exe_name, func_name));
-                            }
-                        }
-
-                        // Format and cache the result
-                        let info = if !matches.is_empty() {
-                            let unique_names: std::collections::HashSet<String> =
-                                matches.iter().map(|(_, name)| name.clone()).collect();
-
-                            if unique_names.len() == 1 {
-                                format!(
-                                    " [{} matches: {}]",
-                                    matches.len(),
-                                    unique_names.iter().next().unwrap()
-                                )
-                            } else {
-                                format!(
-                                    " [{} matches across {} unique names]",
-                                    matches.len(),
-                                    unique_names.len()
-                                )
+                            match row {
+                                (total_count, _, Some(func_name)) => {
+                                    format!(" [{} matches: {}]", total_count, func_name)
+                                }
+                                (total_count, unique_count, None) => {
+                                    format!(
+                                        " [{} matches across {} unique names]",
+                                        total_count, unique_count
+                                    )
+                                }
                             }
                         } else {
                             String::new()
@@ -529,23 +525,36 @@ fn main() -> Result<()> {
                 };
 
                 // Build JSON matches if needed
-                let mut json_matches = Vec::new();
-                if format == "json" && stmt.is_some() && !match_info.is_empty() {
-                    // Re-query for JSON output (this is rare, only when JSON format is requested)
-                    if let Some(ref mut stmt) = stmt {
-                        use rusqlite::params;
-                        let mut rows = stmt.query(params![guid.to_string()])?;
+                let json_match_info =
+                    if format == "json" && stmt.is_some() && !match_info.is_empty() {
+                        // Use the cached query result for JSON output
+                        if let Some(ref mut stmt) = stmt {
+                            use rusqlite::params;
+                            let row = stmt.query_row(params![guid.to_string()], |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,            // total_count
+                                    row.get::<_, i64>(1)?,            // unique_count
+                                    row.get::<_, Option<String>>(2)?, // unique_function_name
+                                ))
+                            })?;
 
-                        while let Some(row) = rows.next()? {
-                            let exe_name: String = row.get(0)?;
-                            let func_name: String = row.get(1)?;
-                            json_matches.push(serde_json::json!({
-                                "exe": exe_name,
-                                "name": func_name
-                            }));
+                            match row {
+                                (total_count, _, Some(func_name)) => Some(serde_json::json!({
+                                    "unique_name": func_name,
+                                    "total_matches": total_count
+                                })),
+                                (total_count, unique_count, None) => Some(serde_json::json!({
+                                    "unique_name": null,
+                                    "unique_count": unique_count,
+                                    "total_matches": total_count
+                                })),
+                            }
+                        } else {
+                            None
                         }
-                    }
-                }
+                    } else {
+                        None
+                    };
 
                 let mut result = serde_json::json!({
                     "address": format!("0x{:x}", func.start),
@@ -553,8 +562,8 @@ fn main() -> Result<()> {
                     "guid": guid.to_string(),
                 });
 
-                if !json_matches.is_empty() {
-                    result["matches"] = serde_json::json!(json_matches);
+                if let Some(match_info) = json_match_info {
+                    result["match_info"] = match_info;
                 }
 
                 results.push(result);
