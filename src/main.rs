@@ -289,6 +289,10 @@ fn main() -> Result<()> {
                 [],
             )?;
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_function_guids_guid_fname ON function_guids(guid, function_name_id)",
+                [],
+            )?;
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_strings_value ON strings(value)",
                 [],
             )?;
