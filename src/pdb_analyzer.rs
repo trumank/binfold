@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
 use pdb::{FallibleIterator, PDB, SymbolData};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::mmap_source::MmapSource;
 use crate::pe_loader::PeLoader;
+use crate::warp::FunctionCall;
 use crate::{DebugContext, compute_warp_uuid};
 
 pub struct PdbAnalyzer {
@@ -15,12 +17,19 @@ pub struct PdbAnalyzer {
     exe_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct FunctionGuid {
     pub name: String,
     pub address: u64,
     pub size: Option<u32>,
     pub guid: Uuid,
+    pub constraints: Vec<Constraint>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Constraint {
+    pub guid: Uuid,
+    pub offset: Option<i64>,
 }
 
 // Structure to hold procedure data for parallel processing
@@ -146,56 +155,80 @@ impl PdbAnalyzer {
         let pe_loader = &self.pe_loader;
 
         // Process procedures in parallel
-        let results: Vec<_> = procedures
-            .par_iter()
-            .progress_with(pb.clone())
-            .filter_map(|proc_data| {
-                let address = proc_data.rva as u64 + pe_loader.image_base;
+        let (mut functions, calls): (HashMap<u64, FunctionGuid>, Vec<(u64, Vec<FunctionCall>)>) =
+            procedures
+                .par_iter()
+                .progress_with(pb.clone())
+                .filter_map(|proc_data| {
+                    let address = proc_data.rva as u64 + pe_loader.image_base;
 
-                let size = if proc_data.len > 0 {
-                    Some(proc_data.len)
-                } else {
-                    match pe_loader.find_function_size(address, debug_context) {
-                        Ok(sz) => Some(sz as u32),
-                        Err(_) => None,
-                    }
-                };
-
-                if let Some(size) = size {
-                    match Self::compute_function_guid_static(
-                        pe_loader,
-                        address,
-                        size as usize,
-                        debug_context,
-                    ) {
-                        Ok(guid) => Some(FunctionGuid {
-                            name: proc_data.name.clone(),
-                            address,
-                            size: Some(size),
-                            guid,
-                        }),
-                        Err(e) => {
-                            if debug_context.debug_guid {
-                                eprintln!(
-                                    "Failed to compute GUID for function {} at 0x{:x}: {}",
-                                    proc_data.name, address, e
-                                );
-                            }
-                            None
+                    let size = if proc_data.len > 0 {
+                        Some(proc_data.len)
+                    } else {
+                        match pe_loader.find_function_size(address, debug_context) {
+                            Ok(sz) => Some(sz as u32),
+                            Err(_) => None,
                         }
+                    };
+
+                    if let Some(size) = size {
+                        match Self::compute_function_guid_static(
+                            pe_loader,
+                            address,
+                            size as usize,
+                            debug_context,
+                        ) {
+                            Ok((guid, calls)) => Some((
+                                (
+                                    address,
+                                    FunctionGuid {
+                                        name: proc_data.name.clone(),
+                                        address,
+                                        size: Some(size),
+                                        guid,
+                                        constraints: vec![],
+                                    },
+                                ),
+                                (address, calls),
+                            )),
+                            Err(e) => {
+                                if debug_context.debug_guid {
+                                    eprintln!(
+                                        "Failed to compute GUID for function {} at 0x{:x}: {}",
+                                        proc_data.name, address, e
+                                    );
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        None
                     }
-                } else {
-                    None
-                }
-            })
-            .collect();
+                })
+                .unzip();
 
         if let Some(multi) = progress_bar {
             pb.finish_and_clear();
             multi.remove(&pb);
         }
 
-        Ok(results)
+        // TODO analyze and calls to functions that have not already been found?
+        // FIXME constraint GUID calculation is wrong (is not just function GUID)
+
+        for (address, calls) in calls {
+            let constraints = calls
+                .into_iter()
+                .flat_map(|call| {
+                    Some(Constraint {
+                        guid: functions.get(&call.target)?.guid,
+                        offset: Some(call.offset as i64),
+                    })
+                })
+                .collect();
+            functions.get_mut(&address).unwrap().constraints = constraints;
+        }
+
+        Ok(functions.into_values().collect())
     }
 
     fn compute_function_guid_static(
@@ -203,9 +236,10 @@ impl PdbAnalyzer {
         address: u64,
         size: usize,
         debug_context: &DebugContext,
-    ) -> Result<Uuid> {
+    ) -> Result<(Uuid, Vec<FunctionCall>)> {
         let function_bytes = pe_loader.read_at_va(address, size)?;
-        let guid = compute_warp_uuid(function_bytes, address, None, debug_context);
-        Ok(guid)
+        let mut calls = vec![];
+        let guid = compute_warp_uuid(function_bytes, address, Some(&mut calls), debug_context);
+        Ok((guid, calls))
     }
 }

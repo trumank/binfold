@@ -404,6 +404,10 @@ fn command_pdb(
             let function_guids =
                 analyzer.compute_function_guids_with_progress(ctx, Some(multi_progress.clone()))?;
 
+            for func in &function_guids {
+                println!("{func:#x?}");
+            }
+
             // Get just the exe filename
             let exe_name = exe_path
                 .file_name()
