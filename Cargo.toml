@@ -3,6 +3,9 @@ name = "warp-testing"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+debug = true
+
 [dependencies]
 iced-x86 = "1.21"
 uuid = { version = "1.10", features = ["serde", "v5"] }

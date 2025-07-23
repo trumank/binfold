@@ -98,6 +98,10 @@ enum Commands {
         /// Enable debug output
         #[arg(short, long)]
         debug: bool,
+
+        /// Optional SQLite database path for GUID lookups
+        #[arg(short = 'd', long = "database")]
+        database: Option<PathBuf>,
     },
 }
 
@@ -365,6 +369,7 @@ fn main() -> Result<()> {
             file,
             format,
             debug,
+            database,
         } => {
             let debug_context = if debug {
                 DebugContext {
@@ -382,6 +387,27 @@ fn main() -> Result<()> {
 
             println!("Found {} functions in exception directory", functions.len());
 
+            // Open database connection if provided
+            let db_conn = if let Some(db_path) = &database {
+                use rusqlite::Connection;
+                Some(Connection::open(db_path)?)
+            } else {
+                None
+            };
+
+            // Prepare statement for GUID lookups if database is provided
+            let mut stmt = if let Some(ref conn) = db_conn {
+                Some(conn.prepare(
+                    "SELECT DISTINCT exe_name, function_name FROM function_guids WHERE guid = ?1",
+                )?)
+            } else {
+                None
+            };
+
+            // Cache for GUID lookups to avoid repeated queries
+            let mut guid_cache: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+
             let mut results = Vec::new();
 
             for (idx, func) in functions.iter().enumerate() {
@@ -391,14 +417,95 @@ fn main() -> Result<()> {
                 let func_bytes = pe.read_at_va(func.start, size)?;
                 let guid = compute_warp_uuid(func_bytes, func.start, &debug_context);
 
-                results.push(serde_json::json!({
+                // Look up GUID in database if available
+                let match_info = if stmt.is_some() {
+                    let guid_str = guid.to_string();
+
+                    // Check cache first
+                    if let Some(cached_info) = guid_cache.get(&guid_str) {
+                        cached_info.clone()
+                    } else {
+                        // Query database if not in cache
+                        let mut matches = Vec::new();
+                        if let Some(ref mut stmt) = stmt {
+                            use rusqlite::params;
+                            let mut rows = stmt.query(params![&guid_str])?;
+
+                            while let Some(row) = rows.next()? {
+                                let exe_name: String = row.get(0)?;
+                                let func_name: String = row.get(1)?;
+                                matches.push((exe_name, func_name));
+                            }
+                        }
+
+                        // Format and cache the result
+                        let info = if !matches.is_empty() {
+                            let unique_names: std::collections::HashSet<String> =
+                                matches.iter().map(|(_, name)| name.clone()).collect();
+
+                            if unique_names.len() == 1 {
+                                format!(
+                                    " [{} matches: {}]",
+                                    matches.len(),
+                                    unique_names.iter().next().unwrap()
+                                )
+                            } else {
+                                format!(
+                                    " [{} matches across {} unique names]",
+                                    matches.len(),
+                                    unique_names.len()
+                                )
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                        guid_cache.insert(guid_str, info.clone());
+                        info
+                    }
+                } else {
+                    String::new()
+                };
+
+                // Build JSON matches if needed
+                let mut json_matches = Vec::new();
+                if format == "json" && stmt.is_some() && !match_info.is_empty() {
+                    // Re-query for JSON output (this is rare, only when JSON format is requested)
+                    if let Some(ref mut stmt) = stmt {
+                        use rusqlite::params;
+                        let mut rows = stmt.query(params![guid.to_string()])?;
+
+                        while let Some(row) = rows.next()? {
+                            let exe_name: String = row.get(0)?;
+                            let func_name: String = row.get(1)?;
+                            json_matches.push(serde_json::json!({
+                                "exe": exe_name,
+                                "name": func_name
+                            }));
+                        }
+                    }
+                }
+
+                let mut result = serde_json::json!({
                     "address": format!("0x{:x}", func.start),
                     "size": size,
                     "guid": guid.to_string(),
-                }));
+                });
+
+                if !json_matches.is_empty() {
+                    result["matches"] = serde_json::json!(json_matches);
+                }
+
+                results.push(result);
 
                 if format == "text" {
-                    println!("Function {} at 0x{:x}: GUID {}", idx + 1, func.start, guid);
+                    println!(
+                        "Function {} at 0x{:x}: GUID {}{}",
+                        idx + 1,
+                        func.start,
+                        guid,
+                        match_info
+                    );
                 }
             }
 
