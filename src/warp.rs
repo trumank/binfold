@@ -493,16 +493,10 @@ fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<
     if instruction.mnemonic() == Mnemonic::Jmp && instruction.op_count() > 0 {
         match instruction.op_kind(0) {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-                // Get the jump target
-                let jump_target = match instruction.op_kind(0) {
-                    OpKind::NearBranch16 => instruction.near_branch16() as u64,
-                    OpKind::NearBranch32 => instruction.near_branch32() as u64,
-                    OpKind::NearBranch64 => instruction.near_branch64(),
-                    _ => 0,
-                };
-
                 // Check if jump target is outside function bounds
-                if !function_bounds.contains(&jump_target) {
+                if let Some(target) = get_branch_target(instruction)
+                    && !function_bounds.contains(&target)
+                {
                     return true;
                 }
             }
@@ -531,51 +525,6 @@ fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<
     }
 
     false
-}
-
-fn print_disassembly_with_edges(raw_bytes: &[u8], base: u64) {
-    // Decode all instructions
-    let instructions = decode_instructions(raw_bytes, base);
-
-    // Build control flow graph edges (we don't need visited for display)
-    let Graph {
-        incoming_edges,
-        outgoing_edges,
-        ..
-    } = build_control_flow_graph(&instructions, base);
-
-    // Identify block boundaries
-    let block_starts =
-        identify_block_boundaries(&instructions, &incoming_edges, &outgoing_edges, base);
-
-    // Print disassembly with edge information - LINEAR SWEEP
-    let mut formatter = iced_x86::NasmFormatter::new();
-    let mut output = String::new();
-
-    println!("Address      | In  | Out | Instruction");
-    println!("-------------|-----|-----|-------------");
-
-    // Do a fresh linear sweep to catch everything
-    let mut decoder = Decoder::with_ip(64, raw_bytes, base, DecoderOptions::NONE);
-
-    while decoder.can_decode() {
-        let addr = decoder.ip();
-
-        // Print block boundary if needed
-        if block_starts.contains(&addr) && addr != base {
-            println!("-------------|-----|-----|------------- BLOCK BOUNDARY");
-        }
-
-        let instruction = decoder.decode();
-
-        let in_edges = incoming_edges.get(&addr).map(|s| s.len()).unwrap_or(0);
-        let out_edges = outgoing_edges.get(&addr).map(|s| s.len()).unwrap_or(0);
-
-        output.clear();
-        formatter.format(&instruction, &mut output);
-
-        println!("0x{addr:08x}  | {in_edges:3} | {out_edges:3} | {output}");
-    }
 }
 
 // >>> with open('/tmp/functions.json', 'w') as f:
