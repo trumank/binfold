@@ -286,12 +286,9 @@ impl PeLoader {
         if offset + 4 > self.mmap.len() {
             bail!("Read would go past end of file");
         }
-        Ok(u32::from_le_bytes([
-            self.mmap[offset],
-            self.mmap[offset + 1],
-            self.mmap[offset + 2],
-            self.mmap[offset + 3],
-        ]))
+        Ok(u32::from_le_bytes(
+            self.mmap[offset..offset + 4].try_into().unwrap(),
+        ))
     }
 
     /// Read a u8 value at the given offset
@@ -321,7 +318,7 @@ impl PeLoader {
         let entry_size = 12; // Each RUNTIME_FUNCTION entry is 12 bytes
 
         // First pass: parse all runtime functions
-        let mut runtime_functions = Vec::new();
+        let mut runtime_functions_by_start: HashMap<usize, RuntimeFunction> = HashMap::new();
         let mut exception_children_cache: HashMap<usize, Vec<RuntimeFunction>> = HashMap::new();
 
         // Parse all entries in the exception directory
@@ -329,12 +326,12 @@ impl PeLoader {
         while offset + entry_size <= exception_range.end {
             let func = self.parse_runtime_function(offset)?;
             exception_children_cache.insert(func.range.start, vec![]);
-            runtime_functions.push(func.clone());
+            runtime_functions_by_start.insert(func.range.start, func);
             offset += entry_size;
         }
 
         // Second pass: build parent-child relationships based on unwind info
-        for func in &runtime_functions {
+        for func in runtime_functions_by_start.values() {
             // Try to parse unwind info to find chained exceptions
             if let Ok(unwind_offset) =
                 self.rva_to_file_offset((func.unwind as u64).saturating_sub(self.image_base))
@@ -396,8 +393,8 @@ impl PeLoader {
                 }
                 visited.insert(addr);
 
-                // Find the runtime function for this address
-                if let Some(func) = runtime_functions.iter().find(|f| f.range.start == addr) {
+                // Find the runtime function for this address using O(1) HashMap lookup
+                if let Some(func) = runtime_functions_by_start.get(&addr) {
                     all_functions.push(func.clone());
 
                     // Add children to queue
