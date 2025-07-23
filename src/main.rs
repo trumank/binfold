@@ -230,12 +230,22 @@ fn command_example(CommandExample: CommandExample, _ctx: &DebugContext) -> Resul
         0x48, 0x83, 0xec, 0x10, // sub rsp, 0x10
         0x89, 0x7d, 0xfc, // mov [rbp-4], edi
         0x8b, 0x45, 0xfc, // mov eax, [rbp-4]
+        0xe8, 0x1d, 0x00, 0x00, 0x00, // call 0x1030
         0x83, 0xc0, 0x01, // add eax, 1
         0xc9, // leave
-        0xc3, // ret
+        0xe9, 0x24, 0x00, 0x00, 0x00, // jmp 0x1040
     ];
 
-    let warp_uuid = compute_warp_uuid(&function_bytes, 0x1000, &DebugContext::default());
+    let mut calls = vec![];
+    let warp_uuid = compute_warp_uuid(
+        &function_bytes,
+        0x1000,
+        Some(&mut calls),
+        &DebugContext::default(),
+    );
+    for call in calls {
+        println!("{call:x?}");
+    }
     println!("WARP UUID: {warp_uuid}");
     Ok(())
 }
@@ -530,7 +540,7 @@ fn command_exception(
 
         let size = pe.find_function_size(func.start, ctx)?;
         let func_bytes = pe.read_at_va(func.start, size)?;
-        let guid = compute_warp_uuid(func_bytes, func.start, ctx);
+        let guid = compute_warp_uuid(func_bytes, func.start, None, ctx);
 
         // Look up GUID in database if available
         let (text_match_info, struct_match_info) = if stmt.is_some() {

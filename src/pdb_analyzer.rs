@@ -205,7 +205,7 @@ impl PdbAnalyzer {
         debug_context: &DebugContext,
     ) -> Result<Uuid> {
         let function_bytes = pe_loader.read_at_va(address, size)?;
-        let guid = compute_warp_uuid(function_bytes, address, debug_context);
+        let guid = compute_warp_uuid(function_bytes, address, None, debug_context);
         Ok(guid)
     }
 }

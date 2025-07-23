@@ -43,10 +43,23 @@ pub fn compute_warp_uuid_from_pe(
     let func_bytes = pe.read_at_va(address, func_size)?;
 
     // Compute WARP UUID
-    Ok(compute_warp_uuid(func_bytes, address, ctx))
+    Ok(compute_warp_uuid(func_bytes, address, None, ctx))
 }
 
-pub fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uuid {
+#[derive(Debug)]
+pub struct FunctionCall {
+    /// function call target
+    pub target: u64,
+    /// offset from calling function entrypoint
+    pub offset: u64,
+}
+
+pub fn compute_warp_uuid(
+    raw_bytes: &[u8],
+    base: u64,
+    mut calls: Option<&mut Vec<FunctionCall>>,
+    ctx: &DebugContext,
+) -> Uuid {
     // Disassemble and identify basic blocks
     let basic_blocks = identify_basic_blocks(raw_bytes, base, ctx);
 
@@ -63,6 +76,7 @@ pub fn compute_warp_uuid(raw_bytes: &[u8], base: u64, ctx: &DebugContext) -> Uui
             block_bytes,
             start_addr,
             base..(base + raw_bytes.len() as u64),
+            calls.as_deref_mut(),
             ctx,
         );
         block_uuids.push((start_addr, uuid));
@@ -355,9 +369,11 @@ fn create_basic_block_guid(
     raw_bytes: &[u8],
     base: u64,
     function_bounds: Range<u64>,
+    calls: Option<&mut Vec<FunctionCall>>,
     ctx: &DebugContext,
 ) -> Uuid {
-    let instruction_bytes = get_instruction_bytes_for_guid(raw_bytes, base, function_bounds, ctx);
+    let instruction_bytes =
+        get_instruction_bytes_for_guid(raw_bytes, base, function_bounds, calls, ctx);
     Uuid::new_v5(&BASIC_BLOCK_NAMESPACE, &instruction_bytes)
 }
 
@@ -365,6 +381,7 @@ fn get_instruction_bytes_for_guid(
     raw_bytes: &[u8],
     base: u64,
     function_bounds: Range<u64>,
+    mut calls: Option<&mut Vec<FunctionCall>>,
     ctx: &DebugContext,
 ) -> Vec<u8> {
     use iced_x86::Formatter;
@@ -402,7 +419,7 @@ fn get_instruction_bytes_for_guid(
         }
 
         // Get instruction bytes, zeroing out relocatable instructions
-        if is_relocatable_instruction(&instruction, function_bounds.clone()) {
+        if is_relocatable_instruction(&instruction, function_bounds.clone(), calls.as_deref_mut()) {
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
             if ctx.debug_guid {
@@ -477,12 +494,21 @@ fn has_implicit_extension(reg: Register) -> bool {
     )
 }
 
-fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<u64>) -> bool {
+fn is_relocatable_instruction(
+    instruction: &Instruction,
+    function_bounds: Range<u64>,
+    calls: Option<&mut Vec<FunctionCall>>,
+) -> bool {
+    let offset = instruction.ip() - function_bounds.start;
+
     // Check for direct calls - but only forward calls are relocatable
     if instruction.mnemonic() == Mnemonic::Call && instruction.op_count() > 0 {
         match instruction.op_kind(0) {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                 // All direct calls are relocatable
+                if let (Some(calls), Some(target)) = (calls, get_branch_target(instruction)) {
+                    calls.push(FunctionCall { target, offset });
+                }
                 return true;
             }
             _ => {}
@@ -497,6 +523,9 @@ fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<
                 if let Some(target) = get_branch_target(instruction)
                     && !function_bounds.contains(&target)
                 {
+                    if let Some(calls) = calls {
+                        calls.push(FunctionCall { target, offset });
+                    }
                     return true;
                 }
             }
@@ -826,6 +855,7 @@ mod test {
                     block_bytes,
                     start,
                     function_address..(function_address + function_size as u64),
+                    None,
                     &DebugContext::default(),
                 ))
             } else {
@@ -852,8 +882,12 @@ mod test {
         }
 
         // Compute WARP UUID
-        let warp_uuid =
-            compute_warp_uuid(function_bytes, function_address, &DebugContext::default());
+        let warp_uuid = compute_warp_uuid(
+            function_bytes,
+            function_address,
+            None,
+            &DebugContext::default(),
+        );
         println!("\nWARP UUID: {}", warp_uuid);
         println!("Expected:  {}", expected_function_guid);
 
