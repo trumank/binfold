@@ -1,4 +1,3 @@
-use crate::DebugContext;
 use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
 use object::pe::{IMAGE_DIRECTORY_ENTRY_EXCEPTION, ImageNtHeaders64};
@@ -7,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
+use tracing::{debug, trace};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeFunction {
@@ -120,14 +120,13 @@ impl PeLoader {
 
     /// Find a function at the given address and return its approximate size
     /// Uses recursive descent to follow all code paths
-    pub fn find_function_size(&self, va: u64, ctx: &DebugContext) -> Result<usize> {
-        self.find_function_size_with_cfg(va, ctx, None)
+    pub fn find_function_size(&self, va: u64) -> Result<usize> {
+        self.find_function_size_with_cfg(va, None)
     }
 
     pub fn find_function_size_with_cfg(
         &self,
         va: u64,
-        ctx: &DebugContext,
         mut cfg_builder: Option<&mut ControlFlowGraph>,
     ) -> Result<usize> {
         use iced_x86::{Decoder, DecoderOptions, FlowControl};
@@ -148,10 +147,12 @@ impl PeLoader {
 
         let bytes = &self.mmap[start_offset..start_offset + scan_size];
 
-        if ctx.debug_size {
-            println!("Scanning function size starting at 0x{va:x}");
-            println!("  Scan range: 0x{scan_size:x} bytes");
-        }
+        debug!(
+            target: "warp_testing::pe_loader::size",
+            start = format!("0x{va:x}"),
+            scan_range = format!("0x{scan_size:x}"),
+            "Scanning function size"
+        );
 
         // First decode all instructions in the scan range
         // let mut all_instructions = std::collections::BTreeMap::new();
@@ -172,18 +173,19 @@ impl PeLoader {
             cfg.block_starts.insert(va);
         }
 
-        if ctx.debug_size {
-            println!("\nStarting recursive descent from 0x{va:x}");
-        }
+        debug!(
+            target: "warp_testing::pe_loader::size",
+            start = format!("0x{va:x}"),
+            "Starting recursive descent"
+        );
 
         while let Some((ip, from)) = queue.pop_front() {
-            if ctx.debug_size {
-                if let Some(from) = from {
-                    println!("  Disassembing @ 0x{ip:x} (from 0x{from:x})",);
-                } else {
-                    println!("  Disassembing @ 0x{ip:x}",);
-                }
-            }
+            trace!(
+                target: "warp_testing::pe_loader::size",
+                at = format!("0x{ip:x}"),
+                from = from.map(|f| format!("0x{f:x}")),
+                "Disassembling"
+            );
 
             if ip
                 .checked_sub(va)
@@ -192,9 +194,11 @@ impl PeLoader {
             {
                 decoder.set_ip(ip);
             } else {
-                if ctx.debug_size {
-                    println!("  Out of function bounds: 0x{ip:x}");
-                }
+                trace!(
+                    target: "warp_testing::pe_loader::size",
+                    address = format!("0x{ip:x}"),
+                    "Out of function bounds"
+                );
                 continue;
             }
             while decoder.can_decode() && !visited.contains(&decoder.ip()) {
@@ -207,19 +211,20 @@ impl PeLoader {
                     cfg.visited_instructions.insert(ip);
                 }
 
-                if ctx.debug_size {
-                    use iced_x86::Formatter;
-                    let mut formatter = iced_x86::NasmFormatter::new();
-                    let mut output = String::new();
-                    formatter.format(&instruction, &mut output);
-                    println!(
-                        "    +{:<5x} 0x{:x}: {} (flow: {:?})",
-                        ip - va,
-                        ip,
-                        output,
-                        instruction.flow_control()
-                    );
-                }
+                trace!(
+                    target: "warp_testing::pe_loader::size",
+                    offset = format!("0x{:<5x}", ip - va),
+                    address = format!("0x{:x}", ip),
+                    instruction = {
+                        use iced_x86::Formatter;
+                        let mut formatter = iced_x86::NasmFormatter::new();
+                        let mut output = String::new();
+                        formatter.format(&instruction, &mut output);
+                        output
+                    },
+                    flow_control = ?instruction.flow_control(),
+                    "Instruction"
+                );
 
                 // Update max address - but not for returns or interrupts
                 match instruction.flow_control() {
@@ -312,9 +317,11 @@ impl PeLoader {
                         // Indirect jump (like jmp rax or jmp [rax])
                         // We can't determine the target statically, but we should
                         // at least handle known patterns
-                        if ctx.debug_size {
-                            println!("  Found indirect branch at 0x{ip:x}");
-                        }
+                        trace!(
+                            target: "warp_testing::pe_loader::size",
+                            address = format!("0x{ip:x}"),
+                            "Found indirect branch"
+                        );
                         // The next instruction (if any) starts a new block
                         let next_ip = decoder.ip();
                         if let Some(cfg) = cfg_builder.as_deref_mut()
@@ -327,13 +334,12 @@ impl PeLoader {
                         break;
                     }
                     _ => {
-                        if ctx.debug_size {
-                            println!(
-                                "  Unhandled flow control {:?} at 0x{:x}",
-                                instruction.flow_control(),
-                                ip
-                            );
-                        }
+                        trace!(
+                            target: "warp_testing::pe_loader::size",
+                            flow_control = ?instruction.flow_control(),
+                            address = format!("0x{:x}", ip),
+                            "Unhandled flow control"
+                        );
                         break;
                     }
                 }
@@ -354,13 +360,14 @@ impl PeLoader {
             bail!("Could not determine function size")
         }
 
-        if ctx.debug_size {
-            println!("\nFunction size analysis complete:");
-            println!("  Start: 0x{va:x}");
-            println!("  End: 0x{max_address:x}");
-            println!("  Size: 0x{size:x} bytes");
-            println!("  Visited {} instructions", visited.len());
-        }
+        debug!(
+            target: "warp_testing::pe_loader::size",
+            start = format!("0x{va:x}"),
+            end = format!("0x{max_address:x}"),
+            size = format!("0x{size:x}"),
+            visited_instructions = visited.len(),
+            "Function size analysis complete"
+        );
 
         Ok(size)
     }

@@ -4,12 +4,13 @@ use pdb::{FallibleIterator, PDB, SymbolData};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
+use tracing::warn;
 use uuid::Uuid;
 
+use crate::compute_warp_uuid;
 use crate::mmap_source::MmapSource;
 use crate::pe_loader::{ControlFlowGraph, PeLoader};
 use crate::warp::{Constraint, FunctionCall};
-use crate::{DebugContext, compute_warp_uuid};
 
 pub struct PdbAnalyzer {
     pe_loader: PeLoader,
@@ -59,7 +60,6 @@ impl PdbAnalyzer {
 
     pub fn compute_function_guids_with_progress(
         &mut self,
-        debug_context: &DebugContext,
         progress_bar: Option<MultiProgress>,
     ) -> Result<Vec<FunctionGuid>> {
         let address_map = self.pdb.address_map()?;
@@ -157,11 +157,8 @@ impl PdbAnalyzer {
                     let address = proc_data.rva as u64 + pe_loader.image_base;
 
                     let mut cfg = ControlFlowGraph::default();
-                    let size = match pe_loader.find_function_size_with_cfg(
-                        address,
-                        debug_context,
-                        Some(&mut cfg),
-                    ) {
+                    let size = match pe_loader.find_function_size_with_cfg(address, Some(&mut cfg))
+                    {
                         Ok(sz) => Some(sz as u32),
                         Err(_) => None,
                     };
@@ -171,7 +168,6 @@ impl PdbAnalyzer {
                             pe_loader,
                             address,
                             size as usize,
-                            debug_context,
                             &cfg,
                         ) {
                             Ok((guid, calls)) => Some((
@@ -188,12 +184,13 @@ impl PdbAnalyzer {
                                 (address, calls),
                             )),
                             Err(e) => {
-                                if debug_context.debug_guid {
-                                    eprintln!(
-                                        "Failed to compute GUID for function {} at 0x{:x}: {}",
-                                        proc_data.name, address, e
-                                    );
-                                }
+                                warn!(
+                                    target: "warp_testing::pdb_analyzer",
+                                    function_name = %proc_data.name,
+                                    address = format!("0x{:x}", address),
+                                    error = %e,
+                                    "Failed to compute GUID for function"
+                                );
                                 None
                             }
                         }
@@ -233,18 +230,11 @@ impl PdbAnalyzer {
         pe_loader: &PeLoader,
         address: u64,
         size: usize,
-        debug_context: &DebugContext,
         cfg: &ControlFlowGraph,
     ) -> Result<(Uuid, Vec<FunctionCall>)> {
         let function_bytes = pe_loader.read_at_va(address, size)?;
         let mut calls = vec![];
-        let guid = compute_warp_uuid(
-            function_bytes,
-            address,
-            Some(&mut calls),
-            debug_context,
-            cfg,
-        );
+        let guid = compute_warp_uuid(function_bytes, address, Some(&mut calls), cfg);
         Ok((guid, calls))
     }
 }

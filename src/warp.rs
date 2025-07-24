@@ -1,4 +1,3 @@
-use crate::DebugContext;
 use crate::pe_loader::PeLoader;
 use anyhow::Result;
 use iced_x86::{
@@ -6,6 +5,7 @@ use iced_x86::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
+use tracing::{debug, trace};
 use uuid::{Uuid, uuid};
 
 const FUNCTION_NAMESPACE: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
@@ -32,44 +32,44 @@ pub struct FunctionCall {
     pub offset: u64,
 }
 
-pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64, ctx: &DebugContext) -> Result<Uuid> {
+pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64) -> Result<Uuid> {
     // Build CFG during size calculation
     let mut cfg = crate::pe_loader::ControlFlowGraph::default();
-    let func_size = pe.find_function_size_with_cfg(address, ctx, Some(&mut cfg))?;
+    let func_size = pe.find_function_size_with_cfg(address, Some(&mut cfg))?;
 
-    if ctx.debug_size {
-        println!("Function size: 0x{func_size:x} bytes");
-    }
+    debug!(
+        target: "warp_testing::warp",
+        size = format!("0x{func_size:x}"),
+        "Function size"
+    );
 
     let func_bytes = pe.read_at_va(address, func_size)?;
 
-    Ok(compute_warp_uuid(func_bytes, address, None, ctx, &cfg))
+    Ok(compute_warp_uuid(func_bytes, address, None, &cfg))
 }
 
-pub fn compute_function_guid_with_contraints(
-    pe: &PeLoader,
-    address: u64,
-    ctx: &DebugContext,
-) -> Result<FunctionGuid> {
+pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Result<FunctionGuid> {
     // Build CFG during size calculation
     let mut cfg = crate::pe_loader::ControlFlowGraph::default();
-    let func_size = pe.find_function_size_with_cfg(address, ctx, Some(&mut cfg))?;
+    let func_size = pe.find_function_size_with_cfg(address, Some(&mut cfg))?;
 
-    if ctx.debug_size {
-        println!("Function size: 0x{func_size:x} bytes");
-    }
+    debug!(
+        target: "warp_testing::warp",
+        size = format!("0x{func_size:x}"),
+        "Function size"
+    );
 
     let func_bytes = pe.read_at_va(address, func_size)?;
 
     let mut calls = vec![];
-    let guid = compute_warp_uuid(func_bytes, address, Some(&mut calls), ctx, &cfg);
+    let guid = compute_warp_uuid(func_bytes, address, Some(&mut calls), &cfg);
     Ok(FunctionGuid {
         address,
         guid,
         constraints: calls
             .into_iter()
             .map(|c| {
-                compute_warp_uuid_from_pe(pe, c.target, ctx).map(|guid| Constraint {
+                compute_warp_uuid_from_pe(pe, c.target).map(|guid| Constraint {
                     guid,
                     offset: Some(c.offset as i64),
                 })
@@ -82,15 +82,16 @@ pub fn compute_warp_uuid(
     raw_bytes: &[u8],
     base: u64,
     mut calls: Option<&mut Vec<FunctionCall>>,
-    ctx: &DebugContext,
     cfg: &crate::pe_loader::ControlFlowGraph,
 ) -> Uuid {
     // Disassemble and identify basic blocks
-    let basic_blocks = identify_basic_blocks(raw_bytes, base, ctx, cfg);
+    let basic_blocks = identify_basic_blocks(raw_bytes, base, cfg);
 
-    if ctx.debug_blocks {
-        println!("Identified {} basic blocks", basic_blocks.len());
-    }
+    debug!(
+        target: "warp_testing::warp",
+        blocks = basic_blocks.len(),
+        "Identified basic blocks"
+    );
 
     // Create UUID for each basic block
     let mut block_uuids = Vec::new();
@@ -102,20 +103,27 @@ pub fn compute_warp_uuid(
             start_addr,
             base..(base + raw_bytes.len() as u64),
             calls.as_deref_mut(),
-            ctx,
         );
         block_uuids.push((start_addr, uuid));
 
-        if ctx.debug_guid {
-            println!("Block 0x{start_addr:x}-0x{end_addr:x}: UUID {uuid}");
-        }
+        debug!(
+            target: "warp_testing::warp::guid",
+            block_start = format!("0x{start_addr:x}"),
+            block_end = format!("0x{end_addr:x}"),
+            uuid = %uuid,
+            "Block UUID computed"
+        );
     }
 
     // Print disassembly for each basic block if requested
-    if ctx.debug_blocks {
+    if tracing::enabled!(target: "warp_testing::warp::blocks", tracing::Level::DEBUG) {
         for (&start_addr, &end_addr) in &basic_blocks {
-            println!("\nBasic block: 0x{start_addr:x} - 0x{end_addr:x}");
-            println!("----------------------------------------");
+            debug!(
+                target: "warp_testing::warp::blocks",
+                start = format!("0x{start_addr:x}"),
+                end = format!("0x{end_addr:x}"),
+                "Basic block"
+            );
 
             // Disassemble the block
             let block_start_offset = (start_addr - base) as usize;
@@ -130,7 +138,12 @@ pub fn compute_warp_uuid(
                 let instruction = decoder.decode();
                 output.clear();
                 formatter.format(&instruction, &mut output);
-                println!("  0x{:x}: {}", instruction.ip(), output);
+                trace!(
+                    target: "warp_testing::warp::blocks",
+                    addr = format!("0x{:x}", instruction.ip()),
+                    instruction = %output,
+                    "Instruction"
+                );
             }
         }
     }
@@ -145,11 +158,12 @@ pub fn compute_warp_uuid(
 
     let function_uuid = Uuid::new_v5(&FUNCTION_NAMESPACE, &combined_bytes);
 
-    if ctx.debug_guid {
-        println!("\nFunction UUID calculation:");
-        println!("  Block count: {}", block_uuids.len());
-        println!("  Final UUID: {function_uuid}");
-    }
+    debug!(
+        target: "warp_testing::warp::guid",
+        block_count = block_uuids.len(),
+        function_uuid = %function_uuid,
+        "Function UUID calculated"
+    );
 
     function_uuid
 }
@@ -172,26 +186,23 @@ fn decode_instructions(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, (Instructio
 pub fn identify_basic_blocks(
     raw_bytes: &[u8],
     base: u64,
-    ctx: &DebugContext,
     cfg: &crate::pe_loader::ControlFlowGraph,
 ) -> BTreeMap<u64, u64> {
     let instructions = decode_instructions(raw_bytes, base);
 
-    if ctx.debug_blocks {
-        println!(
-            "Decoded {} instructions starting at 0x{:x}",
-            instructions.len(),
-            base
-        );
-    }
+    debug!(
+        target: "warp_testing::warp::blocks",
+        instruction_count = instructions.len(),
+        base = format!("0x{:x}", base),
+        "Decoded instructions"
+    );
 
     // Use the pre-built CFG from recursive descent
-    if ctx.debug_blocks {
-        println!(
-            "Using CFG from recursive descent with {} block starts",
-            cfg.block_starts.len()
-        );
-    }
+    debug!(
+        target: "warp_testing::warp::blocks",
+        block_starts = cfg.block_starts.len(),
+        "Using CFG from recursive descent"
+    );
 
     // The CFG from recursive descent only marks some block boundaries.
     // We need to enhance it with additional boundaries based on edge analysis
@@ -225,21 +236,22 @@ pub fn identify_basic_blocks(
         }
     }
 
-    if ctx.debug_blocks {
-        println!(
-            "Enhanced CFG block starts from {} to {}",
-            cfg.block_starts.len(),
-            block_starts.len()
-        );
-    }
+    debug!(
+        target: "warp_testing::warp::blocks",
+        original_count = cfg.block_starts.len(),
+        enhanced_count = block_starts.len(),
+        "Enhanced CFG block starts"
+    );
 
     // Filter block starts to only include those within our function bytes
     let end_addr = base + raw_bytes.len() as u64;
     block_starts.retain(|&addr| addr >= base && addr < end_addr);
 
-    if ctx.debug_blocks {
-        println!("Identified {} block start addresses", block_starts.len());
-    }
+    debug!(
+        target: "warp_testing::warp::blocks",
+        count = block_starts.len(),
+        "Identified block start addresses"
+    );
 
     // Build basic blocks for ALL code (not just reachable)
     // This is key - Binary Ninja identifies blocks even in unreachable code
@@ -302,10 +314,8 @@ fn create_basic_block_guid(
     base: u64,
     function_bounds: Range<u64>,
     calls: Option<&mut Vec<FunctionCall>>,
-    ctx: &DebugContext,
 ) -> Uuid {
-    let instruction_bytes =
-        get_instruction_bytes_for_guid(raw_bytes, base, function_bounds, calls, ctx);
+    let instruction_bytes = get_instruction_bytes_for_guid(raw_bytes, base, function_bounds, calls);
     Uuid::new_v5(&BASIC_BLOCK_NAMESPACE, &instruction_bytes)
 }
 
@@ -314,7 +324,6 @@ fn get_instruction_bytes_for_guid(
     base: u64,
     function_bounds: Range<u64>,
     mut calls: Option<&mut Vec<FunctionCall>>,
-    ctx: &DebugContext,
 ) -> Vec<u8> {
     use iced_x86::Formatter;
 
@@ -326,9 +335,10 @@ fn get_instruction_bytes_for_guid(
     let mut formatter = iced_x86::NasmFormatter::new();
     let mut output = String::new();
 
-    if ctx.debug_guid {
-        println!("  Instruction processing for GUID:");
-    }
+    debug!(
+        target: "warp_testing::warp::guid",
+        "Starting instruction processing for GUID"
+    );
 
     while decoder.can_decode() {
         let start = (decoder.ip() - base) as usize;
@@ -344,9 +354,12 @@ fn get_instruction_bytes_for_guid(
 
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
-            if ctx.debug_guid {
-                println!("    SKIP REG2REG: 0x{:x}: {}", instruction.ip(), output);
-            }
+            trace!(
+                target: "warp_testing::warp::guid",
+                addr = format!("0x{:x}", instruction.ip()),
+                instruction = %output,
+                "Skipping register-to-itself NOP"
+            );
             continue;
         }
 
@@ -354,25 +367,23 @@ fn get_instruction_bytes_for_guid(
         if is_relocatable_instruction(&instruction, function_bounds.clone(), calls.as_deref_mut()) {
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
-            if ctx.debug_guid {
-                println!(
-                    "    ZERO RELOC: 0x{:x}: {} | {:02x?}",
-                    instruction.ip(),
-                    output,
-                    instr_bytes
-                );
-            }
+            trace!(
+                target: "warp_testing::warp::guid",
+                addr = format!("0x{:x}", instruction.ip()),
+                instruction = %output,
+                bytes = format!("{:02x?}", instr_bytes),
+                "Zeroing relocatable instruction"
+            );
         } else {
             // Use actual instruction bytes
             bytes.extend_from_slice(instr_bytes);
-            if ctx.debug_guid {
-                println!(
-                    "    KEEP: 0x{:x}: {} | {:02x?}",
-                    instruction.ip(),
-                    output,
-                    instr_bytes
-                );
-            }
+            trace!(
+                target: "warp_testing::warp::guid",
+                addr = format!("0x{:x}", instruction.ip()),
+                instruction = %output,
+                bytes = format!("{:02x?}", instr_bytes),
+                "Keeping instruction bytes"
+            );
         }
     }
 
@@ -738,7 +749,7 @@ mod test {
         // Use the heuristic to find function size
         let mut cfg = crate::pe_loader::ControlFlowGraph::default();
         let function_size = pe
-            .find_function_size_with_cfg(function_address, &DebugContext::default(), Some(&mut cfg))
+            .find_function_size_with_cfg(function_address, Some(&mut cfg))
             .expect("Failed to determine function size");
 
         // Calculate expected size from the blocks
@@ -769,15 +780,10 @@ mod test {
         // First get function size and build CFG
         let mut cfg = crate::pe_loader::ControlFlowGraph::default();
         let _size = pe
-            .find_function_size_with_cfg(function_address, &DebugContext::default(), Some(&mut cfg))
+            .find_function_size_with_cfg(function_address, Some(&mut cfg))
             .expect("Failed to determine function size");
 
-        let debug_ctx = DebugContext {
-            debug_blocks: true,
-            debug_size: true,
-            ..Default::default()
-        };
-        let blocks = identify_basic_blocks(function_bytes, function_address, &debug_ctx, &cfg);
+        let blocks = identify_basic_blocks(function_bytes, function_address, &cfg);
 
         println!("\nComparing basic blocks:");
         println!(
@@ -799,7 +805,6 @@ mod test {
                     start,
                     function_address..(function_address + function_size as u64),
                     None,
-                    &DebugContext::default(),
                 ))
             } else {
                 None
@@ -825,13 +830,7 @@ mod test {
         }
 
         // Compute WARP UUID
-        let warp_uuid = compute_warp_uuid(
-            function_bytes,
-            function_address,
-            None,
-            &DebugContext::default(),
-            &cfg,
-        );
+        let warp_uuid = compute_warp_uuid(function_bytes, function_address, None, &cfg);
         println!("\nWARP UUID: {}", warp_uuid);
         println!("Expected:  {}", expected_function_guid);
 

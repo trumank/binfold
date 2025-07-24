@@ -4,6 +4,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 mod pe_loader;
@@ -36,20 +37,6 @@ struct FunctionResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum DebugFlag {
-    /// Debug function size analysis
-    Size,
-    /// Debug basic block identification
-    Blocks,
-    /// Debug instruction disassembly
-    Instructions,
-    /// Debug GUID calculation
-    Guid,
-    /// Enable all debug output
-    All,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     /// Plain text output
     Text,
@@ -57,21 +44,9 @@ enum OutputFormat {
     Json,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct DebugContext {
-    pub debug_size: bool,
-    pub debug_blocks: bool,
-    pub debug_instructions: bool,
-    pub debug_guid: bool,
-}
-
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Debug flags
-    #[arg(short = 'D', long, value_enum)]
-    debug: Vec<DebugFlag>,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -143,34 +118,21 @@ fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
     }
 }
 
-fn build_debug_context(flags: &[DebugFlag]) -> DebugContext {
-    let mut ctx = DebugContext::default();
-    for flag in flags {
-        match flag {
-            DebugFlag::Size => ctx.debug_size = true,
-            DebugFlag::Blocks => ctx.debug_blocks = true,
-            DebugFlag::Instructions => ctx.debug_instructions = true,
-            DebugFlag::Guid => ctx.debug_guid = true,
-            DebugFlag::All => {
-                ctx.debug_size = true;
-                ctx.debug_blocks = true;
-                ctx.debug_instructions = true;
-                ctx.debug_guid = true;
-            }
-        }
-    }
-    ctx
-}
-
 fn main() -> Result<()> {
+    // Initialize tracing subscriber with environment filter
+    // Users can control logging via RUST_LOG env var, e.g.:
+    // RUST_LOG=warp_testing=debug
+    // RUST_LOG=warp_testing::warp=trace,warp_testing::constraint_matcher=debug
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let cli = Cli::parse();
 
-    let ctx = build_debug_context(&cli.debug);
-
     match cli.command {
-        Commands::Pe(cmd) => command_pe(cmd, &ctx),
-        Commands::Pdb(cmd) => command_pdb(cmd, &ctx),
-        Commands::Exception(cmd) => command_exception(cmd, &ctx),
+        Commands::Pe(cmd) => command_pe(cmd),
+        Commands::Pdb(cmd) => command_pdb(cmd),
+        Commands::Exception(cmd) => command_exception(cmd),
     }
 }
 
@@ -180,10 +142,12 @@ fn command_pe(
         address,
         database,
     }: CommandPe,
-    ctx: &DebugContext,
 ) -> Result<()> {
     let pe = PeLoader::load(file)?;
-    let func = compute_function_guid_with_contraints(&pe, address, ctx)?;
+    let func = compute_function_guid_with_contraints(&pe, address)?;
+
+    info!(target: "warp_testing::pe", address = %format!("0x{address:x}"), guid = %func.guid, "Computed function GUID");
+
     println!("Function at 0x{address:x}:");
     println!("WARP UUID: {}", func.guid);
     println!("Constraints:");
@@ -200,7 +164,7 @@ fn command_pe(
         let conn = Connection::open(db_path)?;
 
         // Create constraint matcher with naive solver
-        let matcher = ConstraintMatcher::with_naive_solver(ctx.debug_guid);
+        let matcher = ConstraintMatcher::with_naive_solver();
 
         // Convert our constraints to a HashSet of GUIDs
         let query_constraints: HashSet<String> = func
@@ -224,7 +188,7 @@ fn command_pe(
                 println!("\nMultiple GUID matches found. Using constraints to narrow down...");
 
                 if let Some(match_result) =
-                    matcher.match_function(&query_constraints, &candidates_by_guid, ctx.debug_guid)
+                    matcher.match_function(&query_constraints, &candidates_by_guid)
                 {
                     println!("\nBest match found:");
                     println!(
@@ -252,7 +216,7 @@ fn command_pe(
             }
 
             // Show detailed comparison for all GUID matches
-            if ctx.debug_guid || candidates_by_guid.len() > 1 {
+            if candidates_by_guid.len() > 1 {
                 println!("\nDetailed comparison of all GUID matches:");
                 for candidate in &candidates_by_guid {
                     println!(
@@ -278,7 +242,8 @@ fn command_pe(
                         matching
                     );
 
-                    if !only_in_ours.is_empty() && ctx.debug_guid {
+                    if !only_in_ours.is_empty() {
+                        debug!(target: "warp_testing::pe", "Only in our function: {} constraints", only_in_ours.len());
                         println!(
                             "    Only in our function: {} constraints",
                             only_in_ours.len()
@@ -291,7 +256,8 @@ fn command_pe(
                         }
                     }
 
-                    if !only_in_db.is_empty() && ctx.debug_guid {
+                    if !only_in_db.is_empty() {
+                        debug!(target: "warp_testing::pe", "Only in DB: {} constraints", only_in_db.len());
                         println!("    Only in DB: {} constraints", only_in_db.len());
                         for guid in only_in_db.iter().take(3) {
                             println!("      - {guid}");
@@ -315,7 +281,6 @@ fn command_pdb(
         exe_paths,
         database,
     }: CommandPdb,
-    ctx: &DebugContext,
 ) -> Result<()> {
     use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
     use pdb_analyzer::PdbAnalyzer;
@@ -497,7 +462,7 @@ fn command_pdb(
         let result = (|| -> Result<()> {
             let mut analyzer = PdbAnalyzer::new(&exe_path, &pdb_path_for_exe)?;
             let function_guids =
-                analyzer.compute_function_guids_with_progress(ctx, Some(multi_progress.clone()))?;
+                analyzer.compute_function_guids_with_progress(Some(multi_progress.clone()))?;
 
             // Get just the exe filename
             let exe_name = exe_path
@@ -632,7 +597,6 @@ fn command_exception(
         database,
         generate_pdb,
     }: CommandException,
-    ctx: &DebugContext,
 ) -> Result<()> {
     let pe = PeLoader::load(&file)?;
     let functions = pe.find_all_functions_from_exception_directory()?;
@@ -650,8 +614,7 @@ fn command_exception(
     let mut results: Vec<FunctionResult> = Vec::new();
 
     // Create constraint matcher if database is provided
-    let constraint_matcher =
-        constraint_matcher::ConstraintMatcher::with_naive_solver(ctx.debug_guid);
+    let constraint_matcher = constraint_matcher::ConstraintMatcher::with_naive_solver();
 
     // Cache for GUID lookups to avoid repeated queries
     let mut cache_guid_lookups = HashMap::new();
@@ -660,9 +623,9 @@ fn command_exception(
     // Process each function
     for (idx, func) in functions.iter().enumerate() {
         // Compute function GUID and constraints
-        let func_guid = compute_function_guid_with_contraints(&pe, func.start, ctx)?;
+        let func_guid = compute_function_guid_with_contraints(&pe, func.start)?;
         let guid = func_guid.guid;
-        let size = pe.find_function_size(func.start, ctx)?;
+        let size = pe.find_function_size(func.start)?;
 
         // Look up matches in database if available
         let (text_match_info, struct_match_info) = if let Some(ref conn) = db_conn {
@@ -717,16 +680,24 @@ fn command_exception(
                 Ok((total_count, unique_count, None)) if *unique_count > 1 => {
                     // Multiple unique names for this GUID - try constraint matching
                     // Load all candidates with this GUID
-                    if let std::collections::hash_map::Entry::Vacant(e) =
-                        cache_full_lookups.entry(guid)
-                    {
-                        e.insert(load_candidates_by_guid(conn, &guid)?);
-                    }
-                    let candidates = cache_full_lookups.get(&guid).unwrap();
+                    let candidates_entry = match cache_full_lookups.entry(guid) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            tracing::debug!("Candidates for {guid} found in cache");
+                            entry
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            tracing::debug!("Candidates for {guid} loading...");
+                            let entry = entry.insert_entry(load_candidates_by_guid(conn, &guid)?);
+                            tracing::debug!("Found {} candidates for {guid}", entry.get().len());
+                            entry
+                        }
+                    };
+                    let candidates = candidates_entry.get();
 
                     // Try to narrow down using constraints
+                    tracing::debug!("Matching constraints");
                     if let Some(result) =
-                        constraint_matcher.match_function(&query_constraints, candidates, false)
+                        constraint_matcher.match_function(&query_constraints, candidates)
                     {
                         let text = format!(" [Constraint match: {}]", result.candidate.name);
                         let match_info = MatchInfo {
