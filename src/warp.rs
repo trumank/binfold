@@ -6,44 +6,22 @@ use iced_x86::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
-use std::path::PathBuf;
 use uuid::{Uuid, uuid};
 
 const FUNCTION_NAMESPACE: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
 const BASIC_BLOCK_NAMESPACE: Uuid = uuid!("0192a178-7a5f-7936-8653-3cbaa7d6afe7");
 
-pub fn compute_warp_uuid_from_pe(
-    path: &PathBuf,
-    address: u64,
-    size: Option<usize>,
-    ctx: &DebugContext,
-) -> Result<Uuid> {
-    let pe = PeLoader::load(path)?;
+#[derive(Default, Debug, Clone)]
+pub struct FunctionGuid {
+    pub guid: Uuid,
+    pub address: u64,
+    pub constraints: Vec<Constraint>,
+}
 
-    // Determine function size if not provided
-    let func_size = match size {
-        Some(s) => s,
-        None => {
-            if ctx.debug_size {
-                println!("Auto-detecting function size...");
-            }
-            let detected_size = pe.find_function_size(address, ctx)?;
-            if ctx.debug_size {
-                println!("Detected function size: 0x{detected_size:x} bytes");
-            }
-            detected_size
-        }
-    };
-
-    if !ctx.debug_size {
-        println!("Function size: 0x{func_size:x} bytes");
-    }
-
-    // Read function bytes
-    let func_bytes = pe.read_at_va(address, func_size)?;
-
-    // Compute WARP UUID
-    Ok(compute_warp_uuid(func_bytes, address, None, ctx))
+#[derive(Debug, Clone)]
+pub struct Constraint {
+    pub guid: Uuid,
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -52,6 +30,48 @@ pub struct FunctionCall {
     pub target: u64,
     /// offset from calling function entrypoint
     pub offset: u64,
+}
+
+pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64, ctx: &DebugContext) -> Result<Uuid> {
+    let func_size = pe.find_function_size(address, ctx)?;
+
+    if ctx.debug_size {
+        println!("Function size: 0x{func_size:x} bytes");
+    }
+
+    let func_bytes = pe.read_at_va(address, func_size)?;
+
+    Ok(compute_warp_uuid(func_bytes, address, None, ctx))
+}
+
+pub fn compute_function_guid_with_contraints(
+    pe: &PeLoader,
+    address: u64,
+    ctx: &DebugContext,
+) -> Result<FunctionGuid> {
+    let func_size = pe.find_function_size(address, ctx)?;
+
+    if ctx.debug_size {
+        println!("Function size: 0x{func_size:x} bytes");
+    }
+
+    let func_bytes = pe.read_at_va(address, func_size)?;
+
+    let mut calls = vec![];
+    let guid = compute_warp_uuid(func_bytes, address, Some(&mut calls), ctx);
+    Ok(FunctionGuid {
+        address,
+        guid,
+        constraints: calls
+            .into_iter()
+            .map(|c| {
+                compute_warp_uuid_from_pe(pe, c.target, ctx).map(|guid| Constraint {
+                    guid,
+                    offset: Some(c.offset as i64),
+                })
+            })
+            .collect::<Result<_>>()?,
+    })
 }
 
 pub fn compute_warp_uuid(

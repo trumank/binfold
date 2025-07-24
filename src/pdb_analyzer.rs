@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::mmap_source::MmapSource;
 use crate::pe_loader::PeLoader;
-use crate::warp::FunctionCall;
+use crate::warp::{Constraint, FunctionCall};
 use crate::{DebugContext, compute_warp_uuid};
 
 pub struct PdbAnalyzer {
@@ -24,12 +24,6 @@ pub struct FunctionGuid {
     pub size: Option<u32>,
     pub guid: Uuid,
     pub constraints: Vec<Constraint>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Constraint {
-    pub guid: Uuid,
-    pub offset: Option<i64>,
 }
 
 // Structure to hold procedure data for parallel processing
@@ -213,6 +207,8 @@ impl PdbAnalyzer {
         }
 
         // TODO analyze and calls to functions that have not already been found?
+        // FIXME actually omitting calls leaves room for false positives so really should be fixed
+        //
         // FIXME constraint GUID calculation is wrong (is not just function GUID)
 
         for (address, calls) in calls {

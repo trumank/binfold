@@ -7,7 +7,9 @@ use std::path::PathBuf;
 mod pe_loader;
 use pe_loader::PeLoader;
 
-use crate::warp::{compute_warp_uuid, compute_warp_uuid_from_pe};
+use crate::warp::{
+    compute_function_guid_with_contraints, compute_warp_uuid, compute_warp_uuid_from_pe,
+};
 mod mmap_source;
 mod pdb_analyzer;
 mod pdb_writer;
@@ -75,7 +77,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Pe(CommandPe),
-    Debug(CommandDebug),
     Example(CommandExample),
     Pdb(CommandPdb),
     Exception(CommandException),
@@ -91,26 +92,6 @@ struct CommandPe {
     /// Virtual address of the function
     #[arg(short, long, value_parser = parse_hex)]
     address: u64,
-
-    /// Optional function size (will auto-detect if not provided)
-    #[arg(short, long)]
-    size: Option<usize>,
-}
-
-/// Debug analysis of a function
-#[derive(Parser)]
-struct CommandDebug {
-    /// Path to the PE file
-    #[arg(short, long)]
-    file: PathBuf,
-
-    /// Virtual address of the function
-    #[arg(short, long, value_parser = parse_hex)]
-    address: u64,
-
-    /// Optional function size (will auto-detect if not provided)
-    #[arg(short, long)]
-    size: Option<usize>,
 }
 
 /// Run the example function
@@ -183,42 +164,22 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Pe(cmd) => command_pe(cmd, &ctx),
-        Commands::Debug(cmd) => command_debug(cmd, &ctx),
         Commands::Example(cmd) => command_example(cmd, &ctx),
         Commands::Pdb(cmd) => command_pdb(cmd, &ctx),
         Commands::Exception(cmd) => command_exception(cmd, &ctx),
     }
 }
 
-fn command_pe(
-    CommandPe {
-        file,
-        address,
-        size,
-    }: CommandPe,
-    ctx: &DebugContext,
-) -> Result<()> {
-    let warp_uuid = compute_warp_uuid_from_pe(&file, address, size, ctx)?;
+fn command_pe(CommandPe { file, address }: CommandPe, ctx: &DebugContext) -> Result<()> {
+    let pe = PeLoader::load(file)?;
+    let func = compute_function_guid_with_contraints(&pe, address, ctx)?;
     println!("Function at 0x{address:x}:");
-    println!("WARP UUID: {warp_uuid}");
+    println!("WARP UUID: {}", func.guid);
+    println!("contraints:");
+    for constraint in func.constraints {
+        println!("  {:x?}", constraint);
+    }
 
-    Ok(())
-}
-
-fn command_debug(
-    CommandDebug {
-        file,
-        address,
-        size,
-    }: CommandDebug,
-    ctx: &DebugContext,
-) -> Result<()> {
-    println!("Debug analysis for function at 0x{address:x}");
-    println!("Debug flags: {ctx:?}");
-    println!("========================================\n");
-
-    let warp_uuid = compute_warp_uuid_from_pe(&file, address, size, ctx)?;
-    println!("\nFinal WARP UUID: {warp_uuid}");
     Ok(())
 }
 
