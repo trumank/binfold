@@ -1,15 +1,17 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 mod pe_loader;
 use pe_loader::PeLoader;
 
-use crate::warp::{
-    compute_function_guid_with_contraints, compute_warp_uuid, compute_warp_uuid_from_pe,
-};
+use crate::constraint_matcher::FunctionCandidate;
+use crate::warp::{compute_function_guid_with_contraints, compute_warp_uuid};
+mod constraint_matcher;
 mod mmap_source;
 mod pdb_analyzer;
 mod pdb_writer;
@@ -77,7 +79,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Pe(CommandPe),
-    Example(CommandExample),
     Pdb(CommandPdb),
     Exception(CommandException),
 }
@@ -92,6 +93,10 @@ struct CommandPe {
     /// Virtual address of the function
     #[arg(short, long, value_parser = parse_hex)]
     address: u64,
+
+    /// Optional SQLite database path for constraint lookups
+    #[arg(short, long)]
+    database: Option<PathBuf>,
 }
 
 /// Run the example function
@@ -164,50 +169,144 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Pe(cmd) => command_pe(cmd, &ctx),
-        Commands::Example(cmd) => command_example(cmd, &ctx),
         Commands::Pdb(cmd) => command_pdb(cmd, &ctx),
         Commands::Exception(cmd) => command_exception(cmd, &ctx),
     }
 }
 
-fn command_pe(CommandPe { file, address }: CommandPe, ctx: &DebugContext) -> Result<()> {
+fn command_pe(
+    CommandPe {
+        file,
+        address,
+        database,
+    }: CommandPe,
+    ctx: &DebugContext,
+) -> Result<()> {
     let pe = PeLoader::load(file)?;
     let func = compute_function_guid_with_contraints(&pe, address, ctx)?;
     println!("Function at 0x{address:x}:");
     println!("WARP UUID: {}", func.guid);
-    println!("contraints:");
-    for constraint in func.constraints {
-        println!("  {:x?}", constraint);
+    println!("Constraints:");
+    for constraint in &func.constraints {
+        println!("  {constraint:x?}");
     }
 
-    Ok(())
-}
+    // If database is provided, look up matches and compare constraints
+    if let Some(db_path) = database {
+        use constraint_matcher::ConstraintMatcher;
+        use rusqlite::Connection;
+        use std::collections::HashSet;
 
-fn command_example(CommandExample: CommandExample, _ctx: &DebugContext) -> Result<()> {
-    // Example x86_64 function bytes
-    let function_bytes = vec![
-        0x55, // push rbp
-        0x48, 0x89, 0xe5, // mov rbp, rsp
-        0x48, 0x83, 0xec, 0x10, // sub rsp, 0x10
-        0x89, 0x7d, 0xfc, // mov [rbp-4], edi
-        0x8b, 0x45, 0xfc, // mov eax, [rbp-4]
-        0xe8, 0x1d, 0x00, 0x00, 0x00, // call 0x1030
-        0x83, 0xc0, 0x01, // add eax, 1
-        0xc9, // leave
-        0xe9, 0x24, 0x00, 0x00, 0x00, // jmp 0x1040
-    ];
+        let conn = Connection::open(db_path)?;
 
-    let mut calls = vec![];
-    let warp_uuid = compute_warp_uuid(
-        &function_bytes,
-        0x1000,
-        Some(&mut calls),
-        &DebugContext::default(),
-    );
-    for call in calls {
-        println!("{call:x?}");
+        // Create constraint matcher with naive solver
+        let matcher = ConstraintMatcher::with_naive_solver(ctx.debug_guid);
+
+        // Convert our constraints to a HashSet of GUIDs
+        let query_constraints: HashSet<String> = func
+            .constraints
+            .iter()
+            .map(|c| c.guid.to_string())
+            .collect();
+
+        println!("\n=== Function Matching ===");
+
+        // Find matches by GUID (required)
+        let candidates_by_guid = load_candidates_by_guid(&conn, &func.guid)?;
+        if !candidates_by_guid.is_empty() {
+            println!(
+                "\nFound {} functions with matching GUID",
+                candidates_by_guid.len()
+            );
+
+            // If multiple matches, try constraint matching to narrow down
+            if candidates_by_guid.len() > 1 {
+                println!("\nMultiple GUID matches found. Using constraints to narrow down...");
+
+                if let Some(match_result) =
+                    matcher.match_function(&query_constraints, &candidates_by_guid, ctx.debug_guid)
+                {
+                    println!("\nBest match found:");
+                    println!(
+                        "  Function: {} (0x{:x} in {})",
+                        match_result.candidate.name,
+                        match_result.candidate.address,
+                        match_result.candidate.exe_name
+                    );
+                    println!("  Confidence: {:.2}", match_result.confidence);
+                    println!(
+                        "  Matching constraints: {}/{}",
+                        match_result.matching_constraints, match_result.total_constraints
+                    );
+                } else {
+                    println!("\nNo clear best match found among GUID matches");
+                }
+            } else {
+                // Single match - it's the unique match
+                let candidate = &candidates_by_guid[0];
+                println!("\nUnique match found:");
+                println!(
+                    "  Function: {} (0x{:x} in {})",
+                    candidate.name, candidate.address, candidate.exe_name
+                );
+            }
+
+            // Show detailed comparison for all GUID matches
+            if ctx.debug_guid || candidates_by_guid.len() > 1 {
+                println!("\nDetailed comparison of all GUID matches:");
+                for candidate in &candidates_by_guid {
+                    println!(
+                        "\n  {} (0x{:x} in {})",
+                        candidate.name, candidate.address, candidate.exe_name
+                    );
+
+                    let our_constraint_set: HashSet<_> =
+                        query_constraints.iter().cloned().collect();
+                    let db_constraint_set: HashSet<_> =
+                        candidate.constraints.iter().cloned().collect();
+
+                    let matching = our_constraint_set.intersection(&db_constraint_set).count();
+                    let only_in_ours: Vec<_> =
+                        our_constraint_set.difference(&db_constraint_set).collect();
+                    let only_in_db: Vec<_> =
+                        db_constraint_set.difference(&our_constraint_set).collect();
+
+                    println!(
+                        "    Constraints: {} in DB, {} in our function, {} matching",
+                        db_constraint_set.len(),
+                        our_constraint_set.len(),
+                        matching
+                    );
+
+                    if !only_in_ours.is_empty() && ctx.debug_guid {
+                        println!(
+                            "    Only in our function: {} constraints",
+                            only_in_ours.len()
+                        );
+                        for guid in only_in_ours.iter().take(3) {
+                            println!("      - {guid}");
+                        }
+                        if only_in_ours.len() > 3 {
+                            println!("      ... and {} more", only_in_ours.len() - 3);
+                        }
+                    }
+
+                    if !only_in_db.is_empty() && ctx.debug_guid {
+                        println!("    Only in DB: {} constraints", only_in_db.len());
+                        for guid in only_in_db.iter().take(3) {
+                            println!("      - {guid}");
+                        }
+                        if only_in_db.len() > 3 {
+                            println!("      ... and {} more", only_in_db.len() - 3);
+                        }
+                    }
+                }
+            }
+        } else {
+            println!("\nNo functions found with matching GUID");
+        }
     }
-    println!("WARP UUID: {warp_uuid}");
+
     Ok(())
 }
 
@@ -458,7 +557,7 @@ fn command_pdb(
                     // Check if this function already exists
                     let existing_id: Option<i64> = tx
                         .query_row(
-                            "SELECT id FROM functions WHERE address = ?1 AND id_exe_name = ?2",
+                            "SELECT id_function FROM functions WHERE address = ?1 AND id_exe_name = ?2",
                             params![func.address as i64, exe_name_id],
                             |row| row.get(0),
                         )
@@ -467,7 +566,7 @@ fn command_pdb(
                     let function_guid_id = if let Some(id) = existing_id {
                         // Update existing record
                         tx.execute(
-                            "UPDATE functions SET guid = ?1, id_function_name = ?2, timestamp = ?3 WHERE id = ?4",
+                            "UPDATE functions SET guid_function = ?1, id_function_name = ?2, timestamp = ?3 WHERE id_function = ?4",
                             params![func.guid.to_string(), function_name_id, timestamp, id],
                         )?;
 
@@ -548,103 +647,125 @@ fn command_exception(
         None
     };
 
-    // Prepare statement for GUID lookups if database is provided
-    let mut stmt = if let Some(ref conn) = db_conn {
-        Some(conn.prepare(
-            "SELECT
-                COUNT(*) as total_count,
-                COUNT(DISTINCT id_function_name) as unique_count,
-                CASE
-                    WHEN COUNT(DISTINCT id_function_name) = 1
-                    THEN (SELECT value FROM strings WHERE id = id_function_name LIMIT 1)
-                    ELSE NULL
-                END as unique_function_name
-            FROM functions
-            WHERE guid = ?1",
-        )?)
-    } else {
-        None
-    };
-
-    // Cache for GUID lookups to avoid repeated queries
-    let mut guid_cache: std::collections::HashMap<String, (String, Option<MatchInfo>)> =
-        std::collections::HashMap::new();
-
     let mut results: Vec<FunctionResult> = Vec::new();
 
+    // Create constraint matcher if database is provided
+    let constraint_matcher =
+        constraint_matcher::ConstraintMatcher::with_naive_solver(ctx.debug_guid);
+
+    // Cache for GUID lookups to avoid repeated queries
+    let mut cache_guid_lookups = HashMap::new();
+    let mut cache_full_lookups = HashMap::new();
+
+    // Process each function
     for (idx, func) in functions.iter().enumerate() {
-        // let size = (func.end - func.start) as usize;
-
+        // Compute function GUID and constraints
+        let func_guid = compute_function_guid_with_contraints(&pe, func.start, ctx)?;
+        let guid = func_guid.guid;
         let size = pe.find_function_size(func.start, ctx)?;
-        let func_bytes = pe.read_at_va(func.start, size)?;
-        let guid = compute_warp_uuid(func_bytes, func.start, None, ctx);
 
-        // Look up GUID in database if available
-        let (text_match_info, struct_match_info) = if stmt.is_some() {
-            let guid_str = guid.to_string();
-
+        // Look up matches in database if available
+        let (text_match_info, struct_match_info) = if let Some(ref conn) = db_conn {
             // Check cache first
-            if let Some(cached_info) = guid_cache.get(&guid_str).cloned() {
-                cached_info
-            } else {
-                // Query database if not in cache
-                let info = if let Some(ref mut stmt) = stmt {
-                    use rusqlite::params;
-                    let row_result = stmt.query_row(params![&guid_str], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,            // total_count
-                            row.get::<_, i64>(1)?,            // unique_count
-                            row.get::<_, Option<String>>(2)?, // unique_function_name
-                        ))
-                    });
+            // Convert constraints to HashSet
+            let query_constraints: HashSet<String> = func_guid
+                .constraints
+                .iter()
+                .map(|c| c.guid.to_string())
+                .collect();
 
-                    match row_result {
-                        Ok((total_count, _, Some(func_name))) => {
-                            let text = format!(" [{total_count} matches: {func_name}]");
-                            let match_info = MatchInfo {
-                                unique_name: Some(func_name),
-                                total_matches: total_count,
-                                unique_count: None,
-                            };
-                            (text, Some(match_info))
-                        }
-                        Ok((total_count, unique_count, None)) => {
-                            let text = format!(
-                                " [{total_count} matches across {unique_count} unique names]"
-                            );
-                            let match_info = MatchInfo {
-                                unique_name: None,
-                                total_matches: total_count,
-                                unique_count: Some(unique_count),
-                            };
-                            (text, Some(match_info))
-                        }
-                        Err(_) => (String::new(), None),
+            // Use helper function to determine match info
+            use rusqlite::params;
+
+            if let std::collections::hash_map::Entry::Vacant(e) = cache_guid_lookups.entry(guid) {
+                // Query to get match statistics
+                let mut stmt = conn.prepare(
+                    "SELECT
+                        COUNT(*) as total_count,
+                        COUNT(DISTINCT id_function_name) as unique_count,
+                        CASE
+                            WHEN COUNT(DISTINCT id_function_name) = 1
+                            THEN (SELECT value FROM strings WHERE id = id_function_name LIMIT 1)
+                            ELSE NULL
+                        END as unique_function_name
+                    FROM functions
+                    WHERE guid_function = ?1",
+                )?;
+
+                let row_result = stmt.query_row(params![guid.to_string()], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,            // total_count
+                        row.get::<_, i64>(1)?,            // unique_count
+                        row.get::<_, Option<String>>(2)?, // unique_function_name
+                    ))
+                });
+                e.insert(row_result);
+            }
+            let row_result = cache_guid_lookups.get(&guid).unwrap();
+
+            match row_result {
+                Ok((total_count, _, Some(func_name))) => {
+                    // Unique match by GUID alone
+                    let text = format!(" [Unique match: {func_name}]");
+                    let match_info = MatchInfo {
+                        unique_name: Some(func_name.clone()),
+                        total_matches: *total_count,
+                        unique_count: None,
+                    };
+                    (text, Some(match_info))
+                }
+                Ok((total_count, unique_count, None)) if *unique_count > 1 => {
+                    // Multiple unique names for this GUID - try constraint matching
+                    // Load all candidates with this GUID
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        cache_full_lookups.entry(guid)
+                    {
+                        e.insert(load_candidates_by_guid(conn, &guid)?);
                     }
-                } else {
-                    (String::new(), None)
-                };
+                    let candidates = cache_full_lookups.get(&guid).unwrap();
 
-                guid_cache.insert(guid_str, info.clone());
-                info
+                    // Try to narrow down using constraints
+                    if let Some(result) =
+                        constraint_matcher.match_function(&query_constraints, candidates, false)
+                    {
+                        let text = format!(" [Constraint match: {}]", result.candidate.name);
+                        let match_info = MatchInfo {
+                            unique_name: Some(result.candidate.name.clone()),
+                            total_matches: 1,
+                            unique_count: None,
+                        };
+                        (text, Some(match_info))
+                    } else {
+                        // No clear winner even with constraints
+                        let text =
+                            format!(" [{total_count} matches across {unique_count} unique names]");
+                        let match_info = MatchInfo {
+                            unique_name: None,
+                            total_matches: *total_count,
+                            unique_count: Some(*unique_count),
+                        };
+                        (text, Some(match_info))
+                    }
+                }
+                _ => (String::new(), None),
             }
         } else {
             (String::new(), None)
         };
 
-        if format == OutputFormat::Text
-            && struct_match_info
-                .as_ref()
-                .is_some_and(|i| i.unique_name.is_some())
-        {
-            println!(
-                "Function {} at 0x{:x}: GUID {}{}",
-                idx + 1,
-                func.start,
-                guid,
-                text_match_info
-            );
-        }
+        // if format == OutputFormat::Text
+        //     && struct_match_info
+        //         .as_ref()
+        //         .is_some_and(|i| i.unique_name.is_some())
+        // {
+        println!(
+            "Function {} at 0x{:x}: GUID {}{}",
+            idx + 1,
+            func.start,
+            guid,
+            text_match_info
+        );
+        // }
 
         let result = FunctionResult {
             address: format!("0x{:x}", func.start),
@@ -696,4 +817,54 @@ fn command_exception(
         );
     }
     Ok(())
+}
+/// Load candidates from database for a given function GUID
+pub fn load_candidates_by_guid(conn: &Connection, guid: &Uuid) -> Result<Vec<FunctionCandidate>> {
+    let mut candidates = Vec::new();
+
+    // Find all functions with this GUID
+    let mut stmt = conn.prepare(
+        "SELECT 
+            f.id_function,
+            f.address,
+            (SELECT value FROM strings WHERE id = f.id_function_name) as function_name,
+            (SELECT value FROM strings WHERE id = f.id_exe_name) as exe_name
+        FROM functions f
+        WHERE f.guid_function = ?1",
+    )?;
+
+    let function_rows = stmt.query_map(params![guid.to_string()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)? as u64,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    for row in function_rows {
+        let (func_id, address, name, exe_name) = row?;
+
+        // Load constraints for this function
+        let mut constraint_stmt = conn.prepare(
+            "SELECT guid_constraint 
+            FROM constraints 
+            WHERE id_function = ?1",
+        )?;
+
+        let constraints: HashSet<String> = constraint_stmt
+            .query_map(params![func_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<HashSet<_>, _>>()?;
+
+        candidates.push(FunctionCandidate {
+            id: func_id,
+            address,
+            name,
+            exe_name,
+            guid: guid.to_string(),
+            constraints,
+        });
+    }
+
+    Ok(candidates)
 }

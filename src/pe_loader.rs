@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
 use object::pe::{IMAGE_DIRECTORY_ENTRY_EXCEPTION, ImageNtHeaders64};
 use object::read::pe::{ImageNtHeaders, ImageOptionalHeader, PeFile};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
@@ -18,6 +18,19 @@ pub struct RuntimeFunction {
 pub struct FunctionRange {
     pub start: u64,
     pub end: u64,
+}
+
+/// Control flow graph built during recursive descent
+#[derive(Debug, Default)]
+pub struct ControlFlowGraph {
+    /// Set of all instruction addresses that were visited
+    pub visited_instructions: BTreeSet<u64>,
+    /// Map from instruction address to its successors
+    pub edges: BTreeMap<u64, Vec<u64>>,
+    /// Basic block boundaries (start addresses)
+    pub block_starts: BTreeSet<u64>,
+    /// Function entry point
+    pub entry_point: u64,
 }
 
 #[derive(Debug)]
@@ -108,6 +121,15 @@ impl PeLoader {
     /// Find a function at the given address and return its approximate size
     /// Uses recursive descent to follow all code paths
     pub fn find_function_size(&self, va: u64, ctx: &DebugContext) -> Result<usize> {
+        self.find_function_size_with_cfg(va, ctx, None)
+    }
+
+    pub fn find_function_size_with_cfg(
+        &self,
+        va: u64,
+        ctx: &DebugContext,
+        mut cfg_builder: Option<&mut ControlFlowGraph>,
+    ) -> Result<usize> {
         use iced_x86::{Decoder, DecoderOptions, FlowControl};
         use std::collections::{HashSet, VecDeque};
 
@@ -144,6 +166,12 @@ impl PeLoader {
 
         let mut max_address = va;
 
+        // Initialize CFG if requested
+        if let Some(cfg) = cfg_builder.as_deref_mut() {
+            cfg.entry_point = va;
+            cfg.block_starts.insert(va);
+        }
+
         if ctx.debug_size {
             println!("\nStarting recursive descent from 0x{va:x}");
         }
@@ -173,6 +201,11 @@ impl PeLoader {
                 let instruction = decoder.decode();
                 let ip = instruction.ip();
                 visited.insert(ip);
+
+                // Record instruction in CFG
+                if let Some(cfg) = cfg_builder.as_deref_mut() {
+                    cfg.visited_instructions.insert(ip);
+                }
 
                 if ctx.debug_size {
                     use iced_x86::Formatter;
@@ -208,10 +241,18 @@ impl PeLoader {
                 match instruction.flow_control() {
                     FlowControl::Next => {
                         // Continue to next instruction
+                        let next_ip = decoder.ip();
+                        if let Some(cfg) = cfg_builder.as_deref_mut() {
+                            cfg.edges.entry(ip).or_default().push(next_ip);
+                        }
                     }
                     FlowControl::Call | FlowControl::IndirectCall => {
                         // For calls, always continue to next instruction
                         // (both direct and indirect calls return to the next instruction)
+                        let next_ip = decoder.ip();
+                        if let Some(cfg) = cfg_builder.as_deref_mut() {
+                            cfg.edges.entry(ip).or_default().push(next_ip);
+                        }
                     }
                     FlowControl::UnconditionalBranch => {
                         // Check if it's a tail call (jmp to external function)
@@ -221,23 +262,50 @@ impl PeLoader {
                         {
                             // Internal jump - follow it
                             tailcall_queue.push_back((target, Some(ip)));
+                            if let Some(cfg) = cfg_builder.as_deref_mut() {
+                                cfg.edges.entry(ip).or_default().push(target);
+                                cfg.block_starts.insert(target);
+                            }
+                        }
+                        // The next instruction (if any) starts a new block
+                        let next_ip = decoder.ip();
+                        if let Some(cfg) = cfg_builder.as_deref_mut()
+                            && next_ip < va + scan_size as u64
+                        {
+                            cfg.block_starts.insert(next_ip);
                         }
                         break;
                         // External jump - end of function
                     }
                     FlowControl::ConditionalBranch => {
                         // Follow both paths
+                        let next_ip = decoder.ip();
+                        if let Some(cfg) = cfg_builder.as_deref_mut() {
+                            // Edge to fall-through
+                            cfg.edges.entry(ip).or_default().push(next_ip);
+                        }
+
                         if let Some(target) = get_branch_target(&instruction)
                             && target >= va
                             && target < va + scan_size as u64
                         {
                             // Internal jump - follow it
                             queue.push_back((target, Some(ip)));
+                            if let Some(cfg) = cfg_builder.as_deref_mut() {
+                                cfg.edges.entry(ip).or_default().push(target);
+                                cfg.block_starts.insert(target);
+                            }
                         }
                     }
                     FlowControl::Return => {
                         // Return instruction - path ends here
-                        // println!("    -> Return: path ends");
+                        // The next instruction (if any) starts a new block
+                        let next_ip = decoder.ip();
+                        if let Some(cfg) = cfg_builder.as_deref_mut()
+                            && next_ip < va + scan_size as u64
+                        {
+                            cfg.block_starts.insert(next_ip);
+                        }
                         break;
                     }
                     FlowControl::IndirectBranch => {
@@ -246,6 +314,13 @@ impl PeLoader {
                         // at least handle known patterns
                         if ctx.debug_size {
                             println!("  Found indirect branch at 0x{ip:x}");
+                        }
+                        // The next instruction (if any) starts a new block
+                        let next_ip = decoder.ip();
+                        if let Some(cfg) = cfg_builder.as_deref_mut()
+                            && next_ip < va + scan_size as u64
+                        {
+                            cfg.block_starts.insert(next_ip);
                         }
                         // For now, we can't follow indirect jumps
                         // This is a limitation that might cause us to miss code

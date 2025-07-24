@@ -7,7 +7,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::mmap_source::MmapSource;
-use crate::pe_loader::PeLoader;
+use crate::pe_loader::{ControlFlowGraph, PeLoader};
 use crate::warp::{Constraint, FunctionCall};
 use crate::{DebugContext, compute_warp_uuid};
 
@@ -156,13 +156,14 @@ impl PdbAnalyzer {
                 .filter_map(|proc_data| {
                     let address = proc_data.rva as u64 + pe_loader.image_base;
 
-                    let size = if proc_data.len > 0 {
-                        Some(proc_data.len)
-                    } else {
-                        match pe_loader.find_function_size(address, debug_context) {
-                            Ok(sz) => Some(sz as u32),
-                            Err(_) => None,
-                        }
+                    let mut cfg = ControlFlowGraph::default();
+                    let size = match pe_loader.find_function_size_with_cfg(
+                        address,
+                        debug_context,
+                        Some(&mut cfg),
+                    ) {
+                        Ok(sz) => Some(sz as u32),
+                        Err(_) => None,
                     };
 
                     if let Some(size) = size {
@@ -171,6 +172,7 @@ impl PdbAnalyzer {
                             address,
                             size as usize,
                             debug_context,
+                            &cfg,
                         ) {
                             Ok((guid, calls)) => Some((
                                 (
@@ -232,10 +234,17 @@ impl PdbAnalyzer {
         address: u64,
         size: usize,
         debug_context: &DebugContext,
+        cfg: &ControlFlowGraph,
     ) -> Result<(Uuid, Vec<FunctionCall>)> {
         let function_bytes = pe_loader.read_at_va(address, size)?;
         let mut calls = vec![];
-        let guid = compute_warp_uuid(function_bytes, address, Some(&mut calls), debug_context);
+        let guid = compute_warp_uuid(
+            function_bytes,
+            address,
+            Some(&mut calls),
+            debug_context,
+            cfg,
+        );
         Ok((guid, calls))
     }
 }

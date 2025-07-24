@@ -4,7 +4,7 @@ use anyhow::Result;
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, OpKind, Register,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use uuid::{Uuid, uuid};
 
@@ -33,7 +33,9 @@ pub struct FunctionCall {
 }
 
 pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64, ctx: &DebugContext) -> Result<Uuid> {
-    let func_size = pe.find_function_size(address, ctx)?;
+    // Build CFG during size calculation
+    let mut cfg = crate::pe_loader::ControlFlowGraph::default();
+    let func_size = pe.find_function_size_with_cfg(address, ctx, Some(&mut cfg))?;
 
     if ctx.debug_size {
         println!("Function size: 0x{func_size:x} bytes");
@@ -41,7 +43,7 @@ pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64, ctx: &DebugContext
 
     let func_bytes = pe.read_at_va(address, func_size)?;
 
-    Ok(compute_warp_uuid(func_bytes, address, None, ctx))
+    Ok(compute_warp_uuid(func_bytes, address, None, ctx, &cfg))
 }
 
 pub fn compute_function_guid_with_contraints(
@@ -49,7 +51,9 @@ pub fn compute_function_guid_with_contraints(
     address: u64,
     ctx: &DebugContext,
 ) -> Result<FunctionGuid> {
-    let func_size = pe.find_function_size(address, ctx)?;
+    // Build CFG during size calculation
+    let mut cfg = crate::pe_loader::ControlFlowGraph::default();
+    let func_size = pe.find_function_size_with_cfg(address, ctx, Some(&mut cfg))?;
 
     if ctx.debug_size {
         println!("Function size: 0x{func_size:x} bytes");
@@ -58,7 +62,7 @@ pub fn compute_function_guid_with_contraints(
     let func_bytes = pe.read_at_va(address, func_size)?;
 
     let mut calls = vec![];
-    let guid = compute_warp_uuid(func_bytes, address, Some(&mut calls), ctx);
+    let guid = compute_warp_uuid(func_bytes, address, Some(&mut calls), ctx, &cfg);
     Ok(FunctionGuid {
         address,
         guid,
@@ -79,9 +83,10 @@ pub fn compute_warp_uuid(
     base: u64,
     mut calls: Option<&mut Vec<FunctionCall>>,
     ctx: &DebugContext,
+    cfg: &crate::pe_loader::ControlFlowGraph,
 ) -> Uuid {
     // Disassemble and identify basic blocks
-    let basic_blocks = identify_basic_blocks(raw_bytes, base, ctx);
+    let basic_blocks = identify_basic_blocks(raw_bytes, base, ctx, cfg);
 
     if ctx.debug_blocks {
         println!("Identified {} basic blocks", basic_blocks.len());
@@ -164,137 +169,11 @@ fn decode_instructions(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, (Instructio
     instructions
 }
 
-struct Graph {
-    incoming_edges: HashMap<u64, HashSet<u64>>,
-    outgoing_edges: HashMap<u64, HashSet<u64>>,
-    visited: HashSet<u64>,
-}
-
-// Helper function to build control flow graph
-fn build_control_flow_graph(instructions: &BTreeMap<u64, (Instruction, u64)>, base: u64) -> Graph {
-    let mut incoming_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
-    let mut outgoing_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
-    let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
-    queue.push_back(base);
-
-    while let Some(addr) = queue.pop_front() {
-        if visited.contains(&addr) {
-            continue;
-        }
-        visited.insert(addr);
-
-        if let Some((instruction, next_addr)) = instructions.get(&addr) {
-            match instruction.flow_control() {
-                FlowControl::Next | FlowControl::Call => {
-                    // Regular instruction or call - edge to next
-                    outgoing_edges.entry(addr).or_default().insert(*next_addr);
-                    incoming_edges.entry(*next_addr).or_default().insert(addr);
-                    queue.push_back(*next_addr);
-                }
-                FlowControl::UnconditionalBranch => {
-                    // Unconditional jump - edge to target only
-                    if let Some(target) = get_branch_target(instruction)
-                        && instructions.contains_key(&target)
-                    {
-                        outgoing_edges.entry(addr).or_default().insert(target);
-                        incoming_edges.entry(target).or_default().insert(addr);
-                        queue.push_back(target);
-                    }
-                }
-                FlowControl::ConditionalBranch => {
-                    // Conditional jump - edges to both next and target
-                    outgoing_edges.entry(addr).or_default().insert(*next_addr);
-                    incoming_edges.entry(*next_addr).or_default().insert(addr);
-                    queue.push_back(*next_addr);
-
-                    if let Some(target) = get_branch_target(instruction)
-                        && instructions.contains_key(&target)
-                    {
-                        outgoing_edges.entry(addr).or_default().insert(target);
-                        incoming_edges.entry(target).or_default().insert(addr);
-                        queue.push_back(target);
-                    }
-                }
-                FlowControl::Return => {
-                    // Return - no outgoing edges
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Graph {
-        incoming_edges,
-        outgoing_edges,
-        visited,
-    }
-}
-
-// Helper function to identify block boundaries
-fn identify_block_boundaries(
-    instructions: &BTreeMap<u64, (Instruction, u64)>,
-    incoming_edges: &HashMap<u64, HashSet<u64>>,
-    outgoing_edges: &HashMap<u64, HashSet<u64>>,
-    base: u64,
-) -> BTreeSet<u64> {
-    let mut block_starts = BTreeSet::new();
-    block_starts.insert(base); // Entry point is always a block start
-
-    // Linear sweep approach - more aggressive block identification
-    let sorted_addrs: Vec<u64> = instructions.keys().copied().collect();
-
-    for i in 0..sorted_addrs.len() {
-        let addr = sorted_addrs[i];
-        let (instruction, _) = &instructions[&addr];
-
-        // Block start if multiple incoming edges
-        if incoming_edges.get(&addr).map(|s| s.len()).unwrap_or(0) > 1 {
-            block_starts.insert(addr);
-        }
-
-        // Block start if predecessor has multiple outgoing edges
-        if let Some(predecessors) = incoming_edges.get(&addr) {
-            for &pred in predecessors {
-                if outgoing_edges.get(&pred).map(|s| s.len()).unwrap_or(0) > 1 {
-                    block_starts.insert(addr);
-                }
-            }
-        }
-
-        // Mark targets of all branches as block starts
-        match instruction.flow_control() {
-            FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
-                if let Some(target) = get_branch_target(instruction) {
-                    block_starts.insert(target);
-                }
-                // Also mark the instruction after a branch as a block start
-                if i + 1 < sorted_addrs.len() {
-                    block_starts.insert(sorted_addrs[i + 1]);
-                }
-            }
-            FlowControl::Return | FlowControl::IndirectBranch => {
-                // Mark the next instruction as a block start (if it exists)
-                if i + 1 < sorted_addrs.len() {
-                    block_starts.insert(sorted_addrs[i + 1]);
-                }
-            }
-            FlowControl::Call | FlowControl::IndirectCall => {
-                // Don't mark after every call as a block start
-                // Calls don't typically create new blocks unless there's
-                // a branch to the return address
-            }
-            _ => {}
-        }
-    }
-
-    block_starts
-}
-
 pub fn identify_basic_blocks(
     raw_bytes: &[u8],
     base: u64,
     ctx: &DebugContext,
+    cfg: &crate::pe_loader::ControlFlowGraph,
 ) -> BTreeMap<u64, u64> {
     let instructions = decode_instructions(raw_bytes, base);
 
@@ -306,24 +185,57 @@ pub fn identify_basic_blocks(
         );
     }
 
-    // Build control flow graph edges and find reachable instructions
-    let Graph {
-        incoming_edges,
-        outgoing_edges,
-        visited,
-    } = build_control_flow_graph(&instructions, base);
-
+    // Use the pre-built CFG from recursive descent
     if ctx.debug_blocks {
         println!(
-            "Found {} reachable instructions via control flow",
-            visited.len()
+            "Using CFG from recursive descent with {} block starts",
+            cfg.block_starts.len()
         );
     }
 
-    // Identify basic block boundaries using both reachable and all instructions
-    // This matches Binary Ninja's approach of finding all blocks in the function
-    let block_starts =
-        identify_block_boundaries(&instructions, &incoming_edges, &outgoing_edges, base);
+    // The CFG from recursive descent only marks some block boundaries.
+    // We need to enhance it with additional boundaries based on edge analysis
+    let mut block_starts = cfg.block_starts.clone();
+
+    // Build incoming/outgoing edge maps from the CFG
+    let mut incoming_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
+    let mut outgoing_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
+
+    for (from, targets) in &cfg.edges {
+        for &to in targets {
+            incoming_edges.entry(to).or_default().insert(*from);
+            outgoing_edges.entry(*from).or_default().insert(to);
+        }
+    }
+
+    // Apply the same logic as linear sweep to find additional block boundaries
+    for addr in cfg.visited_instructions.iter() {
+        // Block start if multiple incoming edges
+        if incoming_edges.get(addr).map(|s| s.len()).unwrap_or(0) > 1 {
+            block_starts.insert(*addr);
+        }
+
+        // Block start if predecessor has multiple outgoing edges
+        if let Some(predecessors) = incoming_edges.get(addr) {
+            for &pred in predecessors {
+                if outgoing_edges.get(&pred).map(|s| s.len()).unwrap_or(0) > 1 {
+                    block_starts.insert(*addr);
+                }
+            }
+        }
+    }
+
+    if ctx.debug_blocks {
+        println!(
+            "Enhanced CFG block starts from {} to {}",
+            cfg.block_starts.len(),
+            block_starts.len()
+        );
+    }
+
+    // Filter block starts to only include those within our function bytes
+    let end_addr = base + raw_bytes.len() as u64;
+    block_starts.retain(|&addr| addr >= base && addr < end_addr);
 
     if ctx.debug_blocks {
         println!("Identified {} block start addresses", block_starts.len());
@@ -824,8 +736,9 @@ mod test {
         let pe = PeLoader::load(exe_path).expect("Failed to load main.exe");
 
         // Use the heuristic to find function size
+        let mut cfg = crate::pe_loader::ControlFlowGraph::default();
         let function_size = pe
-            .find_function_size(function_address, &DebugContext::default())
+            .find_function_size_with_cfg(function_address, &DebugContext::default(), Some(&mut cfg))
             .expect("Failed to determine function size");
 
         // Calculate expected size from the blocks
@@ -852,9 +765,19 @@ mod test {
             .read_at_va(function_address, function_size)
             .expect("Failed to read function bytes");
 
-        // Compute basic blocks
-        let blocks =
-            identify_basic_blocks(function_bytes, function_address, &DebugContext::default());
+        // Compute basic blocks using CFG from recursive descent
+        // First get function size and build CFG
+        let mut cfg = crate::pe_loader::ControlFlowGraph::default();
+        let _size = pe
+            .find_function_size_with_cfg(function_address, &DebugContext::default(), Some(&mut cfg))
+            .expect("Failed to determine function size");
+
+        let debug_ctx = DebugContext {
+            debug_blocks: true,
+            debug_size: true,
+            ..Default::default()
+        };
+        let blocks = identify_basic_blocks(function_bytes, function_address, &debug_ctx, &cfg);
 
         println!("\nComparing basic blocks:");
         println!(
@@ -907,6 +830,7 @@ mod test {
             function_address,
             None,
             &DebugContext::default(),
+            &cfg,
         );
         println!("\nWARP UUID: {}", warp_uuid);
         println!("Expected:  {}", expected_function_guid);
