@@ -276,6 +276,10 @@ fn command_pdb(
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // some inspection queries
+    // SELECT function_guids.id, printf('0x%x', address), guid, COUNT(*) AS constraint_count, (SELECT COUNT(*) FROM function_guids a WHERE a.guid = function_guids.guid) AS name_count, (SELECT value FROM strings WHERE id = function_name_id) FROM function_guids LEFT JOIN constraints ON constraints.function_guid_id = function_guids.id GROUP BY function_guid_id HAVING constraint_count > 5 AND name_count > 5 order BY COUNT(*) DESC;
+    // SELECT guid, (SELECT value FROM strings WHERE id = function_name_id), group_concat(constraints.constraint_guid) from function_guids join constraints on constraints.function_guid_id = function_guids.id where guid = 'd3bc46e6-2d2f-508b-9da1-87925e0211b8' group by function_name_id;
+
     // Open database connection
     let conn = Connection::open(&database)?;
 
@@ -300,29 +304,60 @@ fn command_pdb(
 
     // Create table if it doesn't exist (with integer references to strings)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS function_guids (
+        "CREATE TABLE IF NOT EXISTS functions (
+            id_function INTEGER PRIMARY KEY,
             address INTEGER NOT NULL,
-            guid TEXT NOT NULL,
+            guid_function TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
-            exe_name_id INTEGER NOT NULL,
-            function_name_id INTEGER NOT NULL,
-            FOREIGN KEY (exe_name_id) REFERENCES strings(id),
-            FOREIGN KEY (function_name_id) REFERENCES strings(id)
+            id_exe_name INTEGER NOT NULL,
+            id_function_name INTEGER NOT NULL,
+            FOREIGN KEY (id_exe_name) REFERENCES strings(id),
+            FOREIGN KEY (id_function_name) REFERENCES strings(id)
+        )",
+        [],
+    )?;
+
+    // Create constraints table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS constraints (
+            id_constraint INTEGER PRIMARY KEY,
+            id_function INTEGER NOT NULL,
+            guid_constraint TEXT NOT NULL,
+            offset INTEGER,
+            FOREIGN KEY (id_function) REFERENCES functions(id_function) ON DELETE CASCADE
         )",
         [],
     )?;
 
     // Create indices for fast lookups
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_function_guids_guid ON function_guids(guid)",
+        "CREATE INDEX IF NOT EXISTS idx_functions_guid ON functions(guid_function)",
         [],
     )?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_function_guids_guid_fname ON function_guids(guid, function_name_id)",
+        "CREATE INDEX IF NOT EXISTS idx_functions_guid_fname ON functions(guid_function, id_function_name)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_functions_addr_exe ON functions(address, id_exe_name)",
         [],
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_strings_value ON strings(value)",
+        [],
+    )?;
+
+    // Create indices for constraints table
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_constraints_id_function ON constraints(id_function)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_constraints_guid ON constraints(guid_constraint)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_constraints_guid_offset ON constraints(guid_constraint, offset)",
         [],
     )?;
 
@@ -364,10 +399,6 @@ fn command_pdb(
             let mut analyzer = PdbAnalyzer::new(&exe_path, &pdb_path_for_exe)?;
             let function_guids =
                 analyzer.compute_function_guids_with_progress(ctx, Some(multi_progress.clone()))?;
-
-            for func in &function_guids {
-                println!("{func:#x?}");
-            }
 
             // Get just the exe filename
             let exe_name = exe_path
@@ -412,20 +443,61 @@ fn command_pdb(
                 let exe_name_id = get_or_insert_string(&tx, &mut cache, exe_name)?;
 
                 let mut stmt = tx.prepare(
-                    "INSERT OR REPLACE INTO function_guids (address, guid, exe_name_id, function_name_id, timestamp)
+                    "INSERT INTO functions (address, guid_function, id_exe_name, id_function_name, timestamp)
                      VALUES (?1, ?2, ?3, ?4, ?5)"
+                )?;
+
+                let mut constraint_stmt = tx.prepare(
+                    "INSERT INTO constraints (id_function, guid_constraint, offset)
+                     VALUES (?1, ?2, ?3)",
                 )?;
 
                 for func in &function_guids {
                     let function_name_id = get_or_insert_string(&tx, &mut cache, &func.name)?;
 
-                    stmt.execute(params![
-                        func.address as i64,
-                        func.guid.to_string(),
-                        exe_name_id,
-                        function_name_id,
-                        timestamp
-                    ])?;
+                    // Check if this function already exists
+                    let existing_id: Option<i64> = tx
+                        .query_row(
+                            "SELECT id FROM functions WHERE address = ?1 AND id_exe_name = ?2",
+                            params![func.address as i64, exe_name_id],
+                            |row| row.get(0),
+                        )
+                        .ok();
+
+                    let function_guid_id = if let Some(id) = existing_id {
+                        // Update existing record
+                        tx.execute(
+                            "UPDATE functions SET guid = ?1, id_function_name = ?2, timestamp = ?3 WHERE id = ?4",
+                            params![func.guid.to_string(), function_name_id, timestamp, id],
+                        )?;
+
+                        // Delete old constraints
+                        tx.execute(
+                            "DELETE FROM constraints WHERE id_function = ?1",
+                            params![id],
+                        )?;
+
+                        id
+                    } else {
+                        // Insert new record
+                        stmt.execute(params![
+                            func.address as i64,
+                            func.guid.to_string(),
+                            exe_name_id,
+                            function_name_id,
+                            timestamp
+                        ])?;
+                        tx.last_insert_rowid()
+                    };
+
+                    // Insert constraints
+                    for constraint in &func.constraints {
+                        constraint_stmt.execute(params![
+                            function_guid_id,
+                            constraint.guid.to_string(),
+                            constraint.offset
+                        ])?;
+                    }
                 }
             }
             tx.commit()?;
@@ -481,13 +553,13 @@ fn command_exception(
         Some(conn.prepare(
             "SELECT
                 COUNT(*) as total_count,
-                COUNT(DISTINCT function_name_id) as unique_count,
+                COUNT(DISTINCT id_function_name) as unique_count,
                 CASE
-                    WHEN COUNT(DISTINCT function_name_id) = 1
-                    THEN (SELECT value FROM strings WHERE id = function_name_id LIMIT 1)
+                    WHEN COUNT(DISTINCT id_function_name) = 1
+                    THEN (SELECT value FROM strings WHERE id = id_function_name LIMIT 1)
                     ELSE NULL
                 END as unique_function_name
-            FROM function_guids
+            FROM functions
             WHERE guid = ?1",
         )?)
     } else {
