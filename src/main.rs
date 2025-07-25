@@ -1,10 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use rusqlite::{Connection, params};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use tracing::{debug, info};
+use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -622,6 +622,8 @@ fn command_exception(
 
     // Cache for GUID lookups to avoid repeated queries
     let mut cache_guid_lookups = HashMap::new();
+    // func guid => (constraint guid => func name)
+    let mut cache_unique_constraints = HashMap::<Uuid, HashMap<Uuid, String>>::new();
 
     // Process each function
     for (idx, func) in functions.iter().enumerate() {
@@ -634,11 +636,8 @@ fn command_exception(
         let (text_match_info, struct_match_info) = if let Some(ref conn) = db_conn {
             // Check cache first
             // Convert constraints to HashSet
-            let query_constraints: HashSet<String> = func_guid
-                .constraints
-                .iter()
-                .map(|c| c.guid.to_string())
-                .collect();
+            let query_constraints: HashSet<Uuid> =
+                func_guid.constraints.iter().map(|c| c.guid).collect();
 
             // Use helper function to determine match info
             use rusqlite::params;
@@ -682,70 +681,39 @@ fn command_exception(
                 }
                 Ok((total_count, unique_count, None)) if *unique_count > 1 => {
                     // Multiple unique names for this GUID - try constraint matching
-                    // Instead of loading all candidates, query iteratively with constraints
-                    let mut unique_match = None;
-
-                    // Prepare statement once for reuse
-                    // let mut stmt = conn.prepare(
-                    //     "SELECT
-                    //         COUNT(DISTINCT f.id_function_name) as unique_count,
-                    //         MIN(f.id_function_name) as name_id
-                    //     FROM functions f
-                    //     WHERE f.guid_function = ?1
-                    //     AND EXISTS (
-                    //         SELECT 1 FROM constraints c
-                    //         WHERE c.id_function = f.id_function
-                    //         AND c.guid_constraint = ?2
-                    //     )",
-                    // )?;
-                    let mut stmt = conn.prepare(
-                        "SELECT COUNT(DISTINCT id_function_name), MIN(id_function_name)
-                        FROM functions f INDEXED BY idx_functions_guid_function
-                        JOIN constraints c USING(id_function)
-                        WHERE f.guid_function = ?1
-                          AND c.guid_constraint = ?2",
-                    )?;
-
-                    // Try each constraint until we find a unique match
-                    for constraint_guid in &query_constraints {
-                        // println!(
-                        //     "Looking up function {} with constraint {}",
-                        //     guid, constraint_guid
-                        // );
-
-                        let result = tracing::info_span!("query").in_scope(|| {
-                            let result =
-                                stmt.query_row(params![guid.to_string(), constraint_guid], |row| {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        cache_unique_constraints.entry(guid)
+                    {
+                        let mut stmt = conn.prepare(
+                            "SELECT guid_constraint, (SELECT value FROM strings WHERE id = id_function_name)
+                            FROM functions INDEXED BY idx_functions_guid_function
+                            JOIN constraints USING(id_function)
+                            WHERE guid_function = ?1
+                            GROUP BY guid_constraint
+                            HAVING COUNT(DISTINCT id_function_name) = 1"
+                        )?;
+                        let result =
+                            tracing::info_span!("query").in_scope(|| -> rusqlite::Result<_> {
+                                stmt.query_map(params![guid.to_string()], |row| {
                                     Ok((
-                                        row.get::<_, i64>(0)?,         // unique_count
-                                        row.get::<_, Option<i64>>(1)?, // name_id
+                                        Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(), // constraint guid
+                                        row.get::<_, String>(1)?,                            // name
                                     ))
-                                });
-                            // println!(
-                            //     "done unique={:?} name_id={:?}",
-                            //     result.as_ref().ok().map(|r| r.0),
-                            //     result.as_ref().ok().map(|r| r.1)
-                            // );
-                            result
-                        });
-
-                        if let Ok((1, Some(name_id))) = result {
-                            // Found a unique match with this constraint
-                            // Look up the function name
-                            let func_name = conn.query_row(
-                                "SELECT value FROM strings WHERE id = ?1",
-                                params![name_id],
-                                |row| row.get::<_, String>(0),
-                            )?;
-                            unique_match = Some(func_name);
-                            break;
-                        }
+                                })?
+                                .collect::<rusqlite::Result<HashMap<Uuid, String>>>()
+                            })?;
+                        e.insert(result);
                     }
+                    let constraints_map = cache_unique_constraints.get(&guid).unwrap();
+
+                    let unique_match = query_constraints
+                        .iter()
+                        .find_map(|c| constraints_map.get(c));
 
                     if let Some(func_name) = unique_match {
-                        let text = format!(" [Constraint match: {}]", func_name);
+                        let text = format!(" [Constraint match: {func_name}]");
                         let match_info = MatchInfo {
-                            unique_name: Some(func_name),
+                            unique_name: Some(func_name.clone()),
                             total_matches: 1,
                             unique_count: None,
                         };
