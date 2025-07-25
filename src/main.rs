@@ -10,7 +10,6 @@ use uuid::Uuid;
 mod pe_loader;
 use pe_loader::PeLoader;
 
-use crate::constraint_matcher::FunctionCandidate;
 use crate::warp::{compute_function_guid_with_contraints, compute_warp_uuid};
 mod constraint_matcher;
 mod mmap_source;
@@ -613,12 +612,8 @@ fn command_exception(
 
     let mut results: Vec<FunctionResult> = Vec::new();
 
-    // Create constraint matcher if database is provided
-    let constraint_matcher = constraint_matcher::ConstraintMatcher::with_naive_solver();
-
     // Cache for GUID lookups to avoid repeated queries
     let mut cache_guid_lookups = HashMap::new();
-    let mut cache_full_lookups = HashMap::new();
 
     // Process each function
     for (idx, func) in functions.iter().enumerate() {
@@ -679,41 +674,61 @@ fn command_exception(
                 }
                 Ok((total_count, unique_count, None)) if *unique_count > 1 => {
                     // Multiple unique names for this GUID - try constraint matching
-                    // Load all candidates with this GUID
-                    let candidates_entry = match cache_full_lookups.entry(guid) {
-                        std::collections::hash_map::Entry::Occupied(entry) => {
-                            tracing::debug!("Candidates for {guid} found in cache");
-                            entry
-                        }
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            tracing::debug!("Candidates for {guid} loading...");
-                            let entry = entry.insert_entry(load_candidates_by_guid(conn, &guid)?);
-                            tracing::debug!("Found {} candidates for {guid}", entry.get().len());
-                            entry
-                        }
-                    };
-                    let candidates = candidates_entry.get();
+                    // Instead of loading all candidates, query iteratively with constraints
+                    let mut unique_match = None;
 
-                    // Try to narrow down using constraints
-                    tracing::debug!("Matching constraints");
-                    if let Some(result) =
-                        constraint_matcher.match_function(&query_constraints, candidates)
-                    {
-                        // Lookup function name in string table
-                        let name = conn.query_row(
-                            "SELECT value FROM strings WHERE id = ?1",
-                            params![result.candidate.name_id],
-                            |row| row.get::<_, String>(0),
+                    // Try each constraint until we find a unique match
+                    for constraint_guid in &query_constraints {
+                        tracing::debug!(
+                            "Looking up function {} with constraint {}",
+                            guid,
+                            constraint_guid
+                        );
+                        let mut stmt = conn.prepare(
+                            "SELECT
+                                COUNT(DISTINCT f.id_function_name) as unique_count,
+                                MIN(f.id_function_name) as name_id
+                            FROM functions f
+                            WHERE f.guid_function = ?1 
+                            AND EXISTS (
+                                SELECT 1 FROM constraints c 
+                                WHERE c.id_function = f.id_function 
+                                AND c.guid_constraint = ?2
+                            )",
                         )?;
-                        let text = format!(" [Constraint match: {}]", name);
+
+                        let result =
+                            stmt.query_row(params![guid.to_string(), constraint_guid], |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,         // unique_count
+                                    row.get::<_, Option<i64>>(1)?, // name_id
+                                ))
+                            });
+
+                        if let Ok((1, Some(name_id))) = result {
+                            // Found a unique match with this constraint
+                            // Look up the function name
+                            let func_name = conn.query_row(
+                                "SELECT value FROM strings WHERE id = ?1",
+                                params![name_id],
+                                |row| row.get::<_, String>(0),
+                            )?;
+                            unique_match = Some(func_name);
+                            break;
+                        }
+                    }
+
+                    if let Some(func_name) = unique_match {
+                        let text = format!(" [Constraint match: {}]", func_name);
                         let match_info = MatchInfo {
-                            unique_name: Some(name.clone()),
+                            unique_name: Some(func_name),
                             total_matches: 1,
                             unique_count: None,
                         };
                         (text, Some(match_info))
                     } else {
-                        // No clear winner even with constraints
+                        // No unique match found with any single constraint
+                        // Could try combinations, but for now just report ambiguity
                         let text =
                             format!(" [{total_count} matches across {unique_count} unique names]");
                         let match_info = MatchInfo {
@@ -794,58 +809,4 @@ fn command_exception(
         );
     }
     Ok(())
-}
-/// Load candidates from database for a given function GUID
-pub fn load_candidates_by_guid(conn: &Connection, guid: &Uuid) -> Result<Vec<FunctionCandidate>> {
-    // Use a single query with LEFT JOIN to get both functions and constraints
-    // This avoids the issue with too many placeholders in the IN clause
-    let mut stmt = conn.prepare(
-        "SELECT 
-            f.id_function,
-            f.address,
-            f.id_function_name,
-            c.guid_constraint
-        FROM functions f
-        LEFT JOIN constraints c ON c.id_function = f.id_function
-        WHERE f.guid_function = ?1
-        ORDER BY f.id_function",
-    )?;
-
-    let mut candidates_map: HashMap<i64, (u64, i64, HashSet<String>)> = HashMap::new();
-
-    let rows = stmt.query_map(params![guid.to_string()], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,            // id_function
-            row.get::<_, i64>(1)? as u64,     // address
-            row.get::<_, i64>(2)?,            // id_function_name
-            row.get::<_, Option<String>>(3)?, // guid_constraint (can be NULL)
-        ))
-    })?;
-
-    for row in rows {
-        let (func_id, address, name_id, constraint_guid) = row?;
-
-        let entry = candidates_map
-            .entry(func_id)
-            .or_insert_with(|| (address, name_id, HashSet::new()));
-
-        // Add constraint if it exists (LEFT JOIN can produce NULL)
-        if let Some(constraint) = constraint_guid {
-            entry.2.insert(constraint);
-        }
-    }
-
-    // Convert the map to a vector of candidates
-    let mut candidates = Vec::new();
-    for (func_id, (address, name_id, constraints)) in candidates_map {
-        candidates.push(FunctionCandidate {
-            id: func_id,
-            address,
-            name_id,
-            guid: guid.to_string(),
-            constraints,
-        });
-    }
-
-    Ok(candidates)
 }
