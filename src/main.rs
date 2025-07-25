@@ -143,135 +143,135 @@ fn command_pe(
         database,
     }: CommandPe,
 ) -> Result<()> {
-    let pe = PeLoader::load(file)?;
-    let func = compute_function_guid_with_contraints(&pe, address)?;
+    // let pe = PeLoader::load(file)?;
+    // let func = compute_function_guid_with_contraints(&pe, address)?;
 
-    info!(target: "warp_testing::pe", address = %format!("0x{address:x}"), guid = %func.guid, "Computed function GUID");
+    // info!(target: "warp_testing::pe", address = %format!("0x{address:x}"), guid = %func.guid, "Computed function GUID");
 
-    println!("Function at 0x{address:x}:");
-    println!("WARP UUID: {}", func.guid);
-    println!("Constraints:");
-    for constraint in &func.constraints {
-        println!("  {constraint:x?}");
-    }
+    // println!("Function at 0x{address:x}:");
+    // println!("WARP UUID: {}", func.guid);
+    // println!("Constraints:");
+    // for constraint in &func.constraints {
+    //     println!("  {constraint:x?}");
+    // }
 
-    // If database is provided, look up matches and compare constraints
-    if let Some(db_path) = database {
-        use constraint_matcher::ConstraintMatcher;
-        use rusqlite::Connection;
-        use std::collections::HashSet;
+    // // If database is provided, look up matches and compare constraints
+    // if let Some(db_path) = database {
+    //     use constraint_matcher::ConstraintMatcher;
+    //     use rusqlite::Connection;
+    //     use std::collections::HashSet;
 
-        let conn = Connection::open(db_path)?;
+    //     let conn = Connection::open(db_path)?;
 
-        // Create constraint matcher with naive solver
-        let matcher = ConstraintMatcher::with_naive_solver();
+    //     // Create constraint matcher with naive solver
+    //     let matcher = ConstraintMatcher::with_naive_solver();
 
-        // Convert our constraints to a HashSet of GUIDs
-        let query_constraints: HashSet<String> = func
-            .constraints
-            .iter()
-            .map(|c| c.guid.to_string())
-            .collect();
+    //     // Convert our constraints to a HashSet of GUIDs
+    //     let query_constraints: HashSet<String> = func
+    //         .constraints
+    //         .iter()
+    //         .map(|c| c.guid.to_string())
+    //         .collect();
 
-        println!("\n=== Function Matching ===");
+    //     println!("\n=== Function Matching ===");
 
-        // Find matches by GUID (required)
-        let candidates_by_guid = load_candidates_by_guid(&conn, &func.guid)?;
-        if !candidates_by_guid.is_empty() {
-            println!(
-                "\nFound {} functions with matching GUID",
-                candidates_by_guid.len()
-            );
+    //     // Find matches by GUID (required)
+    //     let candidates_by_guid = load_candidates_by_guid(&conn, &func.guid)?;
+    //     if !candidates_by_guid.is_empty() {
+    //         println!(
+    //             "\nFound {} functions with matching GUID",
+    //             candidates_by_guid.len()
+    //         );
 
-            // If multiple matches, try constraint matching to narrow down
-            if candidates_by_guid.len() > 1 {
-                println!("\nMultiple GUID matches found. Using constraints to narrow down...");
+    //         // If multiple matches, try constraint matching to narrow down
+    //         if candidates_by_guid.len() > 1 {
+    //             println!("\nMultiple GUID matches found. Using constraints to narrow down...");
 
-                if let Some(match_result) =
-                    matcher.match_function(&query_constraints, &candidates_by_guid)
-                {
-                    println!("\nBest match found:");
-                    println!(
-                        "  Function: {} (0x{:x} in {})",
-                        match_result.candidate.name,
-                        match_result.candidate.address,
-                        match_result.candidate.exe_name
-                    );
-                    println!("  Confidence: {:.2}", match_result.confidence);
-                    println!(
-                        "  Matching constraints: {}/{}",
-                        match_result.matching_constraints, match_result.total_constraints
-                    );
-                } else {
-                    println!("\nNo clear best match found among GUID matches");
-                }
-            } else {
-                // Single match - it's the unique match
-                let candidate = &candidates_by_guid[0];
-                println!("\nUnique match found:");
-                println!(
-                    "  Function: {} (0x{:x} in {})",
-                    candidate.name, candidate.address, candidate.exe_name
-                );
-            }
+    //             if let Some(match_result) =
+    //                 matcher.match_function(&query_constraints, &candidates_by_guid)
+    //             {
+    //                 println!("\nBest match found:");
+    //                 println!(
+    //                     "  Function: {} (0x{:x} in {})",
+    //                     match_result.candidate.name,
+    //                     match_result.candidate.address,
+    //                     match_result.candidate.exe_name
+    //                 );
+    //                 println!("  Confidence: {:.2}", match_result.confidence);
+    //                 println!(
+    //                     "  Matching constraints: {}/{}",
+    //                     match_result.matching_constraints, match_result.total_constraints
+    //                 );
+    //             } else {
+    //                 println!("\nNo clear best match found among GUID matches");
+    //             }
+    //         } else {
+    //             // Single match - it's the unique match
+    //             let candidate = &candidates_by_guid[0];
+    //             println!("\nUnique match found:");
+    //             println!(
+    //                 "  Function: {} (0x{:x} in {})",
+    //                 candidate.name, candidate.address, candidate.exe_name
+    //             );
+    //         }
 
-            // Show detailed comparison for all GUID matches
-            if candidates_by_guid.len() > 1 {
-                println!("\nDetailed comparison of all GUID matches:");
-                for candidate in &candidates_by_guid {
-                    println!(
-                        "\n  {} (0x{:x} in {})",
-                        candidate.name, candidate.address, candidate.exe_name
-                    );
+    //         // Show detailed comparison for all GUID matches
+    //         if candidates_by_guid.len() > 1 {
+    //             println!("\nDetailed comparison of all GUID matches:");
+    //             for candidate in &candidates_by_guid {
+    //                 println!(
+    //                     "\n  {} (0x{:x} in {})",
+    //                     candidate.name, candidate.address, candidate.exe_name
+    //                 );
 
-                    let our_constraint_set: HashSet<_> =
-                        query_constraints.iter().cloned().collect();
-                    let db_constraint_set: HashSet<_> =
-                        candidate.constraints.iter().cloned().collect();
+    //                 let our_constraint_set: HashSet<_> =
+    //                     query_constraints.iter().cloned().collect();
+    //                 let db_constraint_set: HashSet<_> =
+    //                     candidate.constraints.iter().cloned().collect();
 
-                    let matching = our_constraint_set.intersection(&db_constraint_set).count();
-                    let only_in_ours: Vec<_> =
-                        our_constraint_set.difference(&db_constraint_set).collect();
-                    let only_in_db: Vec<_> =
-                        db_constraint_set.difference(&our_constraint_set).collect();
+    //                 let matching = our_constraint_set.intersection(&db_constraint_set).count();
+    //                 let only_in_ours: Vec<_> =
+    //                     our_constraint_set.difference(&db_constraint_set).collect();
+    //                 let only_in_db: Vec<_> =
+    //                     db_constraint_set.difference(&our_constraint_set).collect();
 
-                    println!(
-                        "    Constraints: {} in DB, {} in our function, {} matching",
-                        db_constraint_set.len(),
-                        our_constraint_set.len(),
-                        matching
-                    );
+    //                 println!(
+    //                     "    Constraints: {} in DB, {} in our function, {} matching",
+    //                     db_constraint_set.len(),
+    //                     our_constraint_set.len(),
+    //                     matching
+    //                 );
 
-                    if !only_in_ours.is_empty() {
-                        debug!(target: "warp_testing::pe", "Only in our function: {} constraints", only_in_ours.len());
-                        println!(
-                            "    Only in our function: {} constraints",
-                            only_in_ours.len()
-                        );
-                        for guid in only_in_ours.iter().take(3) {
-                            println!("      - {guid}");
-                        }
-                        if only_in_ours.len() > 3 {
-                            println!("      ... and {} more", only_in_ours.len() - 3);
-                        }
-                    }
+    //                 if !only_in_ours.is_empty() {
+    //                     debug!(target: "warp_testing::pe", "Only in our function: {} constraints", only_in_ours.len());
+    //                     println!(
+    //                         "    Only in our function: {} constraints",
+    //                         only_in_ours.len()
+    //                     );
+    //                     for guid in only_in_ours.iter().take(3) {
+    //                         println!("      - {guid}");
+    //                     }
+    //                     if only_in_ours.len() > 3 {
+    //                         println!("      ... and {} more", only_in_ours.len() - 3);
+    //                     }
+    //                 }
 
-                    if !only_in_db.is_empty() {
-                        debug!(target: "warp_testing::pe", "Only in DB: {} constraints", only_in_db.len());
-                        println!("    Only in DB: {} constraints", only_in_db.len());
-                        for guid in only_in_db.iter().take(3) {
-                            println!("      - {guid}");
-                        }
-                        if only_in_db.len() > 3 {
-                            println!("      ... and {} more", only_in_db.len() - 3);
-                        }
-                    }
-                }
-            }
-        } else {
-            println!("\nNo functions found with matching GUID");
-        }
-    }
+    //                 if !only_in_db.is_empty() {
+    //                     debug!(target: "warp_testing::pe", "Only in DB: {} constraints", only_in_db.len());
+    //                     println!("    Only in DB: {} constraints", only_in_db.len());
+    //                     for guid in only_in_db.iter().take(3) {
+    //                         println!("      - {guid}");
+    //                     }
+    //                     if only_in_db.len() > 3 {
+    //                         println!("      ... and {} more", only_in_db.len() - 3);
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     } else {
+    //         println!("\nNo functions found with matching GUID");
+    //     }
+    // }
 
     Ok(())
 }
@@ -699,9 +699,15 @@ fn command_exception(
                     if let Some(result) =
                         constraint_matcher.match_function(&query_constraints, candidates)
                     {
-                        let text = format!(" [Constraint match: {}]", result.candidate.name);
+                        // Lookup function name in string table
+                        let name = conn.query_row(
+                            "SELECT value FROM strings WHERE id = ?1",
+                            params![result.candidate.name_id],
+                            |row| row.get::<_, String>(0),
+                        )?;
+                        let text = format!(" [Constraint match: {}]", name);
                         let match_info = MatchInfo {
-                            unique_name: Some(result.candidate.name.clone()),
+                            unique_name: Some(name.clone()),
                             total_matches: 1,
                             unique_count: None,
                         };
@@ -791,47 +797,51 @@ fn command_exception(
 }
 /// Load candidates from database for a given function GUID
 pub fn load_candidates_by_guid(conn: &Connection, guid: &Uuid) -> Result<Vec<FunctionCandidate>> {
-    let mut candidates = Vec::new();
-
-    // Find all functions with this GUID
+    // Use a single query with LEFT JOIN to get both functions and constraints
+    // This avoids the issue with too many placeholders in the IN clause
     let mut stmt = conn.prepare(
         "SELECT 
             f.id_function,
             f.address,
-            (SELECT value FROM strings WHERE id = f.id_function_name) as function_name,
-            (SELECT value FROM strings WHERE id = f.id_exe_name) as exe_name
+            f.id_function_name,
+            c.guid_constraint
         FROM functions f
-        WHERE f.guid_function = ?1",
+        LEFT JOIN constraints c ON c.id_function = f.id_function
+        WHERE f.guid_function = ?1
+        ORDER BY f.id_function",
     )?;
 
-    let function_rows = stmt.query_map(params![guid.to_string()], |row| {
+    let mut candidates_map: HashMap<i64, (u64, i64, HashSet<String>)> = HashMap::new();
+
+    let rows = stmt.query_map(params![guid.to_string()], |row| {
         Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)? as u64,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
+            row.get::<_, i64>(0)?,            // id_function
+            row.get::<_, i64>(1)? as u64,     // address
+            row.get::<_, i64>(2)?,            // id_function_name
+            row.get::<_, Option<String>>(3)?, // guid_constraint (can be NULL)
         ))
     })?;
 
-    for row in function_rows {
-        let (func_id, address, name, exe_name) = row?;
+    for row in rows {
+        let (func_id, address, name_id, constraint_guid) = row?;
 
-        // Load constraints for this function
-        let mut constraint_stmt = conn.prepare(
-            "SELECT guid_constraint 
-            FROM constraints 
-            WHERE id_function = ?1",
-        )?;
+        let entry = candidates_map
+            .entry(func_id)
+            .or_insert_with(|| (address, name_id, HashSet::new()));
 
-        let constraints: HashSet<String> = constraint_stmt
-            .query_map(params![func_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<HashSet<_>, _>>()?;
+        // Add constraint if it exists (LEFT JOIN can produce NULL)
+        if let Some(constraint) = constraint_guid {
+            entry.2.insert(constraint);
+        }
+    }
 
+    // Convert the map to a vector of candidates
+    let mut candidates = Vec::new();
+    for (func_id, (address, name_id, constraints)) in candidates_map {
         candidates.push(FunctionCandidate {
             id: func_id,
             address,
-            name,
-            exe_name,
+            name_id,
             guid: guid.to_string(),
             constraints,
         });

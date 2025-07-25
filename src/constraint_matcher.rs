@@ -5,8 +5,7 @@ use tracing::{debug, trace};
 pub struct FunctionCandidate {
     pub id: i64,
     pub address: u64,
-    pub name: String,
-    pub exe_name: String,
+    pub name_id: i64,
     pub guid: String,
     pub constraints: HashSet<String>,
 }
@@ -77,7 +76,7 @@ impl ConstraintSolver for SATConstraintSolver {
         let mut constraint_table: HashMap<String, HashSet<String>> = HashMap::new();
         for candidate in candidates {
             constraint_table.insert(
-                format!("{}_{}", candidate.id, candidate.name),
+                format!("{}_{}", candidate.id, candidate.name_id),
                 candidate.constraints.clone(),
             );
         }
@@ -141,7 +140,7 @@ impl ConstraintSolver for SATConstraintSolver {
 
             // Find the corresponding candidate
             for candidate in candidates {
-                let key = format!("{}_{}", candidate.id, candidate.name);
+                let key = format!("{}_{}", candidate.id, candidate.name_id);
                 if key == *winner_key {
                     let matching = query_constraints
                         .intersection(&candidate.constraints)
@@ -224,7 +223,7 @@ impl ConstraintSolver for NaiveConstraintSolver {
 
         debug!(
             target: "warp_testing::constraint_matcher::naive",
-            name = %best_candidate.name,
+            name = %best_candidate.name_id,
             id = best_candidate.id,
             matches = best_count,
             "Best candidate"
@@ -237,7 +236,7 @@ impl ConstraintSolver for NaiveConstraintSolver {
 
             debug!(
                 target: "warp_testing::constraint_matcher::naive",
-                name = %second_best.name,
+                name = %second_best.name_id,
                 id = second_best.id,
                 matches = second_best_count,
                 "Second best candidate"
@@ -277,7 +276,7 @@ impl ConstraintSolver for NaiveConstraintSolver {
 
         debug!(
             target: "warp_testing::constraint_matcher::naive",
-            name = %best_candidate.name,
+            name = %best_candidate.name_id,
             confidence = format!("{:.3}", confidence),
             "Found winner"
         );
@@ -337,7 +336,7 @@ impl ConstraintSolver for HeuristicConstraintSolver {
             trace!(
                 target: "warp_testing::constraint_matcher::heuristic",
                 id = candidate.id,
-                name = %candidate.name,
+                name = %candidate.name_id,
                 matching,
                 score = format!("{:.3}", score),
                 "Candidate score"
@@ -359,7 +358,7 @@ impl ConstraintSolver for HeuristicConstraintSolver {
             if let Some(ref result) = best_match {
                 debug!(
                     target: "warp_testing::constraint_matcher::heuristic",
-                    name = %result.candidate.name,
+                    name = %result.candidate.name_id,
                     confidence = format!("{:.3}", result.confidence),
                     "Best match found"
                 );
@@ -429,24 +428,21 @@ mod tests {
             FunctionCandidate {
                 id: 1,
                 address: 0x1000,
-                name: "Alice".to_string(),
-                exe_name: "test.exe".to_string(),
+                name_id: 123,
                 guid: "guid1".to_string(),
                 constraints: ["A", "B", "C"].iter().map(|s| s.to_string()).collect(),
             },
             FunctionCandidate {
                 id: 2,
                 address: 0x2000,
-                name: "Bob".to_string(),
-                exe_name: "test.exe".to_string(),
+                name_id: 234,
                 guid: "guid2".to_string(),
                 constraints: ["A", "D"].iter().map(|s| s.to_string()).collect(),
             },
             FunctionCandidate {
                 id: 3,
                 address: 0x3000,
-                name: "Carol".to_string(),
-                exe_name: "test.exe".to_string(),
+                name_id: 345,
                 guid: "guid3".to_string(),
                 constraints: ["B", "C", "E"].iter().map(|s| s.to_string()).collect(),
             },
@@ -462,19 +458,19 @@ mod tests {
         let query1: HashSet<String> = ["A", "C"].iter().map(|s| s.to_string()).collect();
         let result1 = solver.solve(&query1, &candidates);
         assert!(result1.is_some());
-        assert_eq!(result1.unwrap().candidate.name, "Alice");
+        assert_eq!(result1.unwrap().candidate.name_id, 123);
 
         // Test case 2: Query that uniquely identifies Bob
         let query2: HashSet<String> = ["A", "D"].iter().map(|s| s.to_string()).collect();
         let result2 = solver.solve(&query2, &candidates);
         assert!(result2.is_some());
-        assert_eq!(result2.unwrap().candidate.name, "Bob");
+        assert_eq!(result2.unwrap().candidate.name_id, 234);
 
         // Test case 3: Query that uniquely identifies Carol
         let query3: HashSet<String> = ["E"].iter().map(|s| s.to_string()).collect();
         let result3 = solver.solve(&query3, &candidates);
         assert!(result3.is_some());
-        assert_eq!(result3.unwrap().candidate.name, "Carol");
+        assert_eq!(result3.unwrap().candidate.name_id, 345);
 
         // Test case 4: Ambiguous query
         let query4: HashSet<String> = ["B"].iter().map(|s| s.to_string()).collect();
@@ -491,7 +487,7 @@ mod tests {
         let query1: HashSet<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
         let result1 = solver.solve(&query1, &candidates);
         assert!(result1.is_some());
-        assert_eq!(result1.unwrap().candidate.name, "Alice");
+        assert_eq!(result1.unwrap().candidate.name_id, 123);
 
         // Test no clear winner - Alice and Carol both have 2 matches
         let query2: HashSet<String> = ["B", "C", "D"].iter().map(|s| s.to_string()).collect();
@@ -507,7 +503,7 @@ mod tests {
         let query4: HashSet<String> = ["E"].iter().map(|s| s.to_string()).collect();
         let result4 = solver.solve(&query4, &candidates);
         assert!(result4.is_some());
-        assert_eq!(result4.unwrap().candidate.name, "Carol");
+        assert_eq!(result4.unwrap().candidate.name_id, 345);
     }
 
     #[test]
@@ -519,12 +515,12 @@ mod tests {
         let query1: HashSet<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
         let result1 = solver.solve(&query1, &candidates);
         assert!(result1.is_some());
-        assert_eq!(result1.unwrap().candidate.name, "Alice");
+        assert_eq!(result1.unwrap().candidate.name_id, 123);
 
         // Test partial match
         let query2: HashSet<String> = ["A", "D", "X"].iter().map(|s| s.to_string()).collect();
         let result2 = solver.solve(&query2, &candidates);
         assert!(result2.is_some());
-        assert_eq!(result2.unwrap().candidate.name, "Bob");
+        assert_eq!(result2.unwrap().candidate.name_id, 234);
     }
 }
