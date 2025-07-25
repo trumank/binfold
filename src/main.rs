@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, info};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 mod pe_loader;
@@ -122,8 +123,15 @@ fn main() -> Result<()> {
     // Users can control logging via RUST_LOG env var, e.g.:
     // RUST_LOG=warp_testing=debug
     // RUST_LOG=warp_testing::warp=trace,warp_testing::constraint_matcher=debug
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(
+            fmt::layer()
+                .with_span_events(fmt::format::FmtSpan::ENTER | fmt::format::FmtSpan::CLOSE)
+                .with_timer(fmt::time::SystemTime)
+                .with_level(true)
+                .with_target(true),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -142,17 +150,17 @@ fn command_pe(
         database,
     }: CommandPe,
 ) -> Result<()> {
-    // let pe = PeLoader::load(file)?;
-    // let func = compute_function_guid_with_contraints(&pe, address)?;
+    let pe = PeLoader::load(file)?;
+    let func = compute_function_guid_with_contraints(&pe, address)?;
 
-    // info!(target: "warp_testing::pe", address = %format!("0x{address:x}"), guid = %func.guid, "Computed function GUID");
+    info!(target: "warp_testing::pe", address = %format!("0x{address:x}"), guid = %func.guid, "Computed function GUID");
 
-    // println!("Function at 0x{address:x}:");
-    // println!("WARP UUID: {}", func.guid);
-    // println!("Constraints:");
-    // for constraint in &func.constraints {
-    //     println!("  {constraint:x?}");
-    // }
+    println!("Function at 0x{address:x}:");
+    println!("WARP UUID: {}", func.guid);
+    println!("Constraints:");
+    for constraint in &func.constraints {
+        println!("  {constraint:x?}");
+    }
 
     // // If database is provided, look up matches and compare constraints
     // if let Some(db_path) = database {
@@ -677,33 +685,49 @@ fn command_exception(
                     // Instead of loading all candidates, query iteratively with constraints
                     let mut unique_match = None;
 
+                    // Prepare statement once for reuse
+                    // let mut stmt = conn.prepare(
+                    //     "SELECT
+                    //         COUNT(DISTINCT f.id_function_name) as unique_count,
+                    //         MIN(f.id_function_name) as name_id
+                    //     FROM functions f
+                    //     WHERE f.guid_function = ?1
+                    //     AND EXISTS (
+                    //         SELECT 1 FROM constraints c
+                    //         WHERE c.id_function = f.id_function
+                    //         AND c.guid_constraint = ?2
+                    //     )",
+                    // )?;
+                    let mut stmt = conn.prepare(
+                        "SELECT COUNT(DISTINCT id_function_name), MIN(id_function_name)
+                        FROM functions f INDEXED BY idx_functions_guid_function
+                        JOIN constraints c USING(id_function)
+                        WHERE f.guid_function = ?1
+                          AND c.guid_constraint = ?2",
+                    )?;
+
                     // Try each constraint until we find a unique match
                     for constraint_guid in &query_constraints {
-                        tracing::debug!(
-                            "Looking up function {} with constraint {}",
-                            guid,
-                            constraint_guid
-                        );
-                        let mut stmt = conn.prepare(
-                            "SELECT
-                                COUNT(DISTINCT f.id_function_name) as unique_count,
-                                MIN(f.id_function_name) as name_id
-                            FROM functions f
-                            WHERE f.guid_function = ?1 
-                            AND EXISTS (
-                                SELECT 1 FROM constraints c 
-                                WHERE c.id_function = f.id_function 
-                                AND c.guid_constraint = ?2
-                            )",
-                        )?;
+                        // println!(
+                        //     "Looking up function {} with constraint {}",
+                        //     guid, constraint_guid
+                        // );
 
-                        let result =
-                            stmt.query_row(params![guid.to_string(), constraint_guid], |row| {
-                                Ok((
-                                    row.get::<_, i64>(0)?,         // unique_count
-                                    row.get::<_, Option<i64>>(1)?, // name_id
-                                ))
-                            });
+                        let result = tracing::info_span!("query").in_scope(|| {
+                            let result =
+                                stmt.query_row(params![guid.to_string(), constraint_guid], |row| {
+                                    Ok((
+                                        row.get::<_, i64>(0)?,         // unique_count
+                                        row.get::<_, Option<i64>>(1)?, // name_id
+                                    ))
+                                });
+                            // println!(
+                            //     "done unique={:?} name_id={:?}",
+                            //     result.as_ref().ok().map(|r| r.0),
+                            //     result.as_ref().ok().map(|r| r.1)
+                            // );
+                            result
+                        });
 
                         if let Ok((1, Some(name_id))) = result {
                             // Found a unique match with this constraint
@@ -809,4 +833,65 @@ fn command_exception(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_query() -> Result<()> {
+        use rusqlite::Connection;
+        let conn = Connection::open("new_giga.db")?;
+
+        // let mut stmt = conn.prepare(
+        //     "
+        // SELECT
+        //     COUNT(DISTINCT f.id_function_name) as unique_count,
+        //     MIN(f.id_function_name) as name_id
+        // FROM functions f
+        // WHERE f.guid_function = '7286f2ec-31c4-5743-8061-3e87c3310b6b'
+        // AND EXISTS (
+        //     SELECT 1 FROM constraints c
+        //     WHERE c.id_function = f.id_function
+        //     AND c.guid_constraint = '85438e2f-3853-57ab-9bdd-b1f9e256a220'
+        // );
+        // ",
+        // )?;
+
+        let mut stmt = conn.prepare(
+            "SELECT
+                COUNT(DISTINCT f.id_function_name) as unique_count,
+                MIN(f.id_function_name) as name_id
+            FROM functions f
+            WHERE f.guid_function = ?1 
+            AND EXISTS (
+                SELECT 1 FROM constraints c 
+                WHERE c.id_function = f.id_function 
+                AND c.guid_constraint = ?2
+            )",
+        )?;
+
+        // time.busy=5.36s
+        // Looking up function 4910ea65-c576-55a3-b6df-b070c4c701f2
+        //  with constraint 31f6cc3a-d351-51c8-96b2-3fc57391f8a6
+
+        // let row_result = stmt.query_row(params![guid.to_string()], |row| {
+        let row_result = stmt.query_row(
+            params![
+                "4910ea65-c576-55a3-b6df-b070c4c701f2",
+                "31f6cc3a-d351-51c8-96b2-3fc57391f8a6"
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?, // total_count
+                    row.get::<_, i64>(1)?, // unique_count
+                ))
+            },
+        )?;
+
+        dbg!(row_result);
+
+        Ok(())
+    }
 }
