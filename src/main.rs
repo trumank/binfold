@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use rusqlite::params;
+use indicatif::{ParallelProgressIterator as _, ProgressBar, ProgressStyle};
+use rayon::prelude::*;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -610,66 +612,145 @@ fn command_exception(
 
     println!("Found {} functions in exception directory", functions.len());
 
-    // Open database connection if provided
-    let db_conn = if let Some(db_path) = &database {
-        use rusqlite::Connection;
-        Some(Connection::open(db_path)?)
-    } else {
-        None
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
+    // Open database connection if provided (and discard, just checking for errors)
+    if let Some(db_path) = &database {
+        Connection::open_with_flags(db_path, flags)?;
     };
 
     let mut results: Vec<FunctionResult> = Vec::new();
 
-    // Cache for GUID lookups to avoid repeated queries
-    let mut cache_guid_lookups = HashMap::new();
-    // func guid => (constraint guid => func name)
-    let mut cache_unique_constraints = HashMap::<Uuid, HashMap<Uuid, String>>::new();
+    struct DbContext {
+        // func guid => (total count, unique count, unique func name)
+        cache_guid_lookups: HashMap<Uuid, (i64, i64, Option<String>)>,
+        // func guid => (constraint guid => func name)
+        cache_unique_constraints: HashMap<Uuid, HashMap<Uuid, String>>,
+    }
+
+    let new_pb = |len, msg| {
+        ProgressBar::new(len).with_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        ).with_message(msg)
+    };
+    let pb = new_pb(functions.len() as u64, "Analyzing functions");
+
+    type Res = (HashSet<Uuid>, Vec<warp::FunctionGuid>);
+    let (function_guids, analyzed_functions): Res = functions
+        .par_iter()
+        .progress_with(pb)
+        .map(|func| compute_function_guid_with_contraints(&pe, func.start).map(|f| (f.guid, f)))
+        .collect::<Result<Res>>()?;
+
+    println!(
+        "Found {} unique funcs and {} total funcs",
+        function_guids.len(),
+        analyzed_functions.len()
+    );
+
+    let db_context = if let Some(database) = &database {
+        let pb = new_pb(function_guids.len() as u64, "Querying function GUIDs");
+        let cache_guid_lookups = function_guids
+            .par_iter()
+            .progress_with(pb)
+            .map_init(
+                || Connection::open_with_flags(database, flags).unwrap(),
+                |conn, guid| -> Result<(Uuid, (i64, i64, Option<String>))> {
+                    let mut stmt = conn.prepare(
+                        "SELECT
+                    COUNT(*) as total_count,
+                    COUNT(DISTINCT id_function_name) as unique_count,
+                    CASE
+                        WHEN COUNT(DISTINCT id_function_name) = 1
+                        THEN (SELECT value FROM strings WHERE id = id_function_name LIMIT 1)
+                        ELSE NULL
+                    END as unique_function_name
+                FROM functions
+                WHERE guid_function = ?1",
+                    )?;
+
+                    let result = stmt.query_row(params![guid.to_string()], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,            // total_count
+                            row.get::<_, i64>(1)?,            // unique_count
+                            row.get::<_, Option<String>>(2)?, // unique_function_name
+                        ))
+                    })?;
+                    Ok((*guid, result))
+                },
+            )
+            .collect::<Result<HashMap<Uuid, (i64, i64, Option<String>)>>>()?;
+        println!("Found {} unique guids", cache_guid_lookups.len());
+
+        let to_find_constraints: HashSet<Uuid> = function_guids
+            .iter()
+            .copied()
+            .filter(|guid| {
+                cache_guid_lookups
+                    .get(guid)
+                    .is_some_and(|lookup| lookup.2.is_none())
+            })
+            .collect();
+
+        let pb = new_pb(
+            to_find_constraints.len() as u64,
+            "Querying function constraints",
+        );
+        let cache_unique_constraints: HashMap<Uuid, HashMap<Uuid, String>> = to_find_constraints
+            .par_iter()
+            .progress_with(pb)
+            .map_init(
+                || Connection::open_with_flags(database, flags).unwrap(),
+                |conn, guid| -> Result<_> {
+                    let mut stmt = conn.prepare(
+                        "SELECT guid_constraint, (SELECT value FROM strings WHERE id = id_function_name)
+                        FROM functions INDEXED BY idx_functions_guid_function
+                        JOIN constraints USING(id_function)
+                        WHERE guid_function = ?1
+                        GROUP BY guid_constraint
+                        HAVING COUNT(DISTINCT id_function_name) = 1"
+                    )?;
+                    let res = stmt.query_map(params![guid.to_string()], |row| {
+                        Ok((
+                            Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(), // constraint guid
+                            row.get::<_, String>(1)?,                            // name
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<HashMap<Uuid, String>>>()?;
+                    Ok((*guid, res))
+                }
+            )
+            .collect::<Result<_>>()?;
+
+        println!("Found {} constraint guids", cache_unique_constraints.len());
+        Some(DbContext {
+            cache_guid_lookups,
+            cache_unique_constraints,
+        })
+    } else {
+        None
+    };
 
     // Process each function
-    for (idx, func) in functions.iter().enumerate() {
-        // Compute function GUID and constraints
-        let func_guid = compute_function_guid_with_contraints(&pe, func.start)?;
-        let guid = func_guid.guid;
-        let size = pe.find_function_size(func.start)?;
+    for (idx, func) in analyzed_functions.iter().enumerate() {
+        let size = pe.find_function_size(func.address)?;
 
         // Look up matches in database if available
-        let (text_match_info, struct_match_info) = if let Some(ref conn) = db_conn {
+        let (text_match_info, struct_match_info) = if let Some(db_context) = &db_context {
             // Check cache first
             // Convert constraints to HashSet
             let query_constraints: HashSet<Uuid> =
-                func_guid.constraints.iter().map(|c| c.guid).collect();
+                func.constraints.iter().map(|c| c.guid).collect();
 
-            // Use helper function to determine match info
-            use rusqlite::params;
-
-            if let std::collections::hash_map::Entry::Vacant(e) = cache_guid_lookups.entry(guid) {
-                // Query to get match statistics
-                let mut stmt = conn.prepare(
-                    "SELECT
-                        COUNT(*) as total_count,
-                        COUNT(DISTINCT id_function_name) as unique_count,
-                        CASE
-                            WHEN COUNT(DISTINCT id_function_name) = 1
-                            THEN (SELECT value FROM strings WHERE id = id_function_name LIMIT 1)
-                            ELSE NULL
-                        END as unique_function_name
-                    FROM functions
-                    WHERE guid_function = ?1",
-                )?;
-
-                let row_result = stmt.query_row(params![guid.to_string()], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,            // total_count
-                        row.get::<_, i64>(1)?,            // unique_count
-                        row.get::<_, Option<String>>(2)?, // unique_function_name
-                    ))
-                });
-                e.insert(row_result);
-            }
-            let row_result = cache_guid_lookups.get(&guid).unwrap();
+            let row_result = db_context.cache_guid_lookups.get(&func.guid).unwrap();
 
             match row_result {
-                Ok((total_count, _, Some(func_name))) => {
+                (total_count, _, Some(func_name)) => {
                     // Unique match by GUID alone
                     let text = format!(" [Unique match: {func_name}]");
                     let match_info = MatchInfo {
@@ -679,32 +760,10 @@ fn command_exception(
                     };
                     (text, Some(match_info))
                 }
-                Ok((total_count, unique_count, None)) if *unique_count > 1 => {
+                (total_count, unique_count, None) if *unique_count > 1 => {
                     // Multiple unique names for this GUID - try constraint matching
-                    if let std::collections::hash_map::Entry::Vacant(e) =
-                        cache_unique_constraints.entry(guid)
-                    {
-                        let mut stmt = conn.prepare(
-                            "SELECT guid_constraint, (SELECT value FROM strings WHERE id = id_function_name)
-                            FROM functions INDEXED BY idx_functions_guid_function
-                            JOIN constraints USING(id_function)
-                            WHERE guid_function = ?1
-                            GROUP BY guid_constraint
-                            HAVING COUNT(DISTINCT id_function_name) = 1"
-                        )?;
-                        let result =
-                            tracing::info_span!("query").in_scope(|| -> rusqlite::Result<_> {
-                                stmt.query_map(params![guid.to_string()], |row| {
-                                    Ok((
-                                        Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(), // constraint guid
-                                        row.get::<_, String>(1)?,                            // name
-                                    ))
-                                })?
-                                .collect::<rusqlite::Result<HashMap<Uuid, String>>>()
-                            })?;
-                        e.insert(result);
-                    }
-                    let constraints_map = cache_unique_constraints.get(&guid).unwrap();
+                    let constraints_map =
+                        db_context.cache_unique_constraints.get(&func.guid).unwrap();
 
                     let unique_match = query_constraints
                         .iter()
@@ -745,16 +804,16 @@ fn command_exception(
         println!(
             "Function {} at 0x{:x}: GUID {}{}",
             idx + 1,
-            func.start,
-            guid,
+            func.address,
+            func.guid,
             text_match_info
         );
         // }
 
         let result = FunctionResult {
-            address: format!("0x{:x}", func.start),
+            address: format!("0x{:x}", func.address),
             size,
-            guid: guid.to_string(),
+            guid: func.guid.to_string(),
             match_info: struct_match_info,
         };
 
