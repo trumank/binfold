@@ -690,7 +690,7 @@ fn command_exception(
     }
     analyzed_functions.sort_by_key(|f| f.address);
 
-    // Build parent call constraints
+    // Build parent call constraints and keep callers map for later use
     let mut callers: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
     let mut functions_by_addr: HashMap<u64, FunctionGuid> = HashMap::new();
 
@@ -796,71 +796,127 @@ fn command_exception(
         None
     };
 
-    // Process each function
-    for (idx, func) in analyzed_functions.iter().enumerate() {
-        let size = pe.find_function_size(func.address)?;
+    // Incrementally match functions
+    let mut matched_functions: HashMap<u64, String> = HashMap::new();
+    let mut unmatched_functions: Vec<&warp::Function> = analyzed_functions.iter().collect();
 
-        // Look up matches in database if available
-        let (text_match_info, struct_match_info) = if let Some(db_context) = &db_context {
-            let query_constraints: HashSet<ConstraintGuid> =
-                func.constraints.iter().map(|c| c.guid).collect();
+    // Keep matching until no more matches are found
+    loop {
+        let mut new_matches = Vec::new();
 
-            let FunctionGuidCounts {
-                total,
-                unique,
-                name,
-            } = db_context.cache_guid_lookups.get(&func.guid).unwrap();
+        for func in &unmatched_functions {
+            // Add symbol-based constraints for already matched functions
+            let mut enhanced_constraints = func.constraints.clone();
 
-            match name {
-                Some(func_name) => {
-                    // Unique match by GUID alone
-                    let text = format!(" [Unique match: {func_name}]");
-                    let match_info = MatchInfo {
-                        unique_name: Some(func_name.clone()),
-                        total_matches: *total,
-                        unique_count: None,
-                    };
-                    (text, Some(match_info))
+            // Check if any of our calls have been matched - add symbol constraints
+            for call in &func.calls {
+                if let Some(target_name) = matched_functions.get(&call.target) {
+                    let target_symbol = warp::SymbolGuid::from_symbol(target_name);
+                    enhanced_constraints.push(warp::Constraint {
+                        guid: warp::ConstraintGuid::from_symbol_child_call(target_symbol),
+                        offset: Some(call.offset as i64),
+                    });
                 }
-                None => {
-                    // Multiple unique names for this GUID - try constraint matching
-                    let constraints_map =
-                        db_context.cache_unique_constraints.get(&func.guid).unwrap();
+            }
 
-                    let unique_match = query_constraints
-                        .iter()
-                        .find_map(|c| constraints_map.get(c));
-
-                    if let Some(func_name) = unique_match {
-                        let text = format!(" [Constraint match: {func_name}]");
-                        let match_info = MatchInfo {
-                            unique_name: Some(func_name.clone()),
-                            total_matches: 1,
-                            unique_count: None,
-                        };
-                        (text, Some(match_info))
-                    } else {
-                        // No unique match found with any single constraint
-                        // Could try combinations, but for now just report ambiguity
-                        let text = format!(" [{total} matches across {unique} unique names]");
-                        let match_info = MatchInfo {
-                            unique_name: None,
-                            total_matches: *total,
-                            unique_count: Some(*unique),
-                        };
-                        (text, Some(match_info))
+            // Check if any functions that call us have been matched - add symbol parent constraints
+            if let Some(parent_calls) = callers.get(&func.address) {
+                for (parent_addr, offset) in parent_calls {
+                    if let Some(parent_name) = matched_functions.get(parent_addr) {
+                        let parent_symbol = warp::SymbolGuid::from_symbol(parent_name);
+                        enhanced_constraints.push(warp::Constraint {
+                            guid: warp::ConstraintGuid::from_symbol_parent_call(parent_symbol),
+                            offset: Some(*offset as i64),
+                        });
                     }
                 }
             }
-        } else {
-            (String::new(), None)
-        };
 
-        // if format == OutputFormat::Text
-        //     && struct_match_info
-        //         .as_ref()
-        //         .is_some_and(|i| i.unique_name.is_some())
-        // {
+            // Try to match with enhanced constraints
+            if let Some(db_context) = &db_context {
+                let query_constraints: HashSet<ConstraintGuid> =
+                    enhanced_constraints.iter().map(|c| c.guid).collect();
+
+                let FunctionGuidCounts {
+                    total,
+                    unique,
+                    name,
+                } = db_context.cache_guid_lookups.get(&func.guid).unwrap();
+
+                match name {
+                    Some(func_name) => {
+                        // Unique match by GUID alone
+                        new_matches.push((func.address, func_name.clone()));
+                    }
+                    None => {
+                        // Multiple unique names for this GUID - try constraint matching
+                        let constraints_map =
+                            db_context.cache_unique_constraints.get(&func.guid).unwrap();
+
+                        let unique_match = query_constraints
+                            .iter()
+                            .find_map(|c| constraints_map.get(c));
+
+                        if let Some(func_name) = unique_match {
+                            new_matches.push((func.address, func_name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no new matches found, we're done
+        if new_matches.is_empty() {
+            break;
+        }
+
+        // Add new matches and remove from unmatched list
+        let new_match_count = new_matches.len();
+        for (addr, name) in new_matches {
+            matched_functions.insert(addr, name);
+            unmatched_functions.retain(|f| f.address != addr);
+        }
+
+        println!(
+            "Found {} new matches in this iteration (total: {})",
+            new_match_count,
+            matched_functions.len()
+        );
+    }
+
+    // Generate results for all functions
+    for (idx, func) in analyzed_functions.iter().enumerate() {
+        let size = pe.find_function_size(func.address)?;
+
+        // Look up match info
+        let (text_match_info, struct_match_info) =
+            if let Some(func_name) = matched_functions.get(&func.address) {
+                let text = format!(" [Match: {func_name}]");
+                let match_info = MatchInfo {
+                    unique_name: Some(func_name.clone()),
+                    total_matches: 1,
+                    unique_count: None,
+                };
+                (text, Some(match_info))
+            } else if let Some(db_context) = &db_context {
+                // For unmatched functions, show ambiguity info
+                let FunctionGuidCounts {
+                    total,
+                    unique,
+                    name: _,
+                } = db_context.cache_guid_lookups.get(&func.guid).unwrap();
+
+                let text = format!(" [{total} matches across {unique} unique names]");
+                let match_info = MatchInfo {
+                    unique_name: None,
+                    total_matches: *total,
+                    unique_count: Some(*unique),
+                };
+                (text, Some(match_info))
+            } else {
+                (String::new(), None)
+            };
+
         println!(
             "Function {} at 0x{:x}: GUID {}{}",
             idx + 1,
@@ -868,7 +924,6 @@ fn command_exception(
             func.guid,
             text_match_info
         );
-        // }
 
         let result = FunctionResult {
             address: format!("0x{:x}", func.address),

@@ -9,7 +9,7 @@ use tracing::warn;
 use crate::compute_warp_uuid;
 use crate::mmap_source::MmapSource;
 use crate::pe_loader::{ControlFlowGraph, PeLoader};
-use crate::warp::{Constraint, ConstraintGuid, FunctionCall, FunctionGuid};
+use crate::warp::{Constraint, ConstraintGuid, FunctionCall, FunctionGuid, SymbolGuid};
 
 pub struct PdbAnalyzer {
     pe_loader: PeLoader,
@@ -223,23 +223,41 @@ impl PdbAnalyzer {
         for (address, calls) in calls {
             let mut constraints = Vec::new();
 
-            // Add child call constraints
+            // Add child call constraints (both function-based and symbol-based)
             for call in calls {
                 if let Some(target_fn) = functions.get(&call.target) {
+                    let offset = Some(call.offset as i64);
+                    // Function-based child constraint
                     constraints.push(Constraint {
                         guid: ConstraintGuid::from_child_call(target_fn.guid),
-                        offset: Some(call.offset as i64),
+                        offset,
+                    });
+
+                    // Symbol-based child constraint
+                    let target_symbol = SymbolGuid::from_symbol(&target_fn.name);
+                    constraints.push(Constraint {
+                        guid: ConstraintGuid::from_symbol_child_call(target_symbol),
+                        offset,
                     });
                 }
             }
 
-            // Add parent call constraints
+            // Add parent call constraints (both function-based and symbol-based)
             if let Some(parent_calls) = callers.get(&address) {
                 for (parent_addr, offset) in parent_calls {
                     if let Some(parent_fn) = functions.get(parent_addr) {
+                        let offset = Some(*offset as i64);
+                        // Function-based parent constraint
                         constraints.push(Constraint {
                             guid: ConstraintGuid::from_parent_call(parent_fn.guid),
-                            offset: Some(*offset as i64),
+                            offset,
+                        });
+
+                        // Symbol-based parent constraint
+                        let parent_symbol = SymbolGuid::from_symbol(&parent_fn.name);
+                        constraints.push(Constraint {
+                            guid: ConstraintGuid::from_symbol_parent_call(parent_symbol),
+                            offset,
                         });
                     }
                 }

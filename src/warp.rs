@@ -10,9 +10,11 @@ use uuid::{Uuid, uuid};
 
 const NAMESPACE_FUNCTION: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
 const NAMESPACE_BASIC_BLOCK: Uuid = uuid!("0192a178-7a5f-7936-8653-3cbaa7d6afe7");
+const NAMESPACE_SYMBOL: Uuid = uuid!("6d5ace5a-0050-4e71-815e-5536e9e61484");
 const NAMESPACE_CHILD_CALL: Uuid = uuid!("7e3d0b40-56dd-4b77-a825-9c75b0b607c5");
 const NAMESPACE_PARENT_CALL: Uuid = uuid!("dc0e3d9d-72ea-46df-81fc-ebe4295f0977");
-const NAMESPACE_SYMBOL: Uuid = uuid!("1fc5246b-8679-4272-a17a-424e5f8d2f33");
+const NAMESPACE_SYMBOL_CHILD_CALL: Uuid = uuid!("18811911-ca5d-4d97-a1c3-dd526ae818a5");
+const NAMESPACE_SYMBOL_PARENT_CALL: Uuid = uuid!("e4b07ff0-e798-4427-b533-174aebda4858");
 
 macro_rules! new_guid {
     ($name:ident) => {
@@ -52,6 +54,7 @@ macro_rules! new_guid {
 
 new_guid!(FunctionGuid);
 new_guid!(BasicBlockGuid);
+new_guid!(SymbolGuid);
 new_guid!(ConstraintGuid);
 
 impl ConstraintGuid {
@@ -62,6 +65,29 @@ impl ConstraintGuid {
     /// constraint on target calling this function
     pub fn from_parent_call(target: FunctionGuid) -> Self {
         Self(Uuid::new_v5(&NAMESPACE_PARENT_CALL, target.0.as_bytes()))
+    }
+    /// constraint on call to target function
+    pub fn from_symbol_child_call(target: SymbolGuid) -> Self {
+        Self(Uuid::new_v5(
+            &NAMESPACE_SYMBOL_CHILD_CALL,
+            target.0.as_bytes(),
+        ))
+    }
+    /// constraint on target calling this function
+    pub fn from_symbol_parent_call(target: SymbolGuid) -> Self {
+        Self(Uuid::new_v5(
+            &NAMESPACE_SYMBOL_PARENT_CALL,
+            target.0.as_bytes(),
+        ))
+    }
+}
+
+impl SymbolGuid {
+    pub fn from_symbol(symbol_name: impl AsRef<str>) -> SymbolGuid {
+        Self(Uuid::new_v5(
+            &NAMESPACE_SYMBOL,
+            symbol_name.as_ref().as_bytes(),
+        ))
     }
 }
 
