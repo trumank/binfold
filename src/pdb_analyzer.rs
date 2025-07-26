@@ -209,16 +209,42 @@ impl PdbAnalyzer {
         //
         // FIXME constraint GUID calculation is wrong (is not just function GUID)
 
+        // Build a map of who calls whom for parent constraints
+        let mut callers: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+        for (caller_address, calls) in &calls {
+            for call in calls {
+                callers
+                    .entry(call.target)
+                    .or_default()
+                    .push((*caller_address, call.offset));
+            }
+        }
+
         for (address, calls) in calls {
-            let constraints = calls
-                .into_iter()
-                .flat_map(|call| {
-                    Some(Constraint {
-                        guid: ConstraintGuid::from_call(functions.get(&call.target)?.guid),
+            let mut constraints = Vec::new();
+
+            // Add child call constraints
+            for call in calls {
+                if let Some(target_fn) = functions.get(&call.target) {
+                    constraints.push(Constraint {
+                        guid: ConstraintGuid::from_child_call(target_fn.guid),
                         offset: Some(call.offset as i64),
-                    })
-                })
-                .collect();
+                    });
+                }
+            }
+
+            // Add parent call constraints
+            if let Some(parent_calls) = callers.get(&address) {
+                for (parent_addr, offset) in parent_calls {
+                    if let Some(parent_fn) = functions.get(parent_addr) {
+                        constraints.push(Constraint {
+                            guid: ConstraintGuid::from_parent_call(parent_fn.guid),
+                            offset: Some(*offset as i64),
+                        });
+                    }
+                }
+            }
+
             functions.get_mut(&address).unwrap().constraints = constraints;
         }
 

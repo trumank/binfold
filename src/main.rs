@@ -688,6 +688,35 @@ fn command_exception(
         function_guids.extend(new_guids);
         analyzed_functions.extend(new_functions);
     }
+    analyzed_functions.sort_by_key(|f| f.address);
+
+    // Build parent call constraints
+    let mut callers: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+    let mut functions_by_addr: HashMap<u64, FunctionGuid> = HashMap::new();
+
+    for func in &analyzed_functions {
+        functions_by_addr.insert(func.address, func.guid);
+        for call in &func.calls {
+            callers
+                .entry(call.target)
+                .or_default()
+                .push((func.address, call.offset));
+        }
+    }
+
+    // Add parent constraints to functions
+    for func in &mut analyzed_functions {
+        if let Some(parent_calls) = callers.get(&func.address) {
+            for (parent_addr, offset) in parent_calls {
+                if let Some(parent_guid) = functions_by_addr.get(parent_addr) {
+                    func.constraints.push(warp::Constraint {
+                        guid: warp::ConstraintGuid::from_parent_call(*parent_guid),
+                        offset: Some(*offset as i64),
+                    });
+                }
+            }
+        }
+    }
 
     println!(
         "Found {} unique funcs and {} total funcs",

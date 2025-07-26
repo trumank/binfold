@@ -10,7 +10,8 @@ use uuid::{Uuid, uuid};
 
 const NAMESPACE_FUNCTION: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
 const NAMESPACE_BASIC_BLOCK: Uuid = uuid!("0192a178-7a5f-7936-8653-3cbaa7d6afe7");
-const NAMESPACE_CALL: Uuid = uuid!("7e3d0b40-56dd-4b77-a825-9c75b0b607c5");
+const NAMESPACE_CHILD_CALL: Uuid = uuid!("7e3d0b40-56dd-4b77-a825-9c75b0b607c5");
+const NAMESPACE_PARENT_CALL: Uuid = uuid!("dc0e3d9d-72ea-46df-81fc-ebe4295f0977");
 const NAMESPACE_SYMBOL: Uuid = uuid!("1fc5246b-8679-4272-a17a-424e5f8d2f33");
 
 macro_rules! new_guid {
@@ -54,9 +55,13 @@ new_guid!(BasicBlockGuid);
 new_guid!(ConstraintGuid);
 
 impl ConstraintGuid {
-    pub fn from_call(target: FunctionGuid) -> Self {
-        // TODO apply namespace/rehash
-        Self(target.0)
+    /// constraint on call to target function
+    pub fn from_child_call(target: FunctionGuid) -> Self {
+        Self(Uuid::new_v5(&NAMESPACE_CHILD_CALL, target.0.as_bytes()))
+    }
+    /// constraint on target calling this function
+    pub fn from_parent_call(target: FunctionGuid) -> Self {
+        Self(Uuid::new_v5(&NAMESPACE_PARENT_CALL, target.0.as_bytes()))
     }
 }
 
@@ -120,7 +125,7 @@ pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Res
             .iter()
             .map(|c| {
                 compute_warp_uuid_from_pe(pe, c.target).map(|guid| Constraint {
-                    guid: ConstraintGuid::from_call(guid),
+                    guid: ConstraintGuid::from_child_call(guid),
                     offset: Some(c.offset as i64),
                 })
             })
