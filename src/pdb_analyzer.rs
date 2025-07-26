@@ -220,49 +220,55 @@ impl PdbAnalyzer {
             }
         }
 
-        for (address, calls) in calls {
-            let mut constraints = Vec::new();
+        // TODO figure out if/why hashing is so slow (sha1_smol crate?) and cache/optimize
+        let constraints: Vec<_> = calls
+            .par_iter()
+            .map(|(address, calls)| {
+                let mut constraints = Vec::new();
 
-            // Add child call constraints (both function-based and symbol-based)
-            for call in calls {
-                if let Some(target_fn) = functions.get(&call.target) {
-                    let offset = Some(call.offset as i64);
-                    // Function-based child constraint
-                    constraints.push(Constraint {
-                        guid: ConstraintGuid::from_child_call(target_fn.guid),
-                        offset,
-                    });
-
-                    // Symbol-based child constraint
-                    let target_symbol = SymbolGuid::from_symbol(&target_fn.name);
-                    constraints.push(Constraint {
-                        guid: ConstraintGuid::from_symbol_child_call(target_symbol),
-                        offset,
-                    });
-                }
-            }
-
-            // Add parent call constraints (both function-based and symbol-based)
-            if let Some(parent_calls) = callers.get(&address) {
-                for (parent_addr, offset) in parent_calls {
-                    if let Some(parent_fn) = functions.get(parent_addr) {
-                        let offset = Some(*offset as i64);
-                        // Function-based parent constraint
+                // Add child call constraints (both function-based and symbol-based)
+                for call in calls {
+                    if let Some(target_fn) = functions.get(&call.target) {
+                        let offset = Some(call.offset as i64);
+                        // Function-based child constraint
                         constraints.push(Constraint {
-                            guid: ConstraintGuid::from_parent_call(parent_fn.guid),
+                            guid: ConstraintGuid::from_child_call(target_fn.guid),
                             offset,
                         });
 
-                        // Symbol-based parent constraint
-                        let parent_symbol = SymbolGuid::from_symbol(&parent_fn.name);
+                        // Symbol-based child constraint
+                        let target_symbol = SymbolGuid::from_symbol(&target_fn.name);
                         constraints.push(Constraint {
-                            guid: ConstraintGuid::from_symbol_parent_call(parent_symbol),
+                            guid: ConstraintGuid::from_symbol_child_call(target_symbol),
                             offset,
                         });
                     }
                 }
-            }
 
+                // Add parent call constraints (both function-based and symbol-based)
+                if let Some(parent_calls) = callers.get(address) {
+                    for (parent_addr, offset) in parent_calls {
+                        if let Some(parent_fn) = functions.get(parent_addr) {
+                            let offset = Some(*offset as i64);
+                            // Function-based parent constraint
+                            constraints.push(Constraint {
+                                guid: ConstraintGuid::from_parent_call(parent_fn.guid),
+                                offset,
+                            });
+
+                            // Symbol-based parent constraint
+                            let parent_symbol = SymbolGuid::from_symbol(&parent_fn.name);
+                            constraints.push(Constraint {
+                                guid: ConstraintGuid::from_symbol_parent_call(parent_symbol),
+                                offset,
+                            });
+                        }
+                    }
+                }
+                (*address, constraints)
+            })
+            .collect();
+        for (address, constraints) in constraints {
             functions.get_mut(&address).unwrap().constraints = constraints;
         }
 
