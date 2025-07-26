@@ -15,7 +15,6 @@ use pe_loader::PeLoader;
 use crate::warp::{
     ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints, compute_warp_uuid,
 };
-mod constraint_matcher;
 mod mmap_source;
 mod pdb_analyzer;
 mod pdb_writer;
