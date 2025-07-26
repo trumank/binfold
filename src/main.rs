@@ -555,7 +555,7 @@ fn command_pdb(
                         // Insert new record
                         stmt.execute(params![
                             func.address as i64,
-                            func.guid.to_string(),
+                            func.guid,
                             exe_name_id,
                             function_name_id,
                             timestamp
@@ -567,7 +567,7 @@ fn command_pdb(
                     for constraint in &func.constraints {
                         constraint_stmt.execute(params![
                             function_guid_id,
-                            constraint.guid.to_string(),
+                            constraint.guid,
                             constraint.offset
                         ])?;
                     }
@@ -623,9 +623,24 @@ fn command_exception(
 
     let mut results: Vec<FunctionResult> = Vec::new();
 
+    struct FunctionGuidCounts {
+        total: i64,
+        unique: i64,
+        name: Option<String>,
+    }
+    impl FunctionGuidCounts {
+        fn map(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+            Ok(Self {
+                total: row.get(0)?,  // total_count
+                unique: row.get(1)?, // unique_count
+                name: row.get(2)?,   // unique_function_name
+            })
+        }
+    }
+
     struct DbContext {
         // func guid => (total count, unique count, unique func name)
-        cache_guid_lookups: HashMap<Uuid, (i64, i64, Option<String>)>,
+        cache_guid_lookups: HashMap<Uuid, FunctionGuidCounts>,
         // func guid => (constraint guid => func name)
         cache_unique_constraints: HashMap<Uuid, HashMap<Uuid, String>>,
     }
@@ -660,31 +675,25 @@ fn command_exception(
             .progress_with(pb)
             .map_init(
                 || Connection::open_with_flags(database, flags).unwrap(),
-                |conn, guid| -> Result<(Uuid, (i64, i64, Option<String>))> {
+                |conn, guid| {
                     let mut stmt = conn.prepare(
                         "SELECT
-                    COUNT(*) as total_count,
-                    COUNT(DISTINCT id_function_name) as unique_count,
-                    CASE
-                        WHEN COUNT(DISTINCT id_function_name) = 1
-                        THEN (SELECT value FROM strings WHERE id = id_function_name LIMIT 1)
-                        ELSE NULL
-                    END as unique_function_name
-                FROM functions
-                WHERE guid_function = ?1",
+                            COUNT(*) as total_count,
+                            COUNT(DISTINCT id_function_name) as unique_count,
+                            CASE
+                                WHEN COUNT(DISTINCT id_function_name) = 1
+                                THEN (SELECT value FROM strings WHERE id = id_function_name LIMIT 1)
+                                ELSE NULL
+                            END as unique_function_name
+                        FROM functions
+                        WHERE guid_function = ?1",
                     )?;
 
-                    let result = stmt.query_row(params![guid.to_string()], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,            // total_count
-                            row.get::<_, i64>(1)?,            // unique_count
-                            row.get::<_, Option<String>>(2)?, // unique_function_name
-                        ))
-                    })?;
+                    let result = stmt.query_row(params![guid], FunctionGuidCounts::map)?;
                     Ok((*guid, result))
                 },
             )
-            .collect::<Result<HashMap<Uuid, (i64, i64, Option<String>)>>>()?;
+            .collect::<Result<HashMap<Uuid, FunctionGuidCounts>>>()?;
         println!("Found {} unique guids", cache_guid_lookups.len());
 
         let to_find_constraints: HashSet<Uuid> = function_guids
@@ -693,7 +702,7 @@ fn command_exception(
             .filter(|guid| {
                 cache_guid_lookups
                     .get(guid)
-                    .is_some_and(|lookup| lookup.2.is_none())
+                    .is_some_and(|lookup| lookup.name.is_none())
             })
             .collect();
 
@@ -709,18 +718,13 @@ fn command_exception(
                 |conn, guid| -> Result<_> {
                     let mut stmt = conn.prepare(
                         "SELECT guid_constraint, (SELECT value FROM strings WHERE id = id_function_name)
-                        FROM functions INDEXED BY idx_functions_guid_function
-                        JOIN constraints USING(id_function)
-                        WHERE guid_function = ?1
-                        GROUP BY guid_constraint
-                        HAVING COUNT(DISTINCT id_function_name) = 1"
+                            FROM functions INDEXED BY idx_functions_guid_function
+                            JOIN constraints USING(id_function)
+                            WHERE guid_function = ?1
+                            GROUP BY guid_constraint
+                            HAVING COUNT(DISTINCT id_function_name) = 1"
                     )?;
-                    let res = stmt.query_map(params![guid.to_string()], |row| {
-                        Ok((
-                            Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(), // constraint guid
-                            row.get::<_, String>(1)?,                            // name
-                        ))
-                    })?
+                    let res = stmt.query_map(params![guid], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<HashMap<Uuid, String>>>()?;
                     Ok((*guid, res))
                 }
@@ -742,25 +746,27 @@ fn command_exception(
 
         // Look up matches in database if available
         let (text_match_info, struct_match_info) = if let Some(db_context) = &db_context {
-            // Check cache first
-            // Convert constraints to HashSet
             let query_constraints: HashSet<Uuid> =
                 func.constraints.iter().map(|c| c.guid).collect();
 
-            let row_result = db_context.cache_guid_lookups.get(&func.guid).unwrap();
+            let FunctionGuidCounts {
+                total,
+                unique,
+                name,
+            } = db_context.cache_guid_lookups.get(&func.guid).unwrap();
 
-            match row_result {
-                (total_count, _, Some(func_name)) => {
+            match name {
+                Some(func_name) => {
                     // Unique match by GUID alone
                     let text = format!(" [Unique match: {func_name}]");
                     let match_info = MatchInfo {
                         unique_name: Some(func_name.clone()),
-                        total_matches: *total_count,
+                        total_matches: *total,
                         unique_count: None,
                     };
                     (text, Some(match_info))
                 }
-                (total_count, unique_count, None) if *unique_count > 1 => {
+                None => {
                     // Multiple unique names for this GUID - try constraint matching
                     let constraints_map =
                         db_context.cache_unique_constraints.get(&func.guid).unwrap();
@@ -780,17 +786,15 @@ fn command_exception(
                     } else {
                         // No unique match found with any single constraint
                         // Could try combinations, but for now just report ambiguity
-                        let text =
-                            format!(" [{total_count} matches across {unique_count} unique names]");
+                        let text = format!(" [{total} matches across {unique} unique names]");
                         let match_info = MatchInfo {
                             unique_name: None,
-                            total_matches: *total_count,
-                            unique_count: Some(*unique_count),
+                            total_matches: *total,
+                            unique_count: Some(*unique),
                         };
                         (text, Some(match_info))
                     }
                 }
-                _ => (String::new(), None),
             }
         } else {
             (String::new(), None)
