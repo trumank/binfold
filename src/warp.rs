@@ -8,19 +8,68 @@ use std::ops::Range;
 use tracing::{debug, trace};
 use uuid::{Uuid, uuid};
 
-const FUNCTION_NAMESPACE: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
-const BASIC_BLOCK_NAMESPACE: Uuid = uuid!("0192a178-7a5f-7936-8653-3cbaa7d6afe7");
+const NAMESPACE_FUNCTION: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
+const NAMESPACE_BASIC_BLOCK: Uuid = uuid!("0192a178-7a5f-7936-8653-3cbaa7d6afe7");
+const NAMESPACE_CALL: Uuid = uuid!("7e3d0b40-56dd-4b77-a825-9c75b0b607c5");
+const NAMESPACE_SYMBOL: Uuid = uuid!("1fc5246b-8679-4272-a17a-424e5f8d2f33");
+
+macro_rules! new_guid {
+    ($name:ident) => {
+        #[derive(
+            Debug,
+            Default,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            serde::Deserialize,
+            serde::Serialize,
+        )]
+        pub struct $name(pub Uuid);
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+        impl rusqlite::ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+                self.0.to_sql()
+            }
+        }
+        impl rusqlite::types::FromSql for $name {
+            fn column_result(
+                value: rusqlite::types::ValueRef<'_>,
+            ) -> rusqlite::types::FromSqlResult<Self> {
+                rusqlite::types::FromSql::column_result(value).map(Self)
+            }
+        }
+    };
+}
+
+new_guid!(FunctionGuid);
+new_guid!(BasicBlockGuid);
+new_guid!(ConstraintGuid);
+
+impl ConstraintGuid {
+    pub fn from_call(target: FunctionGuid) -> Self {
+        // TODO apply namespace/rehash
+        Self(target.0)
+    }
+}
 
 #[derive(Default, Debug, Clone)]
-pub struct FunctionGuid {
-    pub guid: Uuid,
+pub struct Function {
+    pub guid: FunctionGuid,
     pub address: u64,
     pub constraints: Vec<Constraint>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Constraint {
-    pub guid: Uuid,
+    pub guid: ConstraintGuid,
     pub offset: Option<i64>,
 }
 
@@ -32,7 +81,7 @@ pub struct FunctionCall {
     pub offset: u64,
 }
 
-pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64) -> Result<Uuid> {
+pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64) -> Result<FunctionGuid> {
     // Build CFG during size calculation
     let mut cfg = crate::pe_loader::ControlFlowGraph::default();
     let func_size = pe.find_function_size_with_cfg(address, Some(&mut cfg))?;
@@ -48,7 +97,7 @@ pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64) -> Result<Uuid> {
     Ok(compute_warp_uuid(func_bytes, address, None, &cfg))
 }
 
-pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Result<FunctionGuid> {
+pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Result<Function> {
     // Build CFG during size calculation
     let mut cfg = crate::pe_loader::ControlFlowGraph::default();
     let func_size = pe.find_function_size_with_cfg(address, Some(&mut cfg))?;
@@ -63,14 +112,14 @@ pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Res
 
     let mut calls = vec![];
     let guid = compute_warp_uuid(func_bytes, address, Some(&mut calls), &cfg);
-    Ok(FunctionGuid {
+    Ok(Function {
         address,
         guid,
         constraints: calls
             .into_iter()
             .map(|c| {
                 compute_warp_uuid_from_pe(pe, c.target).map(|guid| Constraint {
-                    guid,
+                    guid: ConstraintGuid::from_call(guid),
                     offset: Some(c.offset as i64),
                 })
             })
@@ -83,7 +132,7 @@ pub fn compute_warp_uuid(
     base: u64,
     mut calls: Option<&mut Vec<FunctionCall>>,
     cfg: &crate::pe_loader::ControlFlowGraph,
-) -> Uuid {
+) -> FunctionGuid {
     // Disassemble and identify basic blocks
     let basic_blocks = identify_basic_blocks(raw_bytes, base, cfg);
 
@@ -156,7 +205,7 @@ pub fn compute_warp_uuid(
         combined_bytes.extend_from_slice(uuid.as_bytes());
     }
 
-    let function_uuid = Uuid::new_v5(&FUNCTION_NAMESPACE, &combined_bytes);
+    let function_uuid = FunctionGuid(Uuid::new_v5(&NAMESPACE_FUNCTION, &combined_bytes));
 
     debug!(
         target: "warp_testing::warp::guid",
@@ -316,7 +365,7 @@ fn create_basic_block_guid(
     calls: Option<&mut Vec<FunctionCall>>,
 ) -> Uuid {
     let instruction_bytes = get_instruction_bytes_for_guid(raw_bytes, base, function_bounds, calls);
-    Uuid::new_v5(&BASIC_BLOCK_NAMESPACE, &instruction_bytes)
+    Uuid::new_v5(&NAMESPACE_BASIC_BLOCK, &instruction_bytes)
 }
 
 fn get_instruction_bytes_for_guid(
@@ -516,7 +565,7 @@ mod test {
 
     #[derive(Debug, Deserialize)]
     struct Function {
-        guid: Uuid,
+        guid: FunctionGuid,
         start: u64,
         blocks: Vec<Block>,
     }
@@ -740,7 +789,7 @@ mod test {
     fn test_warp_function_from_binary(
         exe_path: impl AsRef<std::path::Path>,
         function_address: u64,
-        expected_function_guid: Uuid,
+        expected_function_guid: FunctionGuid,
         expected_blocks: Vec<(u64, u64, Uuid)>,
     ) -> Stats {
         // Load main.exe from root directory

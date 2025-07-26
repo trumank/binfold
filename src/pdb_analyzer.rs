@@ -5,12 +5,11 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::compute_warp_uuid;
 use crate::mmap_source::MmapSource;
 use crate::pe_loader::{ControlFlowGraph, PeLoader};
-use crate::warp::{Constraint, FunctionCall};
+use crate::warp::{Constraint, ConstraintGuid, FunctionCall, FunctionGuid};
 
 pub struct PdbAnalyzer {
     pe_loader: PeLoader,
@@ -19,11 +18,11 @@ pub struct PdbAnalyzer {
 }
 
 #[derive(Default, Debug, Clone)]
-pub struct FunctionGuid {
+pub struct FunctionInfo {
     pub name: String,
     pub address: u64,
     pub size: Option<u32>,
-    pub guid: Uuid,
+    pub guid: FunctionGuid,
     pub constraints: Vec<Constraint>,
 }
 
@@ -61,7 +60,7 @@ impl PdbAnalyzer {
     pub fn compute_function_guids_with_progress(
         &mut self,
         progress_bar: Option<MultiProgress>,
-    ) -> Result<Vec<FunctionGuid>> {
+    ) -> Result<Vec<FunctionInfo>> {
         let address_map = self.pdb.address_map()?;
 
         // Create progress bar for collection phase
@@ -149,7 +148,7 @@ impl PdbAnalyzer {
         let pe_loader = &self.pe_loader;
 
         // Process procedures in parallel
-        let (mut functions, calls): (HashMap<u64, FunctionGuid>, Vec<(u64, Vec<FunctionCall>)>) =
+        let (mut functions, calls): (HashMap<u64, FunctionInfo>, Vec<(u64, Vec<FunctionCall>)>) =
             procedures
                 .par_iter()
                 .progress_with(pb.clone())
@@ -173,7 +172,7 @@ impl PdbAnalyzer {
                             Ok((guid, calls)) => Some((
                                 (
                                     address,
-                                    FunctionGuid {
+                                    FunctionInfo {
                                         name: proc_data.name.clone(),
                                         address,
                                         size: Some(size),
@@ -215,7 +214,7 @@ impl PdbAnalyzer {
                 .into_iter()
                 .flat_map(|call| {
                     Some(Constraint {
-                        guid: functions.get(&call.target)?.guid,
+                        guid: ConstraintGuid::from_call(functions.get(&call.target)?.guid),
                         offset: Some(call.offset as i64),
                     })
                 })
@@ -231,7 +230,7 @@ impl PdbAnalyzer {
         address: u64,
         size: usize,
         cfg: &ControlFlowGraph,
-    ) -> Result<(Uuid, Vec<FunctionCall>)> {
+    ) -> Result<(FunctionGuid, Vec<FunctionCall>)> {
         let function_bytes = pe_loader.read_at_va(address, size)?;
         let mut calls = vec![];
         let guid = compute_warp_uuid(function_bytes, address, Some(&mut calls), cfg);

@@ -8,12 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use uuid::Uuid;
 
 mod pe_loader;
 use pe_loader::PeLoader;
 
-use crate::warp::{compute_function_guid_with_contraints, compute_warp_uuid};
+use crate::warp::{
+    ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints, compute_warp_uuid,
+};
 mod constraint_matcher;
 mod mmap_source;
 mod pdb_analyzer;
@@ -639,10 +640,8 @@ fn command_exception(
     }
 
     struct DbContext {
-        // func guid => (total count, unique count, unique func name)
-        cache_guid_lookups: HashMap<Uuid, FunctionGuidCounts>,
-        // func guid => (constraint guid => func name)
-        cache_unique_constraints: HashMap<Uuid, HashMap<Uuid, String>>,
+        cache_guid_lookups: HashMap<FunctionGuid, FunctionGuidCounts>,
+        cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, String>>,
     }
 
     let new_pb = |len, msg| {
@@ -655,7 +654,7 @@ fn command_exception(
     };
     let pb = new_pb(functions.len() as u64, "Analyzing functions");
 
-    type Res = (HashSet<Uuid>, Vec<warp::FunctionGuid>);
+    type Res = (HashSet<FunctionGuid>, Vec<warp::Function>);
     let (function_guids, analyzed_functions): Res = functions
         .par_iter()
         .progress_with(pb)
@@ -693,10 +692,10 @@ fn command_exception(
                     Ok((*guid, result))
                 },
             )
-            .collect::<Result<HashMap<Uuid, FunctionGuidCounts>>>()?;
+            .collect::<Result<HashMap<FunctionGuid, FunctionGuidCounts>>>()?;
         println!("Found {} unique guids", cache_guid_lookups.len());
 
-        let to_find_constraints: HashSet<Uuid> = function_guids
+        let to_find_constraints: HashSet<FunctionGuid> = function_guids
             .iter()
             .copied()
             .filter(|guid| {
@@ -710,7 +709,7 @@ fn command_exception(
             to_find_constraints.len() as u64,
             "Querying function constraints",
         );
-        let cache_unique_constraints: HashMap<Uuid, HashMap<Uuid, String>> = to_find_constraints
+        let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, String>> = to_find_constraints
             .par_iter()
             .progress_with(pb)
             .map_init(
@@ -725,7 +724,7 @@ fn command_exception(
                             HAVING COUNT(DISTINCT id_function_name) = 1"
                     )?;
                     let res = stmt.query_map(params![guid], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .collect::<rusqlite::Result<HashMap<Uuid, String>>>()?;
+                    .collect::<rusqlite::Result<HashMap<ConstraintGuid, String>>>()?;
                     Ok((*guid, res))
                 }
             )
@@ -746,7 +745,7 @@ fn command_exception(
 
         // Look up matches in database if available
         let (text_match_info, struct_match_info) = if let Some(db_context) = &db_context {
-            let query_constraints: HashSet<Uuid> =
+            let query_constraints: HashSet<ConstraintGuid> =
                 func.constraints.iter().map(|c| c.guid).collect();
 
             let FunctionGuidCounts {
