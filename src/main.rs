@@ -380,7 +380,7 @@ fn command_pdb(
         "CREATE TABLE IF NOT EXISTS functions (
             id_function INTEGER PRIMARY KEY,
             address INTEGER NOT NULL,
-            guid_function TEXT NOT NULL,
+            guid_function BLOB NOT NULL,
             timestamp INTEGER NOT NULL,
             id_exe_name INTEGER NOT NULL,
             id_function_name INTEGER NOT NULL,
@@ -395,7 +395,7 @@ fn command_pdb(
         "CREATE TABLE IF NOT EXISTS constraints (
             id_constraint INTEGER PRIMARY KEY,
             id_function INTEGER NOT NULL,
-            guid_constraint TEXT NOT NULL,
+            guid_constraint BLOB NOT NULL,
             offset INTEGER,
             FOREIGN KEY (id_function) REFERENCES functions(id_function) ON DELETE CASCADE
         )",
@@ -431,6 +431,14 @@ fn command_pdb(
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_constraints_guid_offset ON constraints(guid_constraint, offset)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_constraints_function_constraint ON constraints(id_function, guid_constraint)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_constraints_constraint_function ON constraints(guid_constraint, id_function)",
         [],
     )?;
 
@@ -541,7 +549,7 @@ fn command_pdb(
                         // Update existing record
                         tx.execute(
                             "UPDATE functions SET guid_function = ?1, id_function_name = ?2, timestamp = ?3 WHERE id_function = ?4",
-                            params![func.guid.to_string(), function_name_id, timestamp, id],
+                            params![func.guid, function_name_id, timestamp, id],
                         )?;
 
                         // Delete old constraints
@@ -716,7 +724,7 @@ fn command_exception(
                 |conn, guid| -> Result<_> {
                     let mut stmt = conn.prepare(
                         "SELECT guid_constraint, (SELECT value FROM strings WHERE id = id_function_name)
-                            FROM functions INDEXED BY idx_functions_guid_function
+                            FROM functions INDEXED BY idx_functions_guid
                             JOIN constraints USING(id_function)
                             WHERE guid_function = ?1
                             GROUP BY guid_constraint
