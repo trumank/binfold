@@ -631,6 +631,7 @@ fn command_exception(
 
     let mut results: Vec<FunctionResult> = Vec::new();
 
+    #[derive(Debug)]
     struct FunctionGuidCounts {
         total: i64,
         unique: i64,
@@ -659,14 +660,34 @@ fn command_exception(
                 .progress_chars("#>-"),
         ).with_message(msg)
     };
-    let pb = new_pb(functions.len() as u64, "Analyzing functions");
 
+    let recurse = true;
+
+    let mut to_analyze: HashSet<u64> = functions.iter().map(|f| f.start).collect();
+    let mut analyzed: HashSet<u64> = Default::default();
     type Res = (HashSet<FunctionGuid>, Vec<warp::Function>);
-    let (function_guids, analyzed_functions): Res = functions
-        .par_iter()
-        .progress_with(pb)
-        .map(|func| compute_function_guid_with_contraints(&pe, func.start).map(|f| (f.guid, f)))
-        .collect::<Result<Res>>()?;
+    let (mut function_guids, mut analyzed_functions): Res = Default::default();
+    while !to_analyze.is_empty() {
+        println!("Found {} functions to analyze", to_analyze.len());
+        let pb = new_pb(to_analyze.len() as u64, "Analyzing functions");
+        let (new_guids, new_functions): Res = to_analyze
+            .par_iter()
+            .copied()
+            .progress_with(pb)
+            .map(|func| compute_function_guid_with_contraints(&pe, func).map(|f| (f.guid, f)))
+            .collect::<Result<Res>>()?;
+        analyzed.extend(std::mem::take(&mut to_analyze));
+        if recurse {
+            to_analyze.extend(
+                new_functions
+                    .iter()
+                    .flat_map(|f| f.calls.iter().map(|c| c.target))
+                    .filter(|t| !analyzed.contains(t)),
+            );
+        }
+        function_guids.extend(new_guids);
+        analyzed_functions.extend(new_functions);
+    }
 
     println!(
         "Found {} unique funcs and {} total funcs",

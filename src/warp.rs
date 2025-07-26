@@ -65,6 +65,7 @@ pub struct Function {
     pub guid: FunctionGuid,
     pub address: u64,
     pub constraints: Vec<Constraint>,
+    pub calls: Vec<FunctionCall>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +74,7 @@ pub struct Constraint {
     pub offset: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FunctionCall {
     /// function call target
     pub target: u64,
@@ -116,7 +117,7 @@ pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Res
         address,
         guid,
         constraints: calls
-            .into_iter()
+            .iter()
             .map(|c| {
                 compute_warp_uuid_from_pe(pe, c.target).map(|guid| Constraint {
                     guid: ConstraintGuid::from_call(guid),
@@ -124,6 +125,7 @@ pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Res
                 })
             })
             .collect::<Result<_>>()?,
+        calls,
     })
 }
 
