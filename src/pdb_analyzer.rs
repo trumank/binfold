@@ -6,10 +6,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::warn;
 
-use crate::compute_warp_uuid;
 use crate::mmap_source::MmapSource;
 use crate::pe_loader::{ControlFlowGraph, PeLoader};
-use crate::warp::{Constraint, ConstraintGuid, FunctionCall, FunctionGuid, SymbolGuid};
+use crate::warp::{
+    Constraint, ConstraintGuid, FunctionCall, FunctionGuid, SymbolGuid,
+    compute_function_guid_with_contraints,
+};
 
 pub struct PdbAnalyzer {
     pe_loader: PeLoader,
@@ -148,7 +150,9 @@ impl PdbAnalyzer {
         let pe_loader = &self.pe_loader;
 
         // Process procedures in parallel
-        let (mut functions, calls): (HashMap<u64, FunctionInfo>, Vec<(u64, Vec<FunctionCall>)>) =
+        // TODO figure out how to handle multiple names for single address
+        // TODO this processes each individual symbol and can do a lot of duplicate work if they share same address
+        let (mut functions, calls): (HashMap<u64, FunctionInfo>, HashMap<u64, Vec<FunctionCall>>) =
             procedures
                 .par_iter()
                 .progress_with(pb.clone())
@@ -163,24 +167,19 @@ impl PdbAnalyzer {
                     };
 
                     if let Some(size) = size {
-                        match Self::compute_function_guid_static(
-                            pe_loader,
-                            address,
-                            size as usize,
-                            &cfg,
-                        ) {
-                            Ok((guid, calls)) => Some((
+                        match compute_function_guid_with_contraints(pe_loader, address) {
+                            Ok(func) => Some((
                                 (
                                     address,
                                     FunctionInfo {
                                         name: proc_data.name.clone(),
                                         address,
                                         size: Some(size),
-                                        guid,
-                                        constraints: vec![],
+                                        guid: func.guid,
+                                        constraints: func.constraints,
                                     },
                                 ),
-                                (address, calls),
+                                (address, func.calls),
                             )),
                             Err(e) => {
                                 warn!(
@@ -231,10 +230,11 @@ impl PdbAnalyzer {
                     if let Some(target_fn) = functions.get(&call.target) {
                         let offset = Some(call.offset as i64);
                         // Function-based child constraint
-                        constraints.push(Constraint {
-                            guid: ConstraintGuid::from_child_call(target_fn.guid),
-                            offset,
-                        });
+                        // (already exists from warp analysis)
+                        // constraints.push(Constraint {
+                        //     guid: ConstraintGuid::from_child_call(target_fn.guid),
+                        //     offset,
+                        // });
 
                         // Symbol-based child constraint
                         let target_symbol = SymbolGuid::from_symbol(&target_fn.name);
@@ -269,28 +269,13 @@ impl PdbAnalyzer {
             })
             .collect();
         for (address, constraints) in constraints {
-            functions.get_mut(&address).unwrap().constraints = constraints;
+            functions
+                .get_mut(&address)
+                .unwrap()
+                .constraints
+                .extend(constraints);
         }
 
         Ok(functions.into_values().collect())
-    }
-
-    fn compute_function_guid_static(
-        pe_loader: &PeLoader,
-        address: u64,
-        size: usize,
-        cfg: &ControlFlowGraph,
-    ) -> Result<(FunctionGuid, Vec<FunctionCall>)> {
-        let function_bytes = pe_loader.read_at_va(address, size)?;
-        let mut calls = vec![];
-        let guid = compute_warp_uuid(
-            function_bytes,
-            address,
-            Some(&mut calls),
-            None,
-            cfg,
-            pe_loader,
-        );
-        Ok((guid, calls))
     }
 }
