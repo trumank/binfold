@@ -163,6 +163,31 @@ fn command_pe(
     for constraint in &func.constraints {
         println!("  {constraint:x?}");
     }
+    if !func.data_refs.is_empty() {
+        println!("Data References:");
+        for data_ref in &func.data_refs {
+            let size_str = data_ref
+                .estimated_size
+                .map(|s| format!("{s} bytes"))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            print!(
+                "  target: 0x{:x}, offset: 0x{:x}, readonly: {}, estimated_size: {}",
+                data_ref.target, data_ref.offset, data_ref.is_readonly, size_str
+            );
+
+            // For read-only data with no size (potential strings), try to show the content
+            if data_ref.is_readonly && data_ref.estimated_size.is_none() {
+                if let Some(data) = warp::read_string_data(&pe, data_ref.target) {
+                    println!(" -> \"{}\"", String::from_utf8_lossy(&data));
+                } else {
+                    println!();
+                }
+            } else {
+                println!();
+            }
+        }
+    }
 
     // // If database is provided, look up matches and compare constraints
     // if let Some(db_path) = database {

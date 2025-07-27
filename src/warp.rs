@@ -15,6 +15,7 @@ const NAMESPACE_CHILD_CALL: Uuid = uuid!("7e3d0b40-56dd-4b77-a825-9c75b0b607c5")
 const NAMESPACE_PARENT_CALL: Uuid = uuid!("dc0e3d9d-72ea-46df-81fc-ebe4295f0977");
 const NAMESPACE_SYMBOL_CHILD_CALL: Uuid = uuid!("18811911-ca5d-4d97-a1c3-dd526ae818a5");
 const NAMESPACE_SYMBOL_PARENT_CALL: Uuid = uuid!("e4b07ff0-e798-4427-b533-174aebda4858");
+const NAMESPACE_DATA_CONST: Uuid = uuid!("db056d71-7d64-4660-a937-aeb6e8136af2");
 
 macro_rules! new_guid {
     ($name:ident) => {
@@ -80,6 +81,10 @@ impl ConstraintGuid {
             target.0.as_bytes(),
         ))
     }
+    /// constraint on reference to read-only data
+    pub fn from_data_const(data: &[u8]) -> Self {
+        Self(Uuid::new_v5(&NAMESPACE_DATA_CONST, data))
+    }
 }
 
 impl SymbolGuid {
@@ -97,6 +102,7 @@ pub struct Function {
     pub address: u64,
     pub constraints: Vec<Constraint>,
     pub calls: Vec<FunctionCall>,
+    pub data_refs: Vec<DataReference>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +119,18 @@ pub struct FunctionCall {
     pub offset: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct DataReference {
+    /// target address of data reference
+    pub target: u64,
+    /// offset from calling function entrypoint
+    pub offset: u64,
+    /// whether the reference is to read-only data
+    pub is_readonly: bool,
+    /// estimated size of the data being referenced (based on instruction)
+    pub estimated_size: Option<u32>,
+}
+
 pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64) -> Result<FunctionGuid> {
     // Build CFG during size calculation
     let mut cfg = crate::pe_loader::ControlFlowGraph::default();
@@ -126,7 +144,7 @@ pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64) -> Result<Function
 
     let func_bytes = pe.read_at_va(address, func_size)?;
 
-    Ok(compute_warp_uuid(func_bytes, address, None, &cfg))
+    Ok(compute_warp_uuid(func_bytes, address, None, None, &cfg, pe))
 }
 
 pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Result<Function> {
@@ -143,20 +161,46 @@ pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Res
     let func_bytes = pe.read_at_va(address, func_size)?;
 
     let mut calls = vec![];
-    let guid = compute_warp_uuid(func_bytes, address, Some(&mut calls), &cfg);
+    let mut data_refs = vec![];
+    let guid = compute_warp_uuid(
+        func_bytes,
+        address,
+        Some(&mut calls),
+        Some(&mut data_refs),
+        &cfg,
+        pe,
+    );
+
+    // Generate constraints from calls
+    let mut constraints: Vec<Constraint> = calls
+        .iter()
+        .map(|c| {
+            compute_warp_uuid_from_pe(pe, c.target).map(|guid| Constraint {
+                guid: ConstraintGuid::from_child_call(guid),
+                offset: Some(c.offset as i64),
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    // Add data reference constraints
+    for data_ref in &data_refs {
+        if data_ref.is_readonly && data_ref.estimated_size.is_none() {
+            // For read-only data with no specific size (strings), try to read and hash the content
+            if let Some(data) = read_string_data(pe, data_ref.target) {
+                constraints.push(Constraint {
+                    guid: ConstraintGuid::from_data_const(&data),
+                    offset: Some(data_ref.offset as i64),
+                });
+            }
+        }
+    }
+
     Ok(Function {
         address,
         guid,
-        constraints: calls
-            .iter()
-            .map(|c| {
-                compute_warp_uuid_from_pe(pe, c.target).map(|guid| Constraint {
-                    guid: ConstraintGuid::from_child_call(guid),
-                    offset: Some(c.offset as i64),
-                })
-            })
-            .collect::<Result<_>>()?,
+        constraints,
         calls,
+        data_refs,
     })
 }
 
@@ -164,7 +208,9 @@ pub fn compute_warp_uuid(
     raw_bytes: &[u8],
     base: u64,
     mut calls: Option<&mut Vec<FunctionCall>>,
+    mut data_refs: Option<&mut Vec<DataReference>>,
     cfg: &crate::pe_loader::ControlFlowGraph,
+    pe: &PeLoader,
 ) -> FunctionGuid {
     // Disassemble and identify basic blocks
     let basic_blocks = identify_basic_blocks(raw_bytes, base, cfg);
@@ -185,6 +231,8 @@ pub fn compute_warp_uuid(
             start_addr,
             base..(base + raw_bytes.len() as u64),
             calls.as_deref_mut(),
+            data_refs.as_deref_mut(),
+            pe,
         );
         block_uuids.push((start_addr, uuid));
 
@@ -396,8 +444,11 @@ fn create_basic_block_guid(
     base: u64,
     function_bounds: Range<u64>,
     calls: Option<&mut Vec<FunctionCall>>,
+    data_refs: Option<&mut Vec<DataReference>>,
+    pe: &PeLoader,
 ) -> Uuid {
-    let instruction_bytes = get_instruction_bytes_for_guid(raw_bytes, base, function_bounds, calls);
+    let instruction_bytes =
+        get_instruction_bytes_for_guid(raw_bytes, base, function_bounds, calls, data_refs, pe);
     Uuid::new_v5(&NAMESPACE_BASIC_BLOCK, &instruction_bytes)
 }
 
@@ -406,6 +457,8 @@ fn get_instruction_bytes_for_guid(
     base: u64,
     function_bounds: Range<u64>,
     mut calls: Option<&mut Vec<FunctionCall>>,
+    mut data_refs: Option<&mut Vec<DataReference>>,
+    pe: &PeLoader,
 ) -> Vec<u8> {
     use iced_x86::Formatter;
 
@@ -446,7 +499,13 @@ fn get_instruction_bytes_for_guid(
         }
 
         // Get instruction bytes, zeroing out relocatable instructions
-        if is_relocatable_instruction(&instruction, function_bounds.clone(), calls.as_deref_mut()) {
+        if is_relocatable_instruction(
+            &instruction,
+            function_bounds.clone(),
+            calls.as_deref_mut(),
+            data_refs.as_deref_mut(),
+            pe,
+        ) {
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
             trace!(
@@ -519,10 +578,27 @@ fn has_implicit_extension(reg: Register) -> bool {
     )
 }
 
+fn estimate_data_size_from_instruction(instruction: &Instruction) -> Option<u32> {
+    for i in 0..instruction.op_count() {
+        if instruction.op_kind(i) == OpKind::Memory {
+            let size = instruction.memory_size().size();
+            if size == 0 {
+                return None;
+            } else {
+                return Some(size as u32);
+            }
+        }
+    }
+
+    None
+}
+
 fn is_relocatable_instruction(
     instruction: &Instruction,
     function_bounds: Range<u64>,
     calls: Option<&mut Vec<FunctionCall>>,
+    mut data_refs: Option<&mut Vec<DataReference>>,
+    pe: &PeLoader,
 ) -> bool {
     let offset = instruction.ip() - function_bounds.start;
 
@@ -558,7 +634,38 @@ fn is_relocatable_instruction(
         }
     }
 
-    // Check for RIP-relative memory operands
+    // Check for memory operands that could be data references
+    if instruction.mnemonic() != Mnemonic::Call {
+        for i in 0..instruction.op_count() {
+            if instruction.op_kind(i) == OpKind::Memory {
+                // Check if it's RIP-relative (typical for data references)
+                // Also check for displacement-only addressing (absolute addresses)
+                // BUT exclude segment-relative addressing (GS, FS, etc)
+                if instruction.memory_base() == Register::RIP
+                    || (instruction.memory_base() == Register::None
+                        && instruction.memory_index() == Register::None
+                        && instruction.memory_displacement64() != 0
+                        && instruction.segment_prefix() == Register::None)
+                {
+                    let target_address = instruction.memory_displacement64();
+
+                    // Track this as a data reference if we have the data_refs vector
+                    if let Some(data_refs) = data_refs.as_deref_mut() {
+                        // Check if the target is writable
+                        let is_readonly = !pe.is_address_writable(target_address).unwrap_or(false);
+                        data_refs.push(DataReference {
+                            target: target_address,
+                            offset,
+                            is_readonly,
+                            estimated_size: estimate_data_size_from_instruction(instruction),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Check other RIP-relative memory operands (for non-MOV/LEA instructions)
     for i in 0..instruction.op_count() {
         if instruction.op_kind(i) == OpKind::Memory {
             // Check if it's RIP-relative (no base register, or RIP as base)
@@ -579,6 +686,72 @@ fn is_relocatable_instruction(
     }
 
     false
+}
+
+/// Try to read string data from the given address
+/// Returns the string bytes if it looks like a valid UTF-8 or UTF-16 string
+pub fn read_string_data(pe: &PeLoader, address: u64) -> Option<Vec<u8>> {
+    const MAX_STRING_LEN: usize = 4096;
+
+    // Read first two bytes to determine string type
+    let initial_bytes = pe.read_at_va(address, 2).ok()?;
+
+    // Simple heuristic: if second byte is 0, assume UTF-16 LE
+    if initial_bytes[1] == 0 {
+        // Read UTF-16 string until double null bytes
+        let mut result = Vec::new();
+        let mut offset = 0;
+
+        while offset < MAX_STRING_LEN {
+            match pe.read_at_va(address + offset as u64, 2) {
+                Ok(bytes) => {
+                    if bytes[0] == 0 && bytes[1] == 0 {
+                        break;
+                    }
+                    result.push(bytes[0]);
+                    result.push(bytes[1]);
+                    offset += 2;
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Validate it's actually UTF-16
+        if result.len() > 4 {
+            let u16_values: Vec<u16> = result
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+
+            if String::from_utf16(&u16_values).is_ok() {
+                return Some(result);
+            }
+        }
+    } else {
+        // Assume UTF-8, read until single null byte
+        let mut result = Vec::new();
+        let mut offset = 0;
+
+        while offset < MAX_STRING_LEN {
+            match pe.read_at_va(address + offset as u64, 1) {
+                Ok(bytes) => {
+                    if bytes[0] == 0 {
+                        break;
+                    }
+                    result.push(bytes[0]);
+                    offset += 1;
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Validate it's actually UTF-8
+        if result.len() > 4 && std::str::from_utf8(&result).is_ok() {
+            return Some(result);
+        }
+    }
+
+    None
 }
 
 // >>> with open('/tmp/functions.json', 'w') as f:
@@ -887,6 +1060,8 @@ mod test {
                     start,
                     function_address..(function_address + function_size as u64),
                     None,
+                    None,
+                    &pe,
                 ))
             } else {
                 None
@@ -912,7 +1087,7 @@ mod test {
         }
 
         // Compute WARP UUID
-        let warp_uuid = compute_warp_uuid(function_bytes, function_address, None, &cfg);
+        let warp_uuid = compute_warp_uuid(function_bytes, function_address, None, None, &cfg, &pe);
         println!("\nWARP UUID: {}", warp_uuid);
         println!("Expected:  {}", expected_function_guid);
 

@@ -8,6 +8,9 @@ use std::ops::Range;
 use std::path::Path;
 use tracing::{debug, trace};
 
+// PE section characteristics
+const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000;
+
 #[derive(Debug, Clone)]
 pub struct RuntimeFunction {
     pub range: Range<usize>,
@@ -620,6 +623,23 @@ impl PeLoader {
                 pointer_to_raw_data: section.pointer_to_raw_data.get(object::LittleEndian),
                 characteristics: section.characteristics.get(object::LittleEndian),
             })
+    }
+
+    /// Check if a virtual address is in a writable section
+    pub fn is_address_writable(&self, va: u64) -> Result<bool> {
+        let rva = va.saturating_sub(self.image_base);
+
+        for section in self.sections() {
+            let section_start = section.virtual_address as u64;
+            let section_end = section_start + section.virtual_size as u64;
+
+            if rva >= section_start && rva < section_end {
+                return Ok((section.characteristics & IMAGE_SCN_MEM_WRITE) != 0);
+            }
+        }
+
+        // Address not found in any section
+        Ok(false)
     }
 }
 

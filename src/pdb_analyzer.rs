@@ -283,7 +283,14 @@ impl PdbAnalyzer {
     ) -> Result<(FunctionGuid, Vec<FunctionCall>)> {
         let function_bytes = pe_loader.read_at_va(address, size)?;
         let mut calls = vec![];
-        let guid = compute_warp_uuid(function_bytes, address, Some(&mut calls), cfg);
+        let guid = compute_warp_uuid(
+            function_bytes,
+            address,
+            Some(&mut calls),
+            None,
+            cfg,
+            pe_loader,
+        );
         Ok((guid, calls))
     }
 }
