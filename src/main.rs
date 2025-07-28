@@ -648,9 +648,10 @@ fn command_exception(
         | rusqlite::OpenFlags::SQLITE_OPEN_URI
         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
 
-    // Open database connection if provided (and discard, just checking for errors)
-    if let Some(db_path) = &database {
-        Connection::open_with_flags(db_path, flags)?;
+    let conn = if let Some(db_path) = &database {
+        Some(Connection::open_with_flags(db_path, flags)?)
+    } else {
+        None
     };
 
     let mut results: Vec<FunctionResult> = Vec::new();
@@ -673,7 +674,7 @@ fn command_exception(
 
     struct DbContext {
         cache_guid_lookups: HashMap<FunctionGuid, FunctionGuidCounts>,
-        cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, String>>,
+        cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, i64>>,
     }
 
     let new_pb = |len, msg| {
@@ -787,32 +788,28 @@ fn command_exception(
             to_find_constraints.len() as u64,
             "Querying function constraints",
         );
-        let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, String>> = to_find_constraints
-            .par_iter()
-            .progress_with(pb)
-            .map_init(
-                || Connection::open_with_flags(database, flags).unwrap(),
-                |conn, guid| -> Result<_> {
-                    let mut stmt = conn.prepare(
-                        "SELECT guid_constraint, (SELECT value FROM strings WHERE id = id_function_name)
-                            FROM functions
-                            JOIN constraints USING(id_function)
-                            WHERE guid_function = ?1
-                            GROUP BY guid_constraint
-                            HAVING COUNT(DISTINCT id_function_name) = 1"
-                    )?;
-                    let res = tracing::info_span!("query_constraint",
-                        function = guid.to_string(),
-                    ).in_scope(||
-                        stmt.query_map(params![guid], |row| Ok((row.get(0)?, row.get(1)?)))?
-                            .collect::<rusqlite::Result<HashMap<ConstraintGuid, String>>>()
-                    )?;
-                    Ok((*guid, res))
-                }
-            )
-            .collect::<Result<_>>()?;
+        let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, i64>> =
+            to_find_constraints
+                .par_iter()
+                .progress_with(pb)
+                .map_init(
+                    || Connection::open_with_flags(database, flags).unwrap(),
+                    |conn, guid| -> Result<_> {
+                        let mut stmt = conn.prepare(
+                            "SELECT guid_constraint, id_function_name
+                            FROM unique_constraints
+                            WHERE guid_function = ?1",
+                        )?;
+                        let res = stmt
+                            .query_map(params![guid], |row| Ok((row.get(0)?, row.get(1)?)))?
+                            .collect::<rusqlite::Result<HashMap<ConstraintGuid, i64>>>()?;
+                        Ok((*guid, res))
+                    },
+                )
+                .collect::<Result<_>>()?;
 
         println!("Found {} constraint guids", cache_unique_constraints.len());
+
         Some(DbContext {
             cache_guid_lookups,
             cache_unique_constraints,
@@ -882,8 +879,13 @@ fn command_exception(
                             .iter()
                             .find_map(|c| constraints_map.get(c));
 
-                        if let Some(func_name) = unique_match {
-                            new_matches.push((func.address, func_name.clone()));
+                        if let Some(name_id) = unique_match {
+                            let func_name = conn.as_ref().unwrap().query_row(
+                                "SELECT value FROM strings WHERE id = ?1",
+                                params![name_id],
+                                |row| row.get::<_, String>(0),
+                            )?;
+                            new_matches.push((func.address, func_name));
                         }
                     }
                 }
@@ -1065,6 +1067,163 @@ mod test {
         )?;
 
         dbg!(row_result);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unique_constraint_query() -> Result<()> {
+        use rusqlite::Connection;
+        use std::collections::HashMap;
+
+        let mut conn = Connection::open("erm.db")?;
+
+        conn.execute_batch(
+            "PRAGMA synchronous = OFF;
+             PRAGMA journal_mode = MEMORY;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = 1000000;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA mmap_size = 30000000000;
+             PRAGMA foreign_keys = OFF;",
+        )?;
+
+        let unique_constraints = {
+            // Step 1: Fetch all functions (id_function -> (guid_function, id_function_name))
+            println!("fetching functions");
+            let mut functions_stmt =
+                conn.prepare("SELECT id_function, guid_function, id_function_name FROM functions")?;
+
+            let mut function_info: HashMap<i64, (FunctionGuid, i64)> = HashMap::new();
+            let function_rows = functions_stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, FunctionGuid>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+
+            for row in function_rows {
+                let (id_function, guid_function, id_function_name) = row?;
+                function_info.insert(id_function, (guid_function, id_function_name));
+            }
+
+            println!("Loaded {} functions", function_info.len());
+
+            // Step 2: Fetch all constraints
+            println!("fetching constraints");
+            let mut constraints_stmt =
+                conn.prepare("SELECT id_function, guid_constraint FROM constraints")?;
+
+            // Group by (function_guid, constraint_guid) and collect unique function names
+            let mut constraint_to_names: HashMap<(FunctionGuid, ConstraintGuid), HashSet<i64>> =
+                HashMap::new();
+
+            let constraint_rows = constraints_stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, ConstraintGuid>(1)?))
+            })?;
+
+            let mut constraint_count = 0;
+            let pb = ProgressBar::new(conn.query_row(
+                "SELECT COUNT(guid_constraint) FROM constraints",
+                [],
+                |row| row.get(0),
+            )?)
+            .with_style(progress_style());
+            for row in constraint_rows.progress_with(pb) {
+                let (id_function, guid_constraint) = row?;
+                constraint_count += 1;
+
+                // Join: look up the function guid and name for this function id
+                if let Some(&(guid_function, id_function_name)) = function_info.get(&id_function) {
+                    constraint_to_names
+                        .entry((guid_function, guid_constraint))
+                        .or_insert_with(HashSet::new)
+                        .insert(id_function_name);
+                }
+            }
+
+            println!("Processed {} constraints", constraint_count);
+
+            // Step 3: Filter to only (function_guid, constraint_guid) pairs that have exactly one unique function name
+            let unique_constraints: Vec<(FunctionGuid, ConstraintGuid, i64)> = constraint_to_names
+                .into_iter()
+                .filter_map(|((guid_function, constraint_guid), name_ids)| {
+                    if name_ids.len() == 1 {
+                        Some((
+                            guid_function,
+                            constraint_guid,
+                            *name_ids.iter().next().unwrap(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            unique_constraints
+        };
+
+        println!("Found {} unique constraints", unique_constraints.len());
+        for (guid_function, constraint_guid, function_name_id) in unique_constraints.iter().take(10)
+        {
+            println!(
+                "Function: {:?}, Constraint: {:?}, Function Name ID: {}",
+                guid_function, constraint_guid, function_name_id
+            );
+        }
+
+        // Step 4: Create table and insert results
+        println!("Creating unique_constraints table and inserting results...");
+
+        // Create the table if it doesn't exist
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS unique_constraints (
+                guid_function BLOB NOT NULL,
+                guid_constraint BLOB NOT NULL,
+                id_function_name INTEGER NOT NULL,
+                PRIMARY KEY (guid_function, guid_constraint),
+                FOREIGN KEY (id_function_name) REFERENCES strings(id)
+            )",
+            [],
+        )?;
+
+        // Clear any existing data
+        conn.execute("DELETE FROM unique_constraints", [])?;
+
+        // Insert all unique constraints
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO unique_constraints (guid_function, guid_constraint, id_function_name) 
+                 VALUES (?1, ?2, ?3)",
+            )?;
+
+            let pb = ProgressBar::new(unique_constraints.len() as u64).with_style(progress_style());
+            for (guid_function, constraint_guid, function_name_id) in
+                unique_constraints.iter().progress_with(pb)
+            {
+                stmt.execute(params![guid_function, constraint_guid, function_name_id])?;
+            }
+        }
+        tx.commit()?;
+
+        println!(
+            "Successfully inserted {} unique constraints into the table",
+            unique_constraints.len()
+        );
+
+        // Create indices for fast lookups
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_unique_constraints_function 
+             ON unique_constraints(guid_function)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_unique_constraints_constraint 
+             ON unique_constraints(guid_constraint)",
+            [],
+        )?;
 
         Ok(())
     }
