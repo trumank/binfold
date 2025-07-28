@@ -127,7 +127,7 @@ impl PdbAnalyzer {
             .with_style(progress_style())
             .with_message(self.exe_name.clone());
         if let Some(multi) = &progress_bar {
-            multi.insert_from_back(1, pb.clone());
+            multi.insert_from_back(2, pb.clone());
         }
 
         // Process procedures in parallel

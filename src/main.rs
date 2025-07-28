@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use indicatif::{ParallelProgressIterator as _, ProgressBar, ProgressStyle};
+use indicatif::{ParallelProgressIterator as _, ProgressBar, ProgressIterator as _, ProgressStyle};
 use rayon::prelude::*;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -12,9 +12,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 mod pe_loader;
 use pe_loader::PeLoader;
 
-use crate::warp::{
-    ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints, compute_warp_uuid,
-};
+use crate::warp::{ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints};
 mod mmap_source;
 mod pdb_analyzer;
 mod pdb_writer;
@@ -316,7 +314,7 @@ fn command_pdb(
         database,
     }: CommandPdb,
 ) -> Result<()> {
-    use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+    use indicatif::{MultiProgress, ProgressBar};
     use pdb_analyzer::PdbAnalyzer;
     use std::fs;
 
@@ -388,7 +386,8 @@ fn command_pdb(
          PRAGMA temp_store = MEMORY;
          PRAGMA cache_size = 1000000;
          PRAGMA temp_store = MEMORY;
-         PRAGMA mmap_size = 30000000000;",
+         PRAGMA mmap_size = 30000000000;
+         PRAGMA foreign_keys = OFF;",
     )?;
 
     // Create string table if it doesn't exist
@@ -428,44 +427,44 @@ fn command_pdb(
     )?;
 
     // Create indices for fast lookups
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_functions_guid ON functions(guid_function)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_functions_guid_fname ON functions(guid_function, id_function_name)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_functions_addr_exe ON functions(address, id_exe_name)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_strings_value ON strings(value)",
-        [],
-    )?;
+    // conn.execute(
+    //     "CREATE INDEX IF NOT EXISTS idx_functions_guid ON functions(guid_function)",
+    //     [],
+    // )?;
+    // conn.execute(
+    //     "CREATE INDEX IF NOT EXISTS idx_functions_guid_fname ON functions(guid_function, id_function_name)",
+    //     [],
+    // )?;
+    // conn.execute(
+    //     "CREATE INDEX IF NOT EXISTS idx_functions_addr_exe ON functions(address, id_exe_name)",
+    //     [],
+    // )?;
+    // conn.execute(
+    //     "CREATE INDEX IF NOT EXISTS idx_strings_value ON strings(value)",
+    //     [],
+    // )?;
 
-    // Create indices for constraints table
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_constraints_id_function ON constraints(id_function)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_constraints_guid ON constraints(guid_constraint)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_constraints_guid_offset ON constraints(guid_constraint, offset)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_constraints_function_constraint ON constraints(id_function, guid_constraint)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_constraints_constraint_function ON constraints(guid_constraint, id_function)",
-        [],
-    )?;
+    // // Create indices for constraints table
+    // conn.execute(
+    //     "CREATE INDEX IF NOT EXISTS idx_constraints_id_function ON constraints(id_function)",
+    //     [],
+    // )?;
+    // conn.execute(
+    //     "CREATE INDEX IF NOT EXISTS idx_constraints_guid ON constraints(guid_constraint)",
+    //     [],
+    // )?;
+    // conn.execute(
+    //     "CREATE INDEX IF NOT EXISTS idx_constraints_guid_offset ON constraints(guid_constraint, offset)",
+    //     [],
+    // )?;
+    // conn.execute(
+    //     "CREATE INDEX IF NOT EXISTS idx_constraints_function_constraint ON constraints(id_function, guid_constraint)",
+    //     [],
+    // )?;
+    // conn.execute(
+    //     "CREATE INDEX IF NOT EXISTS idx_constraints_constraint_function ON constraints(guid_constraint, id_function)",
+    //     [],
+    // )?;
 
     // Create string cache for fast lookups
     let string_cache: HashMap<String, i64> = HashMap::new();
@@ -483,9 +482,6 @@ fn command_pdb(
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     multi_progress.add(pb.clone());
 
-    let mut total_processed = 0;
-    let mut total_failed = 0;
-
     // Get current unix timestamp
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -493,7 +489,7 @@ fn command_pdb(
         .as_secs() as i64;
 
     // Process executables sequentially to avoid OOM
-    for exe_path in exe_paths {
+    let process = |exe_path: &PathBuf| -> Result<()> {
         // Derive PDB path for this exe
         let pdb_path_for_exe = exe_path.with_extension("pdb");
 
@@ -555,33 +551,17 @@ fn command_pdb(
                      VALUES (?1, ?2, ?3)",
                 )?;
 
-                for func in &function_guids {
-                    let function_name_id = get_or_insert_string(&tx, &mut cache, &func.name)?;
+                let pb = ProgressBar::new(function_guids.len() as u64)
+                    .with_style(progress_style())
+                    .with_message("Inserting functions");
+                multi_progress.insert_from_back(1, pb.clone());
 
-                    // Check if this function already exists
-                    let existing_id: Option<i64> = tx
-                        .query_row(
-                            "SELECT id_function FROM functions WHERE address = ?1 AND id_exe_name = ?2",
-                            params![func.address as i64, exe_name_id],
-                            |row| row.get(0),
-                        )
-                        .ok();
+                function_guids
+                    .iter()
+                    .progress_with(pb)
+                    .try_for_each(|func| -> Result<()> {
+                        let function_name_id = get_or_insert_string(&tx, &mut cache, &func.name)?;
 
-                    let function_guid_id = if let Some(id) = existing_id {
-                        // Update existing record
-                        tx.execute(
-                            "UPDATE functions SET guid_function = ?1, id_function_name = ?2, timestamp = ?3 WHERE id_function = ?4",
-                            params![func.guid, function_name_id, timestamp, id],
-                        )?;
-
-                        // Delete old constraints
-                        tx.execute(
-                            "DELETE FROM constraints WHERE id_function = ?1",
-                            params![id],
-                        )?;
-
-                        id
-                    } else {
                         // Insert new record
                         stmt.execute(params![
                             func.address as i64,
@@ -590,18 +570,19 @@ fn command_pdb(
                             function_name_id,
                             timestamp
                         ])?;
-                        tx.last_insert_rowid()
-                    };
+                        let function_guid_id = tx.last_insert_rowid();
 
-                    // Insert constraints
-                    for constraint in &func.constraints {
-                        constraint_stmt.execute(params![
-                            function_guid_id,
-                            constraint.guid,
-                            constraint.offset
-                        ])?;
-                    }
-                }
+                        // Insert constraints
+                        for constraint in &func.constraints {
+                            constraint_stmt.execute(params![
+                                function_guid_id,
+                                constraint.guid,
+                                constraint.offset
+                            ])?;
+                        }
+
+                        Ok(())
+                    })?;
             }
             tx.commit()?;
             Ok(())
@@ -610,20 +591,41 @@ fn command_pdb(
         pb.inc(1);
 
         match result {
-            Ok(_) => total_processed += 1,
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("Error processing {}: {}", exe_path.display(), e);
-                total_failed += 1;
             }
         }
-    }
+
+        Ok(())
+    };
+
+    // don't use par_iter to iterate games because we only need a couple threads
+    // will end up bound by sqlite insertion anyway
+    std::thread::scope(|scope| -> Result<()> {
+        let num_threads = 4;
+        let tasks: Vec<_> = exe_paths
+            .chunks((exe_paths.len() + num_threads - 1) / num_threads)
+            .map(|chunk| {
+                scope.spawn(move || -> Result<()> {
+                    for path in chunk {
+                        process(path)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.join().unwrap()?;
+        }
+        Ok(())
+    })?;
 
     pb.finish();
     multi_progress.clear().unwrap();
 
     println!("\nSummary:");
     println!("========");
-    println!("Executables processed: {total_processed} succeeded, {total_failed} failed");
     println!("Database: {}", database.display());
 
     Ok(())
@@ -793,14 +795,18 @@ fn command_exception(
                 |conn, guid| -> Result<_> {
                     let mut stmt = conn.prepare(
                         "SELECT guid_constraint, (SELECT value FROM strings WHERE id = id_function_name)
-                            FROM functions INDEXED BY idx_functions_guid
+                            FROM functions
                             JOIN constraints USING(id_function)
                             WHERE guid_function = ?1
                             GROUP BY guid_constraint
                             HAVING COUNT(DISTINCT id_function_name) = 1"
                     )?;
-                    let res = stmt.query_map(params![guid], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .collect::<rusqlite::Result<HashMap<ConstraintGuid, String>>>()?;
+                    let res = tracing::info_span!("query_constraint",
+                        function = guid.to_string(),
+                    ).in_scope(||
+                        stmt.query_map(params![guid], |row| Ok((row.get(0)?, row.get(1)?)))?
+                            .collect::<rusqlite::Result<HashMap<ConstraintGuid, String>>>()
+                    )?;
                     Ok((*guid, res))
                 }
             )
