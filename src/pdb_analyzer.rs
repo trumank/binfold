@@ -4,10 +4,9 @@ use pdb::{FallibleIterator, PDB, SymbolData};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::warn;
 
 use crate::mmap_source::MmapSource;
-use crate::pe_loader::{ControlFlowGraph, PeLoader};
+use crate::pe_loader::PeLoader;
 use crate::warp::{
     Constraint, ConstraintGuid, FunctionCall, FunctionGuid, SymbolGuid,
     compute_function_guid_with_contraints,
@@ -26,9 +25,9 @@ pub struct FunctionInfo {
     pub size: Option<u32>,
     pub guid: FunctionGuid,
     pub constraints: Vec<Constraint>,
+    pub calls: Vec<FunctionCall>,
 }
 
-// Structure to hold procedure data for parallel processing
 #[derive(Clone)]
 struct ProcedureData {
     name: String,
@@ -146,57 +145,38 @@ impl PdbAnalyzer {
             multi.insert_from_back(1, pb.clone());
         }
 
-        // Create thread-safe references
-        let pe_loader = &self.pe_loader;
+        let binned_procs: HashMap<u64, Vec<&ProcedureData>> =
+            procedures.iter().fold(Default::default(), |mut acc, item| {
+                acc.entry(item.rva as u64 + self.pe_loader.image_base)
+                    .or_default()
+                    .push(item);
+                acc
+            });
 
         // Process procedures in parallel
         // TODO figure out how to handle multiple names for single address
         // TODO this processes each individual symbol and can do a lot of duplicate work if they share same address
-        let (mut functions, calls): (HashMap<u64, FunctionInfo>, HashMap<u64, Vec<FunctionCall>>) =
-            procedures
-                .par_iter()
-                .progress_with(pb.clone())
-                .filter_map(|proc_data| {
-                    let address = proc_data.rva as u64 + pe_loader.image_base;
+        let mut functions: HashMap<u64, FunctionInfo> = binned_procs
+            .par_iter()
+            .progress_with(pb.clone())
+            .map(|(&address, procs)| -> Result<_> {
+                // TODO figure out what to do with the rest
+                let proc = procs[0];
 
-                    let mut cfg = ControlFlowGraph::default();
-                    let size = match pe_loader.find_function_size_with_cfg(address, Some(&mut cfg))
-                    {
-                        Ok(sz) => Some(sz as u32),
-                        Err(_) => None,
-                    };
+                let size = self.pe_loader.find_function_size_with_cfg(address, None)?;
 
-                    if let Some(size) = size {
-                        match compute_function_guid_with_contraints(pe_loader, address) {
-                            Ok(func) => Some((
-                                (
-                                    address,
-                                    FunctionInfo {
-                                        name: proc_data.name.clone(),
-                                        address,
-                                        size: Some(size),
-                                        guid: func.guid,
-                                        constraints: func.constraints,
-                                    },
-                                ),
-                                (address, func.calls),
-                            )),
-                            Err(e) => {
-                                warn!(
-                                    target: "warp_testing::pdb_analyzer",
-                                    function_name = %proc_data.name,
-                                    address = format!("0x{:x}", address),
-                                    error = %e,
-                                    "Failed to compute GUID for function"
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .unzip();
+                let func = compute_function_guid_with_contraints(&self.pe_loader, address)?;
+                let func_info = FunctionInfo {
+                    name: proc.name.clone(),
+                    address,
+                    size: Some(size as u32),
+                    guid: func.guid,
+                    constraints: func.constraints,
+                    calls: func.calls,
+                };
+                Ok((address, func_info))
+            })
+            .collect::<Result<_>>()?;
 
         if let Some(multi) = progress_bar {
             pb.finish_and_clear();
@@ -205,13 +185,11 @@ impl PdbAnalyzer {
 
         // TODO analyze and calls to functions that have not already been found?
         // FIXME actually omitting calls leaves room for false positives so really should be fixed
-        //
-        // FIXME constraint GUID calculation is wrong (is not just function GUID)
 
         // Build a map of who calls whom for parent constraints
         let mut callers: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
-        for (caller_address, calls) in &calls {
-            for call in calls {
+        for (caller_address, info) in &functions {
+            for call in &info.calls {
                 callers
                     .entry(call.target)
                     .or_default()
@@ -220,13 +198,13 @@ impl PdbAnalyzer {
         }
 
         // TODO figure out if/why hashing is so slow (sha1_smol crate?) and cache/optimize
-        let constraints: Vec<_> = calls
+        let constraints: Vec<_> = functions
             .par_iter()
-            .map(|(address, calls)| {
+            .map(|(address, info)| {
                 let mut constraints = Vec::new();
 
                 // Add child call constraints (both function-based and symbol-based)
-                for call in calls {
+                for call in &info.calls {
                     if let Some(target_fn) = functions.get(&call.target) {
                         let offset = Some(call.offset as i64);
                         // Function-based child constraint
