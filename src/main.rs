@@ -2,9 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ParallelProgressIterator as _, ProgressBar, ProgressIterator as _, ProgressStyle};
 use rayon::prelude::*;
-use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -66,7 +65,7 @@ struct CommandPe {
     #[arg(short, long, value_parser = parse_hex)]
     address: u64,
 
-    /// Optional SQLite database path for constraint lookups
+    /// Optional binary database path for constraint lookups
     #[arg(short, long)]
     database: Option<PathBuf>,
 }
@@ -82,7 +81,7 @@ struct CommandPdb {
     #[arg(short = 'e', long = "exe", required = true, num_args = 1..)]
     exe_paths: Vec<PathBuf>,
 
-    /// SQLite database path
+    /// Binary database path
     #[arg(short = 'd', long = "database", required = true)]
     database: PathBuf,
 }
@@ -98,7 +97,7 @@ struct CommandException {
     #[arg(short = 'o', long, default_value_t = OutputFormat::Text, value_enum)]
     format: OutputFormat,
 
-    /// Optional SQLite database path for GUID lookups
+    /// Optional binary database path for GUID lookups
     #[arg(long = "database")]
     database: Option<PathBuf>,
 
@@ -314,6 +313,7 @@ fn command_pdb(
     use indicatif::{MultiProgress, ProgressBar};
     use pdb_analyzer::PdbAnalyzer;
     use std::fs;
+    use std::io::BufWriter;
 
     // Expand directories to find EXE files with PDB files
     let mut expanded_exe_paths = Vec::new();
@@ -365,49 +365,15 @@ fn command_pdb(
     );
     let exe_paths = expanded_exe_paths;
 
-    use rusqlite::{Connection, params};
     use std::sync::{Arc, Mutex};
 
-    // Open database connection
-    let conn = Connection::open(&database)?;
-
-    // Set pragmas for better performance
-    conn.execute_batch(
-        "PRAGMA synchronous = OFF;
-         PRAGMA journal_mode = MEMORY;
-         PRAGMA temp_store = MEMORY;
-         PRAGMA cache_size = 1000000;
-         PRAGMA temp_store = MEMORY;
-         PRAGMA mmap_size = 30000000000;
-         PRAGMA foreign_keys = OFF;",
-    )?;
-
-    // Create string table if it doesn't exist
-    conn.execute(
-        "CREATE TABLE strings (
-            id INTEGER PRIMARY KEY,
-            value TEXT UNIQUE NOT NULL
-        )",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE TABLE unique_constraints (
-            guid_function BLOB NOT NULL,
-            guid_constraint BLOB NOT NULL,
-            id_function_name INTEGER NOT NULL,
-            PRIMARY KEY (guid_function, guid_constraint),
-            FOREIGN KEY (id_function_name) REFERENCES strings(id)
-        )",
-        [],
-    )?;
-
     // Create string cache for fast lookups
-    let string_cache: HashMap<String, i64> = HashMap::new();
+    let strings: Vec<String> = Vec::new();
+    let string_to_index: HashMap<String, u64> = HashMap::new();
 
-    // Wrap connection and cache in Arc<Mutex> for thread-safe access
-    let conn = Arc::new(Mutex::new(conn));
-    let string_cache = Arc::new(Mutex::new(string_cache));
+    // Wrap in Arc<Mutex> for thread-safe access
+    let strings = Arc::new(Mutex::new(strings));
+    let string_to_index = Arc::new(Mutex::new(string_to_index));
 
     // Create multi-progress for parallel progress bars
     let multi_progress = MultiProgress::new();
@@ -420,7 +386,7 @@ fn command_pdb(
 
     // Shared data structure for building unique constraints
     let constraint_to_names: Arc<
-        Mutex<HashMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<i64>>>>,
+        Mutex<HashMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>>,
     > = Default::default();
 
     // Process executables sequentially to avoid OOM
@@ -435,41 +401,28 @@ fn command_pdb(
             let function_guids =
                 analyzer.compute_function_guids_with_progress(Some(multi_progress.clone()))?;
 
-            // Insert all records in a single transaction
-            let mut conn = conn.lock().unwrap();
-            let mut cache = string_cache.lock().unwrap();
-            let tx = conn.transaction()?;
+            // Helper function to get or insert string
+            let get_or_insert_string = |strings: &mut Vec<String>,
+                                        string_to_index: &mut HashMap<String, u64>,
+                                        value: &str|
+             -> u64 {
+                if let Some(&idx) = string_to_index.get(value) {
+                    return idx;
+                }
+
+                let idx = strings.len() as u64;
+                strings.push(value.to_string());
+                string_to_index.insert(value.to_string(), idx);
+                idx
+            };
+
             {
-                // Helper function to get or insert string
-                let get_or_insert_string = |tx: &rusqlite::Transaction,
-                                            cache: &mut HashMap<String, i64>,
-                                            value: &str|
-                 -> Result<i64> {
-                    if let Some(&id) = cache.get(value) {
-                        return Ok(id);
-                    }
+                let mut strings = strings.lock().unwrap();
+                let mut string_to_index = string_to_index.lock().unwrap();
 
-                    // Try to find existing string
-                    let id = match tx.query_row(
-                        "SELECT id FROM strings WHERE value = ?1",
-                        params![value],
-                        |row| row.get(0),
-                    ) {
-                        Ok(id) => id,
-                        Err(rusqlite::Error::QueryReturnedNoRows) => {
-                            // Insert new string
-                            tx.execute("INSERT INTO strings (value) VALUES (?1)", params![value])?;
-                            tx.last_insert_rowid()
-                        }
-                        Err(e) => return Err(e.into()),
-                    };
-
-                    cache.insert(value.to_string(), id);
-                    Ok(id)
-                };
-
-                function_guids.iter().try_for_each(|func| -> Result<()> {
-                    let function_name_id = get_or_insert_string(&tx, &mut cache, &func.name)?;
+                function_guids.iter().for_each(|func| {
+                    let function_name_id =
+                        get_or_insert_string(&mut strings, &mut string_to_index, &func.name);
 
                     // Insert constraints and build constraint_to_names mapping
                     let mut constraint_map = constraint_to_names_clone.lock().unwrap();
@@ -485,11 +438,8 @@ fn command_pdb(
                             .or_default()
                             .insert(function_name_id);
                     }
-
-                    Ok(())
-                })?;
+                });
             }
-            tx.commit()?;
             Ok(())
         })();
 
@@ -505,10 +455,9 @@ fn command_pdb(
         Ok(())
     };
 
-    // don't use par_iter to iterate games because we only need a couple threads
-    // will end up bound by sqlite insertion anyway
+    // Process executables using multiple threads
     std::thread::scope(|scope| -> Result<()> {
-        let num_threads = 4;
+        let num_threads = 8;
         let tasks: Vec<_> = exe_paths
             .chunks(exe_paths.len().div_ceil(num_threads))
             .map(|chunk| {
@@ -540,39 +489,33 @@ fn command_pdb(
 
     println!("Found {unique_constraints} unique constraints");
 
-    {
-        let mut conn = conn.lock().unwrap();
+    // Build the binary database structure
+    let strings = Arc::try_unwrap(strings).unwrap().into_inner().unwrap();
 
-        // Insert all unique constraints
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO unique_constraints (guid_function, guid_constraint, id_function_name) 
-                 VALUES (?1, ?2, ?3)",
-            )?;
-
-            let iter = constraint_map.iter().flat_map(|(f, c)| {
-                c.iter()
-                    .flat_map(|(c, n)| (n.len() == 1).then(|| (*f, *c, n.iter().next().unwrap())))
-            });
-            let pb = ProgressBar::new(unique_constraints as u64).with_style(progress_style());
-            for (guid_function, guid_constraint, id_function_name) in iter.progress_with(pb) {
-                stmt.execute(params![guid_function, guid_constraint, id_function_name])?;
+    // Convert to the format expected by BinaryDatabaseWriter
+    let mut functions_data = BTreeMap::new();
+    for (func_guid, constraints) in constraint_map.iter() {
+        let mut func_constraints = BTreeMap::new();
+        for (constraint_guid, name_ids) in constraints {
+            if name_ids.len() == 1 {
+                let name_id = *name_ids.iter().next().unwrap();
+                func_constraints.insert(*constraint_guid, name_id);
             }
         }
-        tx.commit()?;
-
-        println!("Creating indexes");
-
-        conn.execute(
-            "CREATE INDEX idx_unique_constraints_function_constraint_name ON unique_constraints(guid_function, guid_constraint, id_function_name)",
-            [],
-        )?;
-
-        println!(
-            "Successfully inserted {unique_constraints} unique constraints into the table"
-        );
+        if !func_constraints.is_empty() {
+            functions_data.insert(*func_guid, func_constraints);
+        }
     }
+
+    println!("Writing binary database...");
+
+    {
+        let file = fs::File::create(&database)?;
+        let mut writer = BufWriter::new(file);
+        let db_writer = binary_format::BinaryDatabaseWriter::new(&functions_data, &strings);
+        db_writer.write(&mut writer)?;
+    }
+    println!("Successfully wrote {unique_constraints} unique constraints to binary database");
 
     println!("\nSummary:");
     println!("========");
@@ -594,20 +537,19 @@ fn command_exception(
 
     println!("Found {} functions in exception directory", functions.len());
 
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-        | rusqlite::OpenFlags::SQLITE_OPEN_URI
-        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-
-    let conn = if let Some(db_path) = &database {
-        Some(Connection::open_with_flags(db_path, flags)?)
+    let db_data = if let Some(db_path) = &database {
+        let file = std::fs::File::open(db_path)?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Some(mmap)
     } else {
         None
     };
 
     let mut results: Vec<FunctionResult> = Vec::new();
 
-    struct DbContext {
-        cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, i64>>,
+    struct DbContext<'a> {
+        binary_db: binary_format::BinaryDatabase<'a>,
+        cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, String>>,
     }
 
     let new_pb = |len, msg| {
@@ -679,31 +621,28 @@ fn command_exception(
         analyzed_functions.len()
     );
 
-    let db_context = if let Some(database) = &database {
+    let db_context = if let Some(ref db_data) = db_data {
+        let binary_db = binary_format::BinaryDatabase::new(db_data)?;
         let pb = new_pb(function_guids.len() as u64, "Querying function GUIDs");
-        let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, i64>> =
+
+        let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, String>> =
             function_guids
                 .par_iter()
                 .progress_with(pb)
-                .map_init(
-                    || Connection::open_with_flags(database, flags).unwrap(),
-                    |conn, guid| -> Result<_> {
-                        let mut stmt = conn.prepare(
-                            "SELECT guid_constraint, id_function_name
-                            FROM unique_constraints
-                            WHERE guid_function = ?1",
-                        )?;
-                        let res = stmt
-                            .query_map(params![guid], |row| Ok((row.get(0)?, row.get(1)?)))?
-                            .collect::<rusqlite::Result<HashMap<ConstraintGuid, i64>>>()?;
-                        Ok((*guid, res))
-                    },
-                )
+                .map(|guid| -> Result<_> {
+                    let constraints = binary_db.query_constraints_for_function(guid)?;
+                    let constraint_map: HashMap<ConstraintGuid, String> = constraints
+                        .into_iter()
+                        .map(|(c_guid, name)| (c_guid, name.to_string()))
+                        .collect();
+                    Ok((*guid, constraint_map))
+                })
                 .collect::<Result<_>>()?;
 
         println!("Found {} constraint guids", cache_unique_constraints.len());
 
         Some(DbContext {
+            binary_db,
             cache_unique_constraints,
         })
     } else {
@@ -756,13 +695,8 @@ fn command_exception(
                     query_constraints.iter().find_map(|c| constraints.get(c))
                 });
 
-                if let Some(name_id) = unique_match {
-                    let func_name = conn.as_ref().unwrap().query_row(
-                        "SELECT value FROM strings WHERE id = ?1",
-                        params![name_id],
-                        |row| row.get::<_, String>(0),
-                    )?;
-                    new_matches.push((func.address, func_name));
+                if let Some(func_name) = unique_match {
+                    new_matches.push((func.address, func_name.clone()));
                 }
             }
         }
@@ -863,212 +797,4 @@ fn progress_style() -> ProgressStyle {
         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) {msg}")
         .unwrap()
         .progress_chars("#>-")
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_query() -> Result<()> {
-        use rusqlite::Connection;
-        let conn = Connection::open("new_giga.db")?;
-
-        // let mut stmt = conn.prepare(
-        //     "
-        // SELECT
-        //     COUNT(DISTINCT f.id_function_name) as unique_count,
-        //     MIN(f.id_function_name) as name_id
-        // FROM functions f
-        // WHERE f.guid_function = '7286f2ec-31c4-5743-8061-3e87c3310b6b'
-        // AND EXISTS (
-        //     SELECT 1 FROM constraints c
-        //     WHERE c.id_function = f.id_function
-        //     AND c.guid_constraint = '85438e2f-3853-57ab-9bdd-b1f9e256a220'
-        // );
-        // ",
-        // )?;
-
-        let mut stmt = conn.prepare(
-            "SELECT
-                COUNT(DISTINCT f.id_function_name) as unique_count,
-                MIN(f.id_function_name) as name_id
-            FROM functions f
-            WHERE f.guid_function = ?1 
-            AND EXISTS (
-                SELECT 1 FROM constraints c 
-                WHERE c.id_function = f.id_function 
-                AND c.guid_constraint = ?2
-            )",
-        )?;
-
-        // time.busy=5.36s
-        // Looking up function 4910ea65-c576-55a3-b6df-b070c4c701f2
-        //  with constraint 31f6cc3a-d351-51c8-96b2-3fc57391f8a6
-
-        // let row_result = stmt.query_row(params![guid.to_string()], |row| {
-        let row_result = stmt.query_row(
-            params![
-                "4910ea65-c576-55a3-b6df-b070c4c701f2",
-                "31f6cc3a-d351-51c8-96b2-3fc57391f8a6"
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?, // total_count
-                    row.get::<_, i64>(1)?, // unique_count
-                ))
-            },
-        )?;
-
-        dbg!(row_result);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_unique_constraint_query() -> Result<()> {
-        use rusqlite::Connection;
-        use std::collections::HashMap;
-
-        let mut conn = Connection::open("erm.db")?;
-
-        conn.execute_batch(
-            "PRAGMA synchronous = OFF;
-             PRAGMA journal_mode = MEMORY;
-             PRAGMA temp_store = MEMORY;
-             PRAGMA cache_size = 1000000;
-             PRAGMA temp_store = MEMORY;
-             PRAGMA mmap_size = 30000000000;
-             PRAGMA foreign_keys = OFF;",
-        )?;
-
-        let unique_constraints = {
-            // Step 1: Fetch all functions (id_function -> (guid_function, id_function_name))
-            println!("fetching functions");
-            let mut functions_stmt =
-                conn.prepare("SELECT id_function, guid_function, id_function_name FROM functions")?;
-
-            let mut function_info: HashMap<i64, (FunctionGuid, i64)> = HashMap::new();
-            let function_rows = functions_stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, FunctionGuid>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?;
-
-            for row in function_rows {
-                let (id_function, guid_function, id_function_name) = row?;
-                function_info.insert(id_function, (guid_function, id_function_name));
-            }
-
-            println!("Loaded {} functions", function_info.len());
-
-            // Step 2: Fetch all constraints
-            println!("fetching constraints");
-            let mut constraints_stmt =
-                conn.prepare("SELECT id_function, guid_constraint FROM constraints")?;
-
-            // Group by (function_guid, constraint_guid) and collect unique function names
-            let mut constraint_to_names: HashMap<(FunctionGuid, ConstraintGuid), HashSet<i64>> =
-                HashMap::new();
-
-            let constraint_rows = constraints_stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, ConstraintGuid>(1)?))
-            })?;
-
-            let mut constraint_count = 0;
-            let pb = ProgressBar::new(conn.query_row(
-                "SELECT COUNT(guid_constraint) FROM constraints",
-                [],
-                |row| row.get(0),
-            )?)
-            .with_style(progress_style());
-            for row in constraint_rows.progress_with(pb) {
-                let (id_function, guid_constraint) = row?;
-                constraint_count += 1;
-
-                // Join: look up the function guid and name for this function id
-                if let Some(&(guid_function, id_function_name)) = function_info.get(&id_function) {
-                    constraint_to_names
-                        .entry((guid_function, guid_constraint))
-                        .or_default()
-                        .insert(id_function_name);
-                }
-            }
-
-            println!("Processed {} constraints", constraint_count);
-
-            // Step 3: Filter to only (function_guid, constraint_guid) pairs that have exactly one unique function name
-            let unique_constraints: Vec<(FunctionGuid, ConstraintGuid, i64)> = constraint_to_names
-                .into_iter()
-                .filter_map(|((guid_function, constraint_guid), name_ids)| {
-                    if name_ids.len() == 1 {
-                        Some((
-                            guid_function,
-                            constraint_guid,
-                            *name_ids.iter().next().unwrap(),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            unique_constraints
-        };
-
-        println!("Found {} unique constraints", unique_constraints.len());
-        for (guid_function, constraint_guid, function_name_id) in unique_constraints.iter().take(10)
-        {
-            println!(
-                "Function: {:?}, Constraint: {:?}, Function Name ID: {}",
-                guid_function, constraint_guid, function_name_id
-            );
-        }
-
-        // Step 4: Create table and insert results
-        println!("Creating unique_constraints table and inserting results...");
-
-        // Create the table if it doesn't exist
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS unique_constraints (
-                guid_function BLOB NOT NULL,
-                guid_constraint BLOB NOT NULL,
-                id_function_name INTEGER NOT NULL,
-                PRIMARY KEY (guid_function, guid_constraint),
-                FOREIGN KEY (id_function_name) REFERENCES strings(id)
-            )",
-            [],
-        )?;
-
-        // Insert all unique constraints
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO unique_constraints (guid_function, guid_constraint, id_function_name) 
-                 VALUES (?1, ?2, ?3)",
-            )?;
-
-            let pb = ProgressBar::new(unique_constraints.len() as u64).with_style(progress_style());
-            for (guid_function, constraint_guid, function_name_id) in
-                unique_constraints.iter().progress_with(pb)
-            {
-                stmt.execute(params![guid_function, constraint_guid, function_name_id])?;
-            }
-        }
-        tx.commit()?;
-
-        println!(
-            "Successfully inserted {} unique constraints into the table",
-            unique_constraints.len()
-        );
-
-        conn.execute(
-            "CREATE INDEX idx_unique_constraints ON unique_constraints(guid_function, guid_constraint, id_function_name)",
-            [],
-        )?;
-
-        Ok(())
-    }
 }

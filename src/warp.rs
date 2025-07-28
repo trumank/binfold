@@ -43,18 +43,6 @@ macro_rules! new_guid {
                 self.0.fmt(f)
             }
         }
-        impl rusqlite::ToSql for $name {
-            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-                self.0.to_sql()
-            }
-        }
-        impl rusqlite::types::FromSql for $name {
-            fn column_result(
-                value: rusqlite::types::ValueRef<'_>,
-            ) -> rusqlite::types::FromSqlResult<Self> {
-                rusqlite::types::FromSql::column_result(value).map(Self)
-            }
-        }
     };
 }
 

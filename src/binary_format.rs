@@ -5,6 +5,31 @@ use std::collections::BTreeMap;
 use std::io::{self, Seek, SeekFrom, Write};
 use uuid::Uuid;
 
+// header
+// [8 bytes] magic
+// [file offset of strings section]
+// [file offset of constraints section]
+// [file offset of functions section]
+
+// strings section
+// [4 bytes] number of strings
+// [4 bytes] String length
+// [N bytes] UTF-8 string data
+// ...
+
+// constraints section
+// [4 bytes] number of constraints
+// [16 bytes] ConstraintGUID
+// [4 bytes] byte offset into strings section
+// ...
+
+// functions section
+// [4 bytes] number of functions
+// [16 bytes] FunctionGUID
+// [4 bytes] index of constraints
+// [4 bytes] number of constraints
+// ...
+
 const MAGIC: &[u8; 8] = b"WARPBIN\0";
 
 const CONSTRAINT_SIZE: usize = 16 + 4;
@@ -24,7 +49,6 @@ pub struct Header {
 
 impl<'a> BinaryDatabase<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self> {
-        // Verify magic
         if data.len() < 32 {
             bail!("File too small");
         }
@@ -136,42 +160,36 @@ impl<'a> BinaryDatabaseWriter<'a> {
 
         // Write strings section and record offsets as we go
         let strings_offset = writer.stream_position()?;
-        writer.write_u32::<LE>(self.strings.len() as u32)?;
+        writer.write_u32::<LE>(self.strings.len().try_into().unwrap())?;
 
         let mut string_offsets = Vec::with_capacity(self.strings.len());
         let mut offset = 4;
         for string in self.strings {
             string_offsets.push(offset);
-            writer.write_u32::<LE>(string.len() as u32)?;
+            writer.write_u32::<LE>(string.len().try_into().unwrap())?;
             writer.write_all(string.as_bytes())?;
             offset += 4 + string.len() as u32;
         }
 
-        // Collect all constraints in order
-        let mut all_constraints = Vec::new();
-        for constraints in self.functions.values() {
-            for (constraint_guid, string_idx) in constraints {
-                all_constraints.push((constraint_guid, *string_idx as usize));
-            }
-        }
-
         // Write constraints section
         let constraints_offset = writer.stream_position()?;
-        writer.write_u32::<LE>(all_constraints.len() as u32)?;
-        for (guid, string_idx) in &all_constraints {
-            writer.write_all(guid.0.as_bytes())?;
-            writer.write_u32::<LE>(string_offsets[*string_idx])?;
+        let all_constraints: usize = self.functions.values().map(|c| c.len()).sum();
+        writer.write_u32::<LE>(all_constraints.try_into().unwrap())?;
+        for f in self.functions.values() {
+            for (guid, string_idx) in f {
+                writer.write_all(guid.0.as_bytes())?;
+                writer.write_u32::<LE>(string_offsets[*string_idx as usize])?;
+            }
         }
 
         // Write functions section
         let functions_offset = writer.stream_position()?;
-        writer.write_u32::<LE>(self.functions.len() as u32)?;
-
+        writer.write_u32::<LE>(self.functions.len().try_into().unwrap())?;
         let mut constraint_index = 0;
         for (func_guid, constraints) in self.functions {
             writer.write_all(func_guid.0.as_bytes())?;
             writer.write_u32::<LE>(constraint_index)?;
-            writer.write_u32::<LE>(constraints.len() as u32)?;
+            writer.write_u32::<LE>(constraints.len().try_into().unwrap())?;
             constraint_index += constraints.len() as u32;
         }
 
@@ -211,7 +229,6 @@ mod tests {
         writer
             .write(&mut std::io::Cursor::new(&mut buffer))
             .unwrap();
-        std::fs::write("bun.bin", &buffer).unwrap();
 
         let db = BinaryDatabase::new(&buffer).unwrap();
         let constraints = dbg!(db.query_constraints_for_function(&func_guid).unwrap());
