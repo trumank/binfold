@@ -1,16 +1,18 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use indicatif::{ParallelProgressIterator as _, ProgressBar, ProgressIterator as _, ProgressStyle};
+use indicatif::{ParallelProgressIterator as _, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod pe_loader;
 use pe_loader::PeLoader;
 
+use crate::binary_format::BinaryDatabase;
 use crate::warp::{ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints};
 mod binary_format;
 mod mmap_source;
@@ -537,10 +539,11 @@ fn command_exception(
 
     println!("Found {} functions in exception directory", functions.len());
 
+    let mut mmap = None;
     let db_data = if let Some(db_path) = &database {
         let file = std::fs::File::open(db_path)?;
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        Some(mmap)
+        mmap = Some(unsafe { memmap2::MmapOptions::new().map(&file)? });
+        Some(BinaryDatabase::new(mmap.as_ref().unwrap())?)
     } else {
         None
     };
@@ -548,8 +551,7 @@ fn command_exception(
     let mut results: Vec<FunctionResult> = Vec::new();
 
     struct DbContext<'a> {
-        binary_db: binary_format::BinaryDatabase<'a>,
-        cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, String>>,
+        cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, &'a str>>,
     }
 
     let new_pb = |len, msg| {
@@ -622,27 +624,21 @@ fn command_exception(
     );
 
     let db_context = if let Some(ref db_data) = db_data {
-        let binary_db = binary_format::BinaryDatabase::new(db_data)?;
         let pb = new_pb(function_guids.len() as u64, "Querying function GUIDs");
 
-        let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, String>> =
+        let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, &str>> =
             function_guids
                 .par_iter()
                 .progress_with(pb)
                 .map(|guid| -> Result<_> {
-                    let constraints = binary_db.query_constraints_for_function(guid)?;
-                    let constraint_map: HashMap<ConstraintGuid, String> = constraints
-                        .into_iter()
-                        .map(|(c_guid, name)| (c_guid, name.to_string()))
-                        .collect();
-                    Ok((*guid, constraint_map))
+                    let constraints = db_data.query_constraints_for_function(guid)?;
+                    Ok((*guid, constraints))
                 })
                 .collect::<Result<_>>()?;
 
         println!("Found {} constraint guids", cache_unique_constraints.len());
 
         Some(DbContext {
-            binary_db,
             cache_unique_constraints,
         })
     } else {
@@ -650,56 +646,63 @@ fn command_exception(
     };
 
     // Incrementally match functions
-    let mut matched_functions: HashMap<u64, String> = HashMap::new();
-    let mut unmatched_functions: Vec<&warp::Function> = analyzed_functions.iter().collect();
+    let mut matched_functions: HashMap<u64, &str> = HashMap::new();
+    let mut unmatched_functions: HashMap<u64, &warp::Function> =
+        analyzed_functions.iter().map(|f| (f.address, f)).collect();
 
     // Keep matching until no more matches are found
     loop {
-        let mut new_matches = Vec::new();
+        let new_matches: Arc<Mutex<Vec<(u64, &str)>>> = Default::default();
 
-        for func in &unmatched_functions {
-            // Add symbol-based constraints for already matched functions
-            let mut enhanced_constraints = func.constraints.clone();
+        unmatched_functions.par_iter().try_for_each(
+            |(_, func): (&u64, &&warp::Function)| -> Result<()> {
+                // Add symbol-based constraints for already matched functions
+                let mut enhanced_constraints = func.constraints.clone();
 
-            // Check if any of our calls have been matched - add symbol constraints
-            for call in &func.calls {
-                if let Some(target_name) = matched_functions.get(&call.target) {
-                    let target_symbol = warp::SymbolGuid::from_symbol(target_name);
-                    enhanced_constraints.push(warp::Constraint {
-                        guid: warp::ConstraintGuid::from_symbol_child_call(target_symbol),
-                        offset: Some(call.offset as i64),
-                    });
-                }
-            }
-
-            // Check if any functions that call us have been matched - add symbol parent constraints
-            if let Some(parent_calls) = callers.get(&func.address) {
-                for (parent_addr, offset) in parent_calls {
-                    if let Some(parent_name) = matched_functions.get(parent_addr) {
-                        let parent_symbol = warp::SymbolGuid::from_symbol(parent_name);
+                // Check if any of our calls have been matched - add symbol constraints
+                for call in &func.calls {
+                    if let Some(target_name) = matched_functions.get(&call.target) {
+                        let target_symbol = warp::SymbolGuid::from_symbol(target_name);
                         enhanced_constraints.push(warp::Constraint {
-                            guid: warp::ConstraintGuid::from_symbol_parent_call(parent_symbol),
-                            offset: Some(*offset as i64),
+                            guid: warp::ConstraintGuid::from_symbol_child_call(target_symbol),
+                            offset: Some(call.offset as i64),
                         });
                     }
                 }
-            }
 
-            // Try to match with enhanced constraints
-            if let Some(db_context) = &db_context {
-                let constraints = db_context.cache_unique_constraints.get(&func.guid).unwrap();
-
-                let unique_match = constraints.get(&ConstraintGuid::nil()).or_else(|| {
-                    let query_constraints: HashSet<ConstraintGuid> =
-                        enhanced_constraints.iter().map(|c| c.guid).collect();
-                    query_constraints.iter().find_map(|c| constraints.get(c))
-                });
-
-                if let Some(func_name) = unique_match {
-                    new_matches.push((func.address, func_name.clone()));
+                // Check if any functions that call us have been matched - add symbol parent constraints
+                if let Some(parent_calls) = callers.get(&func.address) {
+                    for (parent_addr, offset) in parent_calls {
+                        if let Some(parent_name) = matched_functions.get(parent_addr) {
+                            let parent_symbol = warp::SymbolGuid::from_symbol(parent_name);
+                            enhanced_constraints.push(warp::Constraint {
+                                guid: warp::ConstraintGuid::from_symbol_parent_call(parent_symbol),
+                                offset: Some(*offset as i64),
+                            });
+                        }
+                    }
                 }
-            }
-        }
+
+                // Try to match with enhanced constraints
+                if let Some(db_context) = &db_context {
+                    let constraints = db_context.cache_unique_constraints.get(&func.guid).unwrap();
+
+                    let unique_match = constraints.get(&ConstraintGuid::nil()).or_else(|| {
+                        let query_constraints: HashSet<ConstraintGuid> =
+                            enhanced_constraints.iter().map(|c| c.guid).collect();
+                        query_constraints.iter().find_map(|c| constraints.get(c))
+                    });
+
+                    if let Some(func_name) = unique_match {
+                        let mut lock = new_matches.lock().unwrap();
+                        lock.push((func.address, func_name));
+                    }
+                }
+                Ok(())
+            },
+        )?;
+
+        let new_matches = new_matches.lock().unwrap();
 
         // If no new matches found, we're done
         if new_matches.is_empty() {
@@ -708,9 +711,9 @@ fn command_exception(
 
         // Add new matches and remove from unmatched list
         let new_match_count = new_matches.len();
-        for (addr, name) in new_matches {
-            matched_functions.insert(addr, name);
-            unmatched_functions.retain(|f| f.address != addr);
+        for (addr, name) in &*new_matches {
+            matched_functions.insert(*addr, name);
+            unmatched_functions.remove(addr);
         }
 
         println!(
@@ -729,7 +732,7 @@ fn command_exception(
             if let Some(func_name) = matched_functions.get(&func.address) {
                 let text = format!(" [Match: {func_name}]");
                 let match_info = MatchInfo {
-                    unique_name: func_name.clone(),
+                    unique_name: func_name.to_string(),
                 };
                 (text, Some(match_info))
             } else {

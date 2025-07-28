@@ -1,7 +1,7 @@
 use crate::warp::{ConstraintGuid, FunctionGuid};
 use anyhow::{Result, bail};
 use byteorder::{LE, WriteBytesExt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Seek, SeekFrom, Write};
 use uuid::Uuid;
 
@@ -78,7 +78,7 @@ impl<'a> BinaryDatabase<'a> {
     pub fn query_constraints_for_function(
         &self,
         function_guid: &FunctionGuid,
-    ) -> Result<Vec<(ConstraintGuid, &str)>> {
+    ) -> Result<HashMap<ConstraintGuid, &str>> {
         // Find the function in the functions section using binary search
         let functions_start = self.header.functions_offset as usize;
         let num_functions = self.u32_at(functions_start) as usize;
@@ -108,12 +108,12 @@ impl<'a> BinaryDatabase<'a> {
 
         let (constraint_index, num_constraints) = match found_function {
             Some(f) => f,
-            None => return Ok(vec![]),
+            None => return Ok(Default::default()),
         };
 
         // Read constraints
         let constraints_start = self.header.constraints_offset as usize + 4;
-        let mut constraints = Vec::with_capacity(num_constraints);
+        let mut constraints = HashMap::with_capacity(num_constraints);
 
         // Skip to the right constraint index
         let constraint_offset = constraints_start + (constraint_index * CONSTRAINT_SIZE);
@@ -125,7 +125,7 @@ impl<'a> BinaryDatabase<'a> {
 
             // Read the string
             let string = self.read_string_at_offset(string_offset)?;
-            constraints.push((constraint_guid, string));
+            constraints.insert(constraint_guid, string);
         }
 
         Ok(constraints)
@@ -234,9 +234,7 @@ mod tests {
         let constraints = dbg!(db.query_constraints_for_function(&func_guid).unwrap());
 
         assert_eq!(constraints.len(), 2);
-        assert_eq!(constraints[0].0, constraint1);
-        assert_eq!(constraints[0].1, "test_value_1");
-        assert_eq!(constraints[1].0, constraint2);
-        assert_eq!(constraints[1].1, "test_value_2");
+        assert_eq!(constraints[&constraint1], "test_value_1");
+        assert_eq!(constraints[&constraint2], "test_value_2");
     }
 }
