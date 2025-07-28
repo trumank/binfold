@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar};
 use pdb::{FallibleIterator, PDB, SymbolData};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -7,6 +7,7 @@ use std::path::Path;
 
 use crate::mmap_source::MmapSource;
 use crate::pe_loader::PeLoader;
+use crate::progress_style;
 use crate::warp::{
     Constraint, ConstraintGuid, FunctionCall, FunctionGuid, SymbolGuid,
     compute_function_guid_with_contraints,
@@ -64,52 +65,34 @@ impl PdbAnalyzer {
     ) -> Result<Vec<FunctionInfo>> {
         let address_map = self.pdb.address_map()?;
 
-        // Create progress bar for collection phase
-        let collection_pb = ProgressBar::new_spinner().with_style(
-            ProgressStyle::default_spinner()
-                .template(&format!(
-                    "{{spinner:.green}} [{{elapsed_precise}}] Collecting procedures from PDB for {}...",
-                    self.exe_name
-                ))
-                .unwrap(),
-        );
-        collection_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-        if let Some(multi) = &progress_bar {
-            multi.insert_from_back(1, collection_pb.clone());
-        };
-
-        let mut procedures = Vec::new();
-
-        // Collect all procedures in a single pass
-        // Collect global symbols
-        let symbol_table = self.pdb.global_symbols()?;
-        let mut symbols = symbol_table.iter();
-        while let Some(symbol) = symbols.next()? {
-            if let Ok(SymbolData::Procedure(proc)) = symbol.parse()
-                && let Some(rva) = proc.offset.to_rva(&address_map)
-            {
-                procedures.push(ProcedureData {
-                    name: proc.name.to_string().to_string(),
-                    rva: rva.0,
-                    len: proc.len,
-                });
+        enum SymbolsProducer<'a> {
+            Global(pdb::SymbolTable<'a>),
+            Module(pdb::ModuleInfo<'a>),
+        }
+        impl<'a> SymbolsProducer<'a> {
+            fn symbols(&self) -> Result<pdb::SymbolIter<'_>, pdb::Error> {
+                match self {
+                    SymbolsProducer::Global(s) => Ok(s.iter()),
+                    SymbolsProducer::Module(s) => s.symbols(),
+                }
             }
         }
 
-        // Collect all modules first
+        // Collect global symbols
+        let mut symbol_producers = vec![SymbolsProducer::Global(self.pdb.global_symbols()?)];
+
+        // Collect modules
         let dbi = self.pdb.debug_information()?;
-        let mut modules_vec = Vec::new();
         let mut modules = dbi.modules()?;
         while let Some(module) = modules.next()? {
             if let Ok(Some(module_info)) = self.pdb.module_info(&module) {
-                modules_vec.push(module_info);
+                symbol_producers.push(SymbolsProducer::Module(module_info));
             }
         }
 
-        // Process modules in parallel to collect their symbols
-        let module_procedures: Vec<Vec<ProcedureData>> = modules_vec
+        let procedures: Vec<_> = symbol_producers
             .par_iter()
-            .filter_map(|module_info| {
+            .map(|module_info| {
                 let mut module_procs = Vec::new();
                 if let Ok(mut module_symbols) = module_info.symbols() {
                     while let Ok(Some(symbol)) = module_symbols.next() {
@@ -124,34 +107,28 @@ impl PdbAnalyzer {
                         }
                     }
                 }
-                Some(module_procs)
+                module_procs
             })
             .collect();
 
-        // Extend procedures with all module procedures
-        for module_procs in module_procedures {
-            procedures.extend(module_procs);
-        }
+        let binned_procs: HashMap<u64, Vec<&ProcedureData>> =
+            procedures
+                .iter()
+                .flatten()
+                .fold(Default::default(), |mut acc, item| {
+                    acc.entry(item.rva as u64 + self.pe_loader.image_base)
+                        .or_default()
+                        .push(item);
+                    acc
+                });
 
         // Now create/update progress bar for analysis phase
-        let pb = ProgressBar::new(procedures.len() as u64).with_style(
-                        ProgressStyle::default_bar()
-                            .template(&format!("{{spinner:.green}} [{{elapsed_precise}}] [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{per_sec}}, {{eta}}) {}", self.exe_name))
-                            .expect("Failed to set progress style")
-                            .progress_chars("#>-"));
+        let pb = ProgressBar::new(binned_procs.len() as u64)
+            .with_style(progress_style())
+            .with_message(self.exe_name.clone());
         if let Some(multi) = &progress_bar {
-            collection_pb.disable_steady_tick();
-            multi.remove(&collection_pb);
             multi.insert_from_back(1, pb.clone());
         }
-
-        let binned_procs: HashMap<u64, Vec<&ProcedureData>> =
-            procedures.iter().fold(Default::default(), |mut acc, item| {
-                acc.entry(item.rva as u64 + self.pe_loader.image_base)
-                    .or_default()
-                    .push(item);
-                acc
-            });
 
         // Process procedures in parallel
         // TODO figure out how to handle multiple names for single address

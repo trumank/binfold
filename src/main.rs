@@ -477,12 +477,9 @@ fn command_pdb(
     // Create multi-progress for parallel progress bars
     let multi_progress = MultiProgress::new();
 
-    let pb = ProgressBar::new(exe_paths.len() as u64).with_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) Processing executables")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
+    let pb = ProgressBar::new(exe_paths.len() as u64)
+        .with_style(progress_style())
+        .with_message("Processing executables");
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     multi_progress.add(pb.clone());
 
@@ -678,12 +675,9 @@ fn command_exception(
     }
 
     let new_pb = |len, msg| {
-        ProgressBar::new(len).with_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) {msg}")
-                .unwrap()
-                .progress_chars("#>-"),
-        ).with_message(msg)
+        ProgressBar::new(len)
+            .with_style(progress_style())
+            .with_message(msg)
     };
 
     let recurse = true;
@@ -1000,6 +994,13 @@ fn command_exception(
         );
     }
     Ok(())
+}
+
+fn progress_style() -> ProgressStyle {
+    ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) {msg}")
+        .unwrap()
+        .progress_chars("#>-")
 }
 
 #[cfg(test)]
