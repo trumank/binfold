@@ -13,6 +13,7 @@ mod pe_loader;
 use pe_loader::PeLoader;
 
 use crate::warp::{ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints};
+mod binary_format;
 mod mmap_source;
 mod pdb_analyzer;
 mod pdb_writer;
