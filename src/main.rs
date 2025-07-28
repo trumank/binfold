@@ -20,11 +20,7 @@ mod warp;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MatchInfo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    unique_name: Option<String>,
-    total_matches: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    unique_count: Option<i64>,
+    unique_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -370,11 +366,6 @@ fn command_pdb(
 
     use rusqlite::{Connection, params};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // some inspection queries
-    // SELECT function_guids.id, printf('0x%x', address), guid, COUNT(*) AS constraint_count, (SELECT COUNT(*) FROM function_guids a WHERE a.guid = function_guids.guid) AS name_count, (SELECT value FROM strings WHERE id = function_name_id) FROM function_guids LEFT JOIN constraints ON constraints.function_guid_id = function_guids.id GROUP BY function_guid_id HAVING constraint_count > 5 AND name_count > 5 order BY COUNT(*) DESC;
-    // SELECT guid, (SELECT value FROM strings WHERE id = function_name_id), group_concat(constraints.constraint_guid) from function_guids join constraints on constraints.function_guid_id = function_guids.id where guid = 'd3bc46e6-2d2f-508b-9da1-87925e0211b8' group by function_name_id;
 
     // Open database connection
     let conn = Connection::open(&database)?;
@@ -392,79 +383,23 @@ fn command_pdb(
 
     // Create string table if it doesn't exist
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS strings (
+        "CREATE TABLE strings (
             id INTEGER PRIMARY KEY,
             value TEXT UNIQUE NOT NULL
         )",
         [],
     )?;
 
-    // Create table if it doesn't exist (with integer references to strings)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS functions (
-            id_function INTEGER PRIMARY KEY,
-            address INTEGER NOT NULL,
+        "CREATE TABLE unique_constraints (
             guid_function BLOB NOT NULL,
-            timestamp INTEGER NOT NULL,
-            id_exe_name INTEGER NOT NULL,
+            guid_constraint BLOB NOT NULL,
             id_function_name INTEGER NOT NULL,
-            FOREIGN KEY (id_exe_name) REFERENCES strings(id),
+            PRIMARY KEY (guid_function, guid_constraint),
             FOREIGN KEY (id_function_name) REFERENCES strings(id)
         )",
         [],
     )?;
-
-    // Create constraints table
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS constraints (
-            id_constraint INTEGER PRIMARY KEY,
-            id_function INTEGER NOT NULL,
-            guid_constraint BLOB NOT NULL,
-            offset INTEGER,
-            FOREIGN KEY (id_function) REFERENCES functions(id_function) ON DELETE CASCADE
-        )",
-        [],
-    )?;
-
-    // Create indices for fast lookups
-    // conn.execute(
-    //     "CREATE INDEX IF NOT EXISTS idx_functions_guid ON functions(guid_function)",
-    //     [],
-    // )?;
-    // conn.execute(
-    //     "CREATE INDEX IF NOT EXISTS idx_functions_guid_fname ON functions(guid_function, id_function_name)",
-    //     [],
-    // )?;
-    // conn.execute(
-    //     "CREATE INDEX IF NOT EXISTS idx_functions_addr_exe ON functions(address, id_exe_name)",
-    //     [],
-    // )?;
-    // conn.execute(
-    //     "CREATE INDEX IF NOT EXISTS idx_strings_value ON strings(value)",
-    //     [],
-    // )?;
-
-    // // Create indices for constraints table
-    // conn.execute(
-    //     "CREATE INDEX IF NOT EXISTS idx_constraints_id_function ON constraints(id_function)",
-    //     [],
-    // )?;
-    // conn.execute(
-    //     "CREATE INDEX IF NOT EXISTS idx_constraints_guid ON constraints(guid_constraint)",
-    //     [],
-    // )?;
-    // conn.execute(
-    //     "CREATE INDEX IF NOT EXISTS idx_constraints_guid_offset ON constraints(guid_constraint, offset)",
-    //     [],
-    // )?;
-    // conn.execute(
-    //     "CREATE INDEX IF NOT EXISTS idx_constraints_function_constraint ON constraints(id_function, guid_constraint)",
-    //     [],
-    // )?;
-    // conn.execute(
-    //     "CREATE INDEX IF NOT EXISTS idx_constraints_constraint_function ON constraints(guid_constraint, id_function)",
-    //     [],
-    // )?;
 
     // Create string cache for fast lookups
     let string_cache: HashMap<String, i64> = HashMap::new();
@@ -482,28 +417,22 @@ fn command_pdb(
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     multi_progress.add(pb.clone());
 
-    // Get current unix timestamp
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    // Shared data structure for building unique constraints
+    let constraint_to_names: Arc<
+        Mutex<HashMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<i64>>>>,
+    > = Default::default();
 
     // Process executables sequentially to avoid OOM
+    let constraint_to_names_clone = constraint_to_names.clone();
     let process = |exe_path: &PathBuf| -> Result<()> {
         // Derive PDB path for this exe
         let pdb_path_for_exe = exe_path.with_extension("pdb");
 
         // Process this exe/pdb pair
         let result = (|| -> Result<()> {
-            let mut analyzer = PdbAnalyzer::new(&exe_path, &pdb_path_for_exe)?;
+            let mut analyzer = PdbAnalyzer::new(exe_path, &pdb_path_for_exe)?;
             let function_guids =
                 analyzer.compute_function_guids_with_progress(Some(multi_progress.clone()))?;
-
-            // Get just the exe filename
-            let exe_name = exe_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
 
             // Insert all records in a single transaction
             let mut conn = conn.lock().unwrap();
@@ -538,51 +467,26 @@ fn command_pdb(
                     Ok(id)
                 };
 
-                // Get exe_name_id once for this executable
-                let exe_name_id = get_or_insert_string(&tx, &mut cache, exe_name)?;
+                function_guids.iter().try_for_each(|func| -> Result<()> {
+                    let function_name_id = get_or_insert_string(&tx, &mut cache, &func.name)?;
 
-                let mut stmt = tx.prepare(
-                    "INSERT INTO functions (address, guid_function, id_exe_name, id_function_name, timestamp)
-                     VALUES (?1, ?2, ?3, ?4, ?5)"
-                )?;
+                    // Insert constraints and build constraint_to_names mapping
+                    let mut constraint_map = constraint_to_names_clone.lock().unwrap();
+                    for constraint in [ConstraintGuid::nil()]
+                        .into_iter()
+                        .chain(func.constraints.iter().map(|c| c.guid))
+                    {
+                        // Update constraint_to_names for unique constraint calculation
+                        constraint_map
+                            .entry(func.guid)
+                            .or_default()
+                            .entry(constraint)
+                            .or_default()
+                            .insert(function_name_id);
+                    }
 
-                let mut constraint_stmt = tx.prepare(
-                    "INSERT INTO constraints (id_function, guid_constraint, offset)
-                     VALUES (?1, ?2, ?3)",
-                )?;
-
-                let pb = ProgressBar::new(function_guids.len() as u64)
-                    .with_style(progress_style())
-                    .with_message("Inserting functions");
-                multi_progress.insert_from_back(1, pb.clone());
-
-                function_guids
-                    .iter()
-                    .progress_with(pb)
-                    .try_for_each(|func| -> Result<()> {
-                        let function_name_id = get_or_insert_string(&tx, &mut cache, &func.name)?;
-
-                        // Insert new record
-                        stmt.execute(params![
-                            func.address as i64,
-                            func.guid,
-                            exe_name_id,
-                            function_name_id,
-                            timestamp
-                        ])?;
-                        let function_guid_id = tx.last_insert_rowid();
-
-                        // Insert constraints
-                        for constraint in &func.constraints {
-                            constraint_stmt.execute(params![
-                                function_guid_id,
-                                constraint.guid,
-                                constraint.offset
-                            ])?;
-                        }
-
-                        Ok(())
-                    })?;
+                    Ok(())
+                })?;
             }
             tx.commit()?;
             Ok(())
@@ -605,7 +509,7 @@ fn command_pdb(
     std::thread::scope(|scope| -> Result<()> {
         let num_threads = 4;
         let tasks: Vec<_> = exe_paths
-            .chunks((exe_paths.len() + num_threads - 1) / num_threads)
+            .chunks(exe_paths.len().div_ceil(num_threads))
             .map(|chunk| {
                 scope.spawn(move || -> Result<()> {
                     for path in chunk {
@@ -623,6 +527,51 @@ fn command_pdb(
 
     pb.finish();
     multi_progress.clear().unwrap();
+
+    // Process unique constraints
+    println!("\nProcessing unique constraints...");
+    let constraint_map = constraint_to_names.lock().unwrap();
+
+    let unique_constraints: usize = constraint_map
+        .values()
+        .map(|c| c.values().filter(|n| n.len() == 1).count())
+        .sum();
+
+    println!("Found {unique_constraints} unique constraints");
+
+    {
+        let mut conn = conn.lock().unwrap();
+
+        // Insert all unique constraints
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO unique_constraints (guid_function, guid_constraint, id_function_name) 
+                 VALUES (?1, ?2, ?3)",
+            )?;
+
+            let iter = constraint_map.iter().flat_map(|(f, c)| {
+                c.iter()
+                    .flat_map(|(c, n)| (n.len() == 1).then(|| (*f, *c, n.iter().next().unwrap())))
+            });
+            let pb = ProgressBar::new(unique_constraints as u64).with_style(progress_style());
+            for (guid_function, guid_constraint, id_function_name) in iter.progress_with(pb) {
+                stmt.execute(params![guid_function, guid_constraint, id_function_name])?;
+            }
+        }
+        tx.commit()?;
+
+        println!("Creating indexes");
+
+        conn.execute(
+            "CREATE INDEX idx_unique_constraints_function_constraint_name ON unique_constraints(guid_function, guid_constraint, id_function_name)",
+            [],
+        )?;
+
+        println!(
+            "Successfully inserted {unique_constraints} unique constraints into the table"
+        );
+    }
 
     println!("\nSummary:");
     println!("========");
@@ -656,24 +605,7 @@ fn command_exception(
 
     let mut results: Vec<FunctionResult> = Vec::new();
 
-    #[derive(Debug)]
-    struct FunctionGuidCounts {
-        total: i64,
-        unique: i64,
-        name: Option<String>,
-    }
-    impl FunctionGuidCounts {
-        fn map(row: &rusqlite::Row) -> rusqlite::Result<Self> {
-            Ok(Self {
-                total: row.get(0)?,  // total_count
-                unique: row.get(1)?, // unique_count
-                name: row.get(2)?,   // unique_function_name
-            })
-        }
-    }
-
     struct DbContext {
-        cache_guid_lookups: HashMap<FunctionGuid, FunctionGuidCounts>,
         cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, i64>>,
     }
 
@@ -748,48 +680,8 @@ fn command_exception(
 
     let db_context = if let Some(database) = &database {
         let pb = new_pb(function_guids.len() as u64, "Querying function GUIDs");
-        let cache_guid_lookups = function_guids
-            .par_iter()
-            .progress_with(pb)
-            .map_init(
-                || Connection::open_with_flags(database, flags).unwrap(),
-                |conn, guid| {
-                    let mut stmt = conn.prepare(
-                        "SELECT
-                            COUNT(*) as total_count,
-                            COUNT(DISTINCT id_function_name) as unique_count,
-                            CASE
-                                WHEN COUNT(DISTINCT id_function_name) = 1
-                                THEN (SELECT value FROM strings WHERE id = id_function_name LIMIT 1)
-                                ELSE NULL
-                            END as unique_function_name
-                        FROM functions
-                        WHERE guid_function = ?1",
-                    )?;
-
-                    let result = stmt.query_row(params![guid], FunctionGuidCounts::map)?;
-                    Ok((*guid, result))
-                },
-            )
-            .collect::<Result<HashMap<FunctionGuid, FunctionGuidCounts>>>()?;
-        println!("Found {} unique guids", cache_guid_lookups.len());
-
-        let to_find_constraints: HashSet<FunctionGuid> = function_guids
-            .iter()
-            .copied()
-            .filter(|guid| {
-                cache_guid_lookups
-                    .get(guid)
-                    .is_some_and(|lookup| lookup.name.is_none())
-            })
-            .collect();
-
-        let pb = new_pb(
-            to_find_constraints.len() as u64,
-            "Querying function constraints",
-        );
         let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, i64>> =
-            to_find_constraints
+            function_guids
                 .par_iter()
                 .progress_with(pb)
                 .map_init(
@@ -811,7 +703,6 @@ fn command_exception(
         println!("Found {} constraint guids", cache_unique_constraints.len());
 
         Some(DbContext {
-            cache_guid_lookups,
             cache_unique_constraints,
         })
     } else {
@@ -856,38 +747,21 @@ fn command_exception(
 
             // Try to match with enhanced constraints
             if let Some(db_context) = &db_context {
-                let query_constraints: HashSet<ConstraintGuid> =
-                    enhanced_constraints.iter().map(|c| c.guid).collect();
+                let constraints = db_context.cache_unique_constraints.get(&func.guid).unwrap();
 
-                let FunctionGuidCounts {
-                    total,
-                    unique,
-                    name,
-                } = db_context.cache_guid_lookups.get(&func.guid).unwrap();
+                let unique_match = constraints.get(&ConstraintGuid::nil()).or_else(|| {
+                    let query_constraints: HashSet<ConstraintGuid> =
+                        enhanced_constraints.iter().map(|c| c.guid).collect();
+                    query_constraints.iter().find_map(|c| constraints.get(c))
+                });
 
-                match name {
-                    Some(func_name) => {
-                        // Unique match by GUID alone
-                        new_matches.push((func.address, func_name.clone()));
-                    }
-                    None => {
-                        // Multiple unique names for this GUID - try constraint matching
-                        let constraints_map =
-                            db_context.cache_unique_constraints.get(&func.guid).unwrap();
-
-                        let unique_match = query_constraints
-                            .iter()
-                            .find_map(|c| constraints_map.get(c));
-
-                        if let Some(name_id) = unique_match {
-                            let func_name = conn.as_ref().unwrap().query_row(
-                                "SELECT value FROM strings WHERE id = ?1",
-                                params![name_id],
-                                |row| row.get::<_, String>(0),
-                            )?;
-                            new_matches.push((func.address, func_name));
-                        }
-                    }
+                if let Some(name_id) = unique_match {
+                    let func_name = conn.as_ref().unwrap().query_row(
+                        "SELECT value FROM strings WHERE id = ?1",
+                        params![name_id],
+                        |row| row.get::<_, String>(0),
+                    )?;
+                    new_matches.push((func.address, func_name));
                 }
             }
         }
@@ -920,24 +794,7 @@ fn command_exception(
             if let Some(func_name) = matched_functions.get(&func.address) {
                 let text = format!(" [Match: {func_name}]");
                 let match_info = MatchInfo {
-                    unique_name: Some(func_name.clone()),
-                    total_matches: 1,
-                    unique_count: None,
-                };
-                (text, Some(match_info))
-            } else if let Some(db_context) = &db_context {
-                // For unmatched functions, show ambiguity info
-                let FunctionGuidCounts {
-                    total,
-                    unique,
-                    name: _,
-                } = db_context.cache_guid_lookups.get(&func.guid).unwrap();
-
-                let text = format!(" [{total} matches across {unique} unique names]");
-                let match_info = MatchInfo {
-                    unique_name: None,
-                    total_matches: *total,
-                    unique_count: Some(*unique),
+                    unique_name: func_name.clone(),
                 };
                 (text, Some(match_info))
             } else {
@@ -973,19 +830,15 @@ fn command_exception(
         // Build function info list from results
         let mut pdb_functions = Vec::new();
 
-        for result in &results {
+        for result in results {
             let address = parse_hex(&result.address).unwrap_or(0);
             let size = result.size as u32;
 
-            if let Some(name) = result
-                .match_info
-                .as_ref()
-                .and_then(|mi| mi.unique_name.clone())
-            {
+            if let Some(info) = result.match_info {
                 pdb_functions.push(pdb_writer::FunctionInfo {
                     address,
                     size,
-                    name,
+                    name: info.unique_name,
                 });
             }
         }
@@ -1138,7 +991,7 @@ mod test {
                 if let Some(&(guid_function, id_function_name)) = function_info.get(&id_function) {
                     constraint_to_names
                         .entry((guid_function, guid_constraint))
-                        .or_insert_with(HashSet::new)
+                        .or_default()
                         .insert(id_function_name);
                 }
             }
@@ -1188,9 +1041,6 @@ mod test {
             [],
         )?;
 
-        // Clear any existing data
-        conn.execute("DELETE FROM unique_constraints", [])?;
-
         // Insert all unique constraints
         let tx = conn.transaction()?;
         {
@@ -1213,15 +1063,8 @@ mod test {
             unique_constraints.len()
         );
 
-        // Create indices for fast lookups
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_unique_constraints_function 
-             ON unique_constraints(guid_function)",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_unique_constraints_constraint 
-             ON unique_constraints(guid_constraint)",
+            "CREATE INDEX idx_unique_constraints ON unique_constraints(guid_function, guid_constraint, id_function_name)",
             [],
         )?;
 
