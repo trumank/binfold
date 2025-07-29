@@ -18,7 +18,7 @@ cargo build --release
 
 ### 1a. Download a pre-generated database
 
-See [databases](https://github.com/trumank/binfold/releases/tag/databases) for pre-generated databases (currently only Unreal Engine).
+- [Unreal Engine](https://drive.google.com/file/d/18rWfF7MobqxTc8NQzZOoMzZxuxiTUHAv/view)
 
 ### 1b. Generate your own
 
