@@ -9,30 +9,36 @@ use uuid::Uuid;
 // [8 bytes] magic
 // [file offset of strings section]
 // [file offset of constraints section]
+// [file offset of function constraints section]
 // [file offset of functions section]
-
+//
 // strings section
 // [4 bytes] number of strings
-// [4 bytes] String length
-// [N bytes] UTF-8 string data
-// ...
-
+// for each:
+//   [4 bytes] String length
+//   [N bytes] UTF-8 string data
+//
 // constraints section
 // [4 bytes] number of constraints
-// [16 bytes] ConstraintGUID
-// [4 bytes] byte offset into strings section
-// ...
-
+// for each:
+//   [16 bytes] ConstraintGUID
+//
+// function constraints section
+// [4 bytes] number of constraints
+// for each:
+//   [4 bytes] index of constraint
+//   [4 bytes] byte offset into strings section
+//
 // functions section
 // [4 bytes] number of functions
-// [16 bytes] FunctionGUID
-// [4 bytes] index of constraints
-// [4 bytes] number of constraints
-// ...
+// for each:
+//   [16 bytes] FunctionGUID
+//   [4 bytes] index of constraints
+//   [4 bytes] number of constraints
 
 const MAGIC: &[u8; 8] = b"BINFOLD\0";
 
-const CONSTRAINT_SIZE: usize = 16 + 4;
+const CONSTRAINT_SIZE: usize = 4 + 4;
 const FUNCTION_SIZE: usize = 16 + 4 + 4;
 
 pub struct Db<'a> {
@@ -44,6 +50,7 @@ pub struct Db<'a> {
 pub struct Header {
     pub strings_offset: u64,
     pub constraints_offset: u64,
+    pub function_constraints_offset: u64,
     pub functions_offset: u64,
 }
 
@@ -59,7 +66,8 @@ impl<'a> Db<'a> {
         let header = Header {
             strings_offset: u64::from_le_bytes(data[8..16].try_into().unwrap()),
             constraints_offset: u64::from_le_bytes(data[16..24].try_into().unwrap()),
-            functions_offset: u64::from_le_bytes(data[24..32].try_into().unwrap()),
+            function_constraints_offset: u64::from_le_bytes(data[24..32].try_into().unwrap()),
+            functions_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
         };
 
         Ok(Db { data, header })
@@ -112,7 +120,7 @@ impl<'a> Db<'a> {
         };
 
         // Read constraints
-        let constraints_start = self.header.constraints_offset as usize + 4;
+        let constraints_start = self.header.function_constraints_offset as usize + 4;
         let mut constraints = HashMap::with_capacity(num_constraints);
 
         // Skip to the right constraint index
@@ -120,8 +128,11 @@ impl<'a> Db<'a> {
 
         for i in 0..num_constraints {
             let offset = constraint_offset + (i * CONSTRAINT_SIZE);
-            let constraint_guid = ConstraintGuid(self.uuid_at(offset));
-            let string_offset = self.u32_at(offset + 16);
+            let constraint_index = self.u32_at(offset) as usize;
+            let constraint_guid = ConstraintGuid(
+                self.uuid_at(self.header.constraints_offset as usize + 4 + constraint_index * 16),
+            );
+            let string_offset = self.u32_at(offset + 4);
 
             // Read the string
             let string = self.read_string_at_offset(string_offset)?;
@@ -156,6 +167,7 @@ impl<'a> DbWriter<'a> {
         writer.write_all(MAGIC)?;
         writer.write_u64::<LE>(0)?; // strings_offset placeholder
         writer.write_u64::<LE>(0)?; // constraints_offset placeholder
+        writer.write_u64::<LE>(0)?; // function_constraints_offset placeholder
         writer.write_u64::<LE>(0)?; // functions_offset placeholder
 
         // Write strings section and record offsets as we go
@@ -173,11 +185,28 @@ impl<'a> DbWriter<'a> {
 
         // Write constraints section
         let constraints_offset = writer.stream_position()?;
+        let mut constraints_map: HashMap<&ConstraintGuid, u32> = Default::default();
+        let mut constraints_vec: Vec<&ConstraintGuid> = Default::default();
+        for f in self.functions.values() {
+            for guid in f.keys() {
+                constraints_map.entry(guid).or_insert_with(|| {
+                    constraints_vec.push(guid);
+                    (constraints_vec.len() - 1).try_into().unwrap()
+                });
+            }
+        }
+        writer.write_u32::<LE>(constraints_vec.len().try_into().unwrap())?;
+        for guid in constraints_vec {
+            writer.write_all(guid.0.as_bytes())?;
+        }
+
+        // Write function constraints section
+        let function_constraints_offset = writer.stream_position()?;
         let all_constraints: usize = self.functions.values().map(|c| c.len()).sum();
         writer.write_u32::<LE>(all_constraints.try_into().unwrap())?;
         for f in self.functions.values() {
             for (guid, string_idx) in f {
-                writer.write_all(guid.0.as_bytes())?;
+                writer.write_u32::<LE>(constraints_map[guid])?;
                 writer.write_u32::<LE>(string_offsets[*string_idx as usize])?;
             }
         }
@@ -197,6 +226,7 @@ impl<'a> DbWriter<'a> {
         writer.seek(SeekFrom::Start(8))?;
         writer.write_u64::<LE>(strings_offset)?;
         writer.write_u64::<LE>(constraints_offset)?;
+        writer.write_u64::<LE>(function_constraints_offset)?;
         writer.write_u64::<LE>(functions_offset)?;
 
         Ok(())
