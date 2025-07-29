@@ -102,6 +102,49 @@ impl<'a> Db<'a> {
         u32::from_le_bytes(self.slice_at(offset, 4).try_into().unwrap())
     }
 
+    pub fn iter_constraints<'db>(
+        &'db self,
+        function_guid: &FunctionGuid,
+    ) -> ConstraintIterator<'db, 'a> {
+        // Find the function in the functions section using binary search
+        let functions_start = self.header.functions_offset as usize;
+        let num_functions = self.u32_at(functions_start) as usize;
+
+        // Binary search for the function
+        let mut left = 0;
+        let mut right = num_functions;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let function_offset = functions_start + 4 + (mid * FUNCTION_SIZE);
+
+            let current_guid = FunctionGuid(self.uuid_at(function_offset));
+
+            match current_guid.cmp(function_guid) {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Greater => right = mid,
+                std::cmp::Ordering::Equal => {
+                    let constraint_index = self.u32_at(function_offset + 16) as usize;
+                    let num_constraints = self.u32_at(function_offset + 20) as usize;
+
+                    return ConstraintIterator {
+                        db: self,
+                        constraint_index,
+                        current: 0,
+                        total: num_constraints,
+                    };
+                }
+            }
+        }
+
+        ConstraintIterator {
+            db: self,
+            constraint_index: 0,
+            current: 0,
+            total: 0,
+        }
+    }
+
     pub fn query_constraints_for_function(
         &self,
         function_guid: &FunctionGuid,
@@ -286,12 +329,72 @@ impl<'a> DbWriter<'a> {
     }
 }
 
+pub struct ConstraintIterator<'db, 'a> {
+    db: &'db Db<'a>,
+    constraint_index: usize,
+    current: usize,
+    total: usize,
+}
+
+pub struct ConstraintInfo<'db, 'a> {
+    pub guid: ConstraintGuid,
+    pub symbol_count: usize,
+    string_index: usize,
+    db: &'db Db<'a>,
+}
+
+impl<'db, 'a> ConstraintInfo<'db, 'a> {
+    pub fn symbols(&self) -> Result<Vec<&'a str>> {
+        let constraint_strings_start = self.db.header.constraint_strings_offset as usize + 4;
+        let mut strings = Vec::with_capacity(self.symbol_count);
+
+        for j in 0..self.symbol_count {
+            let offset =
+                constraint_strings_start + (self.string_index + j) * CONSTRAINT_STRINGS_SIZE;
+            let offset = self.db.u32_at(offset);
+            strings.push(self.db.read_string_at_offset(offset)?);
+        }
+
+        Ok(strings)
+    }
+}
+
+impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
+    type Item = ConstraintInfo<'db, 'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.total {
+            return None;
+        }
+
+        let constraints_start = self.db.header.function_constraints_offset as usize + 4;
+        let offset = constraints_start
+            + ((self.constraint_index + self.current) * FUNCTION_CONSTRAINTS_SIZE);
+
+        let constraint_index = self.db.u32_at(offset) as usize;
+        let constraint_guid = ConstraintGuid(
+            self.db
+                .uuid_at(self.db.header.constraints_offset as usize + 4 + constraint_index * 16),
+        );
+        let string_count = self.db.u32_at(offset + 4) as usize;
+        let string_index = self.db.u32_at(offset + 8) as usize;
+
+        self.current += 1;
+
+        Some(ConstraintInfo {
+            guid: constraint_guid,
+            symbol_count: string_count,
+            string_index,
+            db: self.db,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_write_and_read() {
+    fn test_db() -> Vec<u8> {
         let func_guid = FunctionGuid(Uuid::from_bytes([b'A'; 16]));
         let constraint1 = ConstraintGuid(Uuid::from_bytes([b'B'; 16]));
         let constraint2 = ConstraintGuid(Uuid::from_bytes([b'C'; 16]));
@@ -311,24 +414,58 @@ mod tests {
 
         let writer = DbWriter::new(&functions, &strings);
 
-        // Write to a buffer
         let mut buffer = vec![];
         writer
             .write(&mut std::io::Cursor::new(&mut buffer))
             .unwrap();
-        std::fs::write("buh.fold", &buffer).unwrap();
+        buffer
+    }
+
+    #[test]
+    fn test_write_and_read() {
+        let func_guid = FunctionGuid(Uuid::from_bytes([b'A'; 16]));
+        let constraint1 = ConstraintGuid(Uuid::from_bytes([b'B'; 16]));
+        let constraint2 = ConstraintGuid(Uuid::from_bytes([b'C'; 16]));
+
+        let buffer = test_db();
 
         let db = Db::new(&buffer).unwrap();
         let constraints = db.query_constraints_for_function(&func_guid).unwrap();
 
+        use std::collections::HashSet;
+
         assert_eq!(constraints.len(), 2);
         assert_eq!(
-            constraints[&constraint1],
-            vec!["test_value_1", "test_value_3"]
+            HashSet::<&&str>::from_iter(constraints[&constraint1].iter()),
+            HashSet::from_iter(["test_value_1", "test_value_3"].iter())
         );
         assert_eq!(
-            constraints[&constraint2],
-            vec!["test_value_1", "test_value_2"]
+            HashSet::<&&str>::from_iter(constraints[&constraint2].iter()),
+            HashSet::from_iter(["test_value_1", "test_value_2"].iter())
         );
+    }
+
+    #[test]
+    fn test_direct_constraint_iterator() {
+        let func_guid1 = FunctionGuid(Uuid::from_bytes([b'A'; 16]));
+        let func_guid2 = FunctionGuid(Uuid::from_bytes([b'D'; 16]));
+
+        let buffer = test_db();
+
+        let db = Db::new(&buffer).unwrap();
+
+        // Test direct constraint iterator lookup
+        let mut iter = db.iter_constraints(&func_guid1);
+
+        let c1 = iter.next().unwrap();
+        assert_eq!(c1.symbol_count, 2);
+
+        let c2 = iter.next().unwrap();
+        assert_eq!(c2.symbol_count, 2);
+
+        assert!(iter.next().is_none());
+
+        // Test non-existent function
+        assert_eq!(0, db.iter_constraints(&func_guid2).count());
     }
 }

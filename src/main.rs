@@ -413,14 +413,12 @@ fn command_analyze(
                 .par_iter()
                 .progress_with(pb)
                 .map(|guid| -> Result<_> {
-                    let constraints = db.query_constraints_for_function(guid)?;
-                    let constraints = constraints
-                        .into_iter()
-                        .filter_map(|(key, value)| match value.as_slice() {
-                            [one] => Some((key, *one)),
-                            _ => None,
+                    let constraints = db
+                        .iter_constraints(guid)
+                        .filter_map(|c| -> Option<Result<(ConstraintGuid, &str)>> {
+                            (c.symbol_count == 1).then(|| c.symbols().map(|s| (c.guid, s[0])))
                         })
-                        .collect();
+                        .collect::<Result<HashMap<ConstraintGuid, &str>>>()?;
                     Ok((*guid, constraints))
                 })
                 .collect::<Result<_>>()?;
