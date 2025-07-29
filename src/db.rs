@@ -1,7 +1,7 @@
 use crate::warp::{ConstraintGuid, FunctionGuid};
 use anyhow::{Result, bail};
 use byteorder::{LE, WriteBytesExt};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Seek, SeekFrom, Write};
 use uuid::Uuid;
 
@@ -9,36 +9,46 @@ use uuid::Uuid;
 // [8 bytes] magic
 // [file offset of strings section]
 // [file offset of constraints section]
+// [file offset of constraint strings section]
 // [file offset of function constraints section]
 // [file offset of functions section]
 //
 // strings section
-// [4 bytes] number of strings
+// [4 bytes] count
 // for each:
 //   [4 bytes] String length
 //   [N bytes] UTF-8 string data
 //
 // constraints section
-// [4 bytes] number of constraints
+// [4 bytes] count
 // for each:
 //   [16 bytes] ConstraintGUID
 //
-// function constraints section
-// [4 bytes] number of constraints
+// constraint strings section
+// [4 bytes] count
 // for each:
-//   [4 bytes] index of constraint
 //   [4 bytes] byte offset into strings section
 //
+// function constraints section
+// [4 bytes] count
+// for each:
+//   [4 bytes] index of constraint
+//   [4 bytes] number of strings
+//   [4 bytes] index of constraint strings
+//
 // functions section
-// [4 bytes] number of functions
+// [4 bytes] count
 // for each:
 //   [16 bytes] FunctionGUID
 //   [4 bytes] index of constraints
 //   [4 bytes] number of constraints
 
-const MAGIC: &[u8; 8] = b"BINFOLD\0";
+const MAGIC: &[u8; 7] = b"BINFOLD";
+const VERSION: u8 = 1;
 
-const CONSTRAINT_SIZE: usize = 4 + 4;
+const CONSTRAINTS_SIZE: usize = 16;
+const CONSTRAINT_STRINGS_SIZE: usize = 4;
+const FUNCTION_CONSTRAINTS_SIZE: usize = 4 + 4 + 4;
 const FUNCTION_SIZE: usize = 16 + 4 + 4;
 
 pub struct Db<'a> {
@@ -50,6 +60,7 @@ pub struct Db<'a> {
 pub struct Header {
     pub strings_offset: u64,
     pub constraints_offset: u64,
+    pub constraint_strings_offset: u64,
     pub function_constraints_offset: u64,
     pub functions_offset: u64,
 }
@@ -59,15 +70,23 @@ impl<'a> Db<'a> {
         if data.len() < 32 {
             bail!("File too small");
         }
-        if &data[0..8] != MAGIC {
+        if &data[0..7] != MAGIC {
             bail!("Invalid magic");
+        }
+        let version = data[7];
+        if version < VERSION {
+            bail!("Database version {version} too old");
+        }
+        if version > VERSION {
+            bail!("Database version {version} too new");
         }
 
         let header = Header {
             strings_offset: u64::from_le_bytes(data[8..16].try_into().unwrap()),
             constraints_offset: u64::from_le_bytes(data[16..24].try_into().unwrap()),
-            function_constraints_offset: u64::from_le_bytes(data[24..32].try_into().unwrap()),
-            functions_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
+            constraint_strings_offset: u64::from_le_bytes(data[24..32].try_into().unwrap()),
+            function_constraints_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
+            functions_offset: u64::from_le_bytes(data[40..48].try_into().unwrap()),
         };
 
         Ok(Db { data, header })
@@ -86,7 +105,7 @@ impl<'a> Db<'a> {
     pub fn query_constraints_for_function(
         &self,
         function_guid: &FunctionGuid,
-    ) -> Result<HashMap<ConstraintGuid, &'a str>> {
+    ) -> Result<HashMap<ConstraintGuid, Vec<&'a str>>> {
         // Find the function in the functions section using binary search
         let functions_start = self.header.functions_offset as usize;
         let num_functions = self.u32_at(functions_start) as usize;
@@ -124,19 +143,27 @@ impl<'a> Db<'a> {
         let mut constraints = HashMap::with_capacity(num_constraints);
 
         // Skip to the right constraint index
-        let constraint_offset = constraints_start + (constraint_index * CONSTRAINT_SIZE);
+        let constraint_offset = constraints_start + (constraint_index * FUNCTION_CONSTRAINTS_SIZE);
 
         for i in 0..num_constraints {
-            let offset = constraint_offset + (i * CONSTRAINT_SIZE);
+            let offset = constraint_offset + (i * FUNCTION_CONSTRAINTS_SIZE);
             let constraint_index = self.u32_at(offset) as usize;
             let constraint_guid = ConstraintGuid(
                 self.uuid_at(self.header.constraints_offset as usize + 4 + constraint_index * 16),
             );
-            let string_offset = self.u32_at(offset + 4);
+            let string_count = self.u32_at(offset + 4) as usize;
+            let string_index = self.u32_at(offset + 8) as usize;
 
-            // Read the string
-            let string = self.read_string_at_offset(string_offset)?;
-            constraints.insert(constraint_guid, string);
+            let constraint_strings_start = self.header.constraint_strings_offset as usize + 4;
+            let mut strings = vec![];
+            for j in 0..string_count {
+                let offset =
+                    constraint_strings_start + (string_index + j) * CONSTRAINT_STRINGS_SIZE;
+                let offset = self.u32_at(offset);
+                strings.push(self.read_string_at_offset(offset)?);
+            }
+
+            constraints.insert(constraint_guid, strings);
         }
 
         Ok(constraints)
@@ -150,13 +177,13 @@ impl<'a> Db<'a> {
 }
 
 pub struct DbWriter<'a> {
-    functions: &'a BTreeMap<FunctionGuid, BTreeMap<ConstraintGuid, u64>>,
+    functions: &'a BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>,
     strings: &'a Vec<String>,
 }
 
 impl<'a> DbWriter<'a> {
     pub fn new(
-        functions: &'a BTreeMap<FunctionGuid, BTreeMap<ConstraintGuid, u64>>,
+        functions: &'a BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>,
         strings: &'a Vec<String>,
     ) -> Self {
         DbWriter { functions, strings }
@@ -165,8 +192,10 @@ impl<'a> DbWriter<'a> {
     pub fn write<W: Write + Seek>(&self, writer: &mut W) -> io::Result<()> {
         // Write header with placeholder offsets
         writer.write_all(MAGIC)?;
+        writer.write_u8(VERSION)?;
         writer.write_u64::<LE>(0)?; // strings_offset placeholder
         writer.write_u64::<LE>(0)?; // constraints_offset placeholder
+        writer.write_u64::<LE>(0)?; // constraint_strings_offset placeholder
         writer.write_u64::<LE>(0)?; // function_constraints_offset placeholder
         writer.write_u64::<LE>(0)?; // functions_offset placeholder
 
@@ -200,14 +229,37 @@ impl<'a> DbWriter<'a> {
             writer.write_all(guid.0.as_bytes())?;
         }
 
+        // Write constraint strings section
+        let constraint_strings_offset = writer.stream_position()?;
+        let all_constraint_strings: usize = self
+            .functions
+            .values()
+            .map(|c| c.values().map(|s| s.len()).sum::<usize>())
+            .sum();
+        writer.write_u32::<LE>(all_constraint_strings.try_into().unwrap())?;
+        let mut constraint_string_indexes = vec![];
+        let mut index = 0;
+        for f in self.functions.values() {
+            for strings in f.values() {
+                constraint_string_indexes.push(index);
+                for string_idx in strings {
+                    writer.write_u32::<LE>(string_offsets[*string_idx as usize])?;
+                    index += 1;
+                }
+            }
+        }
+
         // Write function constraints section
         let function_constraints_offset = writer.stream_position()?;
         let all_constraints: usize = self.functions.values().map(|c| c.len()).sum();
         writer.write_u32::<LE>(all_constraints.try_into().unwrap())?;
+        let mut constraint_index = 0;
         for f in self.functions.values() {
-            for (guid, string_idx) in f {
+            for (guid, strings) in f {
                 writer.write_u32::<LE>(constraints_map[guid])?;
-                writer.write_u32::<LE>(string_offsets[*string_idx as usize])?;
+                writer.write_u32::<LE>(strings.len().try_into().unwrap())?;
+                writer.write_u32::<LE>(constraint_string_indexes[constraint_index])?;
+                constraint_index += 1;
             }
         }
 
@@ -226,6 +278,7 @@ impl<'a> DbWriter<'a> {
         writer.seek(SeekFrom::Start(8))?;
         writer.write_u64::<LE>(strings_offset)?;
         writer.write_u64::<LE>(constraints_offset)?;
+        writer.write_u64::<LE>(constraint_strings_offset)?;
         writer.write_u64::<LE>(function_constraints_offset)?;
         writer.write_u64::<LE>(functions_offset)?;
 
@@ -243,11 +296,15 @@ mod tests {
         let constraint1 = ConstraintGuid(Uuid::from_bytes([b'B'; 16]));
         let constraint2 = ConstraintGuid(Uuid::from_bytes([b'C'; 16]));
 
-        let strings = vec!["test_value_1".to_string(), "test_value_2".to_string()];
+        let strings = vec![
+            "test_value_1".to_string(),
+            "test_value_2".to_string(),
+            "test_value_3".to_string(),
+        ];
 
-        let mut constraints = BTreeMap::new();
-        constraints.insert(constraint1, 0u64); // index 0 in strings
-        constraints.insert(constraint2, 1u64); // index 1 in strings
+        let mut constraints = HashMap::new();
+        constraints.insert(constraint1, HashSet::from([0, 2]));
+        constraints.insert(constraint2, HashSet::from([0, 1]));
 
         let mut functions = BTreeMap::new();
         functions.insert(func_guid, constraints);
@@ -259,12 +316,19 @@ mod tests {
         writer
             .write(&mut std::io::Cursor::new(&mut buffer))
             .unwrap();
+        std::fs::write("buh.fold", &buffer).unwrap();
 
         let db = Db::new(&buffer).unwrap();
-        let constraints = dbg!(db.query_constraints_for_function(&func_guid).unwrap());
+        let constraints = db.query_constraints_for_function(&func_guid).unwrap();
 
         assert_eq!(constraints.len(), 2);
-        assert_eq!(constraints[&constraint1], "test_value_1");
-        assert_eq!(constraints[&constraint2], "test_value_2");
+        assert_eq!(
+            constraints[&constraint1],
+            vec!["test_value_1", "test_value_3"]
+        );
+        assert_eq!(
+            constraints[&constraint2],
+            vec!["test_value_1", "test_value_2"]
+        );
     }
 }

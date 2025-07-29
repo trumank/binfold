@@ -186,7 +186,7 @@ fn command_gen_db(
 
     // Shared data structure for building unique constraints
     let constraint_to_names: Arc<
-        Mutex<HashMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>>,
+        Mutex<BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>>,
     > = Default::default();
 
     // Process executables sequentially to avoid OOM
@@ -292,27 +292,12 @@ fn command_gen_db(
     // Build the binary database structure
     let strings = Arc::try_unwrap(strings).unwrap().into_inner().unwrap();
 
-    // Convert to the format expected by BinaryDatabaseWriter
-    let mut functions_data = BTreeMap::new();
-    for (func_guid, constraints) in constraint_map.iter() {
-        let mut func_constraints = BTreeMap::new();
-        for (constraint_guid, name_ids) in constraints {
-            if name_ids.len() == 1 {
-                let name_id = *name_ids.iter().next().unwrap();
-                func_constraints.insert(*constraint_guid, name_id);
-            }
-        }
-        if !func_constraints.is_empty() {
-            functions_data.insert(*func_guid, func_constraints);
-        }
-    }
-
     println!("Writing binary database...");
 
     {
         let file = fs::File::create(&database)?;
         let mut writer = BufWriter::new(file);
-        let db_writer = DbWriter::new(&functions_data, &strings);
+        let db_writer = DbWriter::new(&constraint_map, &strings);
         db_writer.write(&mut writer)?;
     }
     println!("Successfully wrote {unique_constraints} unique constraints to binary database");
@@ -429,6 +414,13 @@ fn command_analyze(
                 .progress_with(pb)
                 .map(|guid| -> Result<_> {
                     let constraints = db.query_constraints_for_function(guid)?;
+                    let constraints = constraints
+                        .into_iter()
+                        .filter_map(|(key, value)| match value.as_slice() {
+                            [one] => Some((key, *one)),
+                            _ => None,
+                        })
+                        .collect();
                     Ok((*guid, constraints))
                 })
                 .collect::<Result<_>>()?;

@@ -455,7 +455,7 @@ impl PeLoader {
                                 unwind_offset + 4 + 2 * unwind_code_count as usize;
 
                             // Align to 4 bytes
-                            if chain_offset % 4 != 0 {
+                            if !chain_offset.is_multiple_of(4) {
                                 chain_offset += 2;
                             }
 
