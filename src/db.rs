@@ -30,12 +30,12 @@ use uuid::Uuid;
 // [4 bytes] number of constraints
 // ...
 
-const MAGIC: &[u8; 8] = b"WARPBIN\0";
+const MAGIC: &[u8; 8] = b"BINFOLD\0";
 
 const CONSTRAINT_SIZE: usize = 16 + 4;
 const FUNCTION_SIZE: usize = 16 + 4 + 4;
 
-pub struct BinaryDatabase<'a> {
+pub struct Db<'a> {
     data: &'a [u8],
     header: Header,
 }
@@ -47,7 +47,7 @@ pub struct Header {
     pub functions_offset: u64,
 }
 
-impl<'a> BinaryDatabase<'a> {
+impl<'a> Db<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.len() < 32 {
             bail!("File too small");
@@ -62,7 +62,7 @@ impl<'a> BinaryDatabase<'a> {
             functions_offset: u64::from_le_bytes(data[24..32].try_into().unwrap()),
         };
 
-        Ok(BinaryDatabase { data, header })
+        Ok(Db { data, header })
     }
 
     fn slice_at(&self, offset: usize, len: usize) -> &'a [u8] {
@@ -138,17 +138,17 @@ impl<'a> BinaryDatabase<'a> {
     }
 }
 
-pub struct BinaryDatabaseWriter<'a> {
+pub struct DbWriter<'a> {
     functions: &'a BTreeMap<FunctionGuid, BTreeMap<ConstraintGuid, u64>>,
     strings: &'a Vec<String>,
 }
 
-impl<'a> BinaryDatabaseWriter<'a> {
+impl<'a> DbWriter<'a> {
     pub fn new(
         functions: &'a BTreeMap<FunctionGuid, BTreeMap<ConstraintGuid, u64>>,
         strings: &'a Vec<String>,
     ) -> Self {
-        BinaryDatabaseWriter { functions, strings }
+        DbWriter { functions, strings }
     }
 
     pub fn write<W: Write + Seek>(&self, writer: &mut W) -> io::Result<()> {
@@ -222,7 +222,7 @@ mod tests {
         let mut functions = BTreeMap::new();
         functions.insert(func_guid, constraints);
 
-        let writer = BinaryDatabaseWriter::new(&functions, &strings);
+        let writer = DbWriter::new(&functions, &strings);
 
         // Write to a buffer
         let mut buffer = vec![];
@@ -230,7 +230,7 @@ mod tests {
             .write(&mut std::io::Cursor::new(&mut buffer))
             .unwrap();
 
-        let db = BinaryDatabase::new(&buffer).unwrap();
+        let db = Db::new(&buffer).unwrap();
         let constraints = dbg!(db.query_constraints_for_function(&func_guid).unwrap());
 
         assert_eq!(constraints.len(), 2);

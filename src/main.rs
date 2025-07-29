@@ -7,11 +7,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::binary_format::BinaryDatabase;
+use crate::db::{Db, DbWriter};
 use crate::pe_loader::PeLoader;
 use crate::warp::{ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints};
 
-mod binary_format;
+mod db;
 mod mmap_source;
 mod pdb_analyzer;
 mod pdb_writer;
@@ -312,7 +312,7 @@ fn command_gen_db(
     {
         let file = fs::File::create(&database)?;
         let mut writer = BufWriter::new(file);
-        let db_writer = binary_format::BinaryDatabaseWriter::new(&functions_data, &strings);
+        let db_writer = DbWriter::new(&functions_data, &strings);
         db_writer.write(&mut writer)?;
     }
     println!("Successfully wrote {unique_constraints} unique constraints to binary database");
@@ -346,7 +346,7 @@ fn command_analyze(
     let mut results: Vec<FunctionResult> = Vec::new();
 
     struct DbContext<'a> {
-        db: BinaryDatabase<'a>,
+        db: Db<'a>,
         cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, &'a str>>,
     }
 
@@ -420,7 +420,7 @@ fn command_analyze(
     );
 
     let db_context = if let Some(ref mmap) = mmap {
-        let db = BinaryDatabase::new(mmap)?;
+        let db = Db::new(mmap)?;
 
         let pb = new_pb(function_guids.len() as u64, "Loading function GUIDs");
         let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, &str>> =
