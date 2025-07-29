@@ -91,7 +91,7 @@ impl PdbAnalyzer {
         }
 
         let procedures: Vec<_> = symbol_producers
-            .par_iter()
+            .iter()
             .map(|module_info| {
                 let mut module_procs = Vec::new();
                 if let Ok(mut module_symbols) = module_info.symbols() {

@@ -65,7 +65,7 @@ impl<'a> BinaryDatabase<'a> {
         Ok(BinaryDatabase { data, header })
     }
 
-    fn slice_at(&self, offset: usize, len: usize) -> &[u8] {
+    fn slice_at(&self, offset: usize, len: usize) -> &'a [u8] {
         &self.data[offset..offset + len]
     }
     fn uuid_at(&self, offset: usize) -> Uuid {
@@ -78,7 +78,7 @@ impl<'a> BinaryDatabase<'a> {
     pub fn query_constraints_for_function(
         &self,
         function_guid: &FunctionGuid,
-    ) -> Result<HashMap<ConstraintGuid, &str>> {
+    ) -> Result<HashMap<ConstraintGuid, &'a str>> {
         // Find the function in the functions section using binary search
         let functions_start = self.header.functions_offset as usize;
         let num_functions = self.u32_at(functions_start) as usize;
@@ -131,7 +131,7 @@ impl<'a> BinaryDatabase<'a> {
         Ok(constraints)
     }
 
-    fn read_string_at_offset(&self, offset: u32) -> Result<&str> {
+    fn read_string_at_offset(&self, offset: u32) -> Result<&'a str> {
         let file_offset = self.header.strings_offset as usize + offset as usize;
         let len = self.u32_at(file_offset) as usize;
         Ok(str::from_utf8(self.slice_at(file_offset + 4, len))?)

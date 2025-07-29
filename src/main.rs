@@ -1,23 +1,22 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use indicatif::{ParallelProgressIterator as _, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-mod pe_loader;
-use pe_loader::PeLoader;
-
 use crate::binary_format::BinaryDatabase;
+use crate::pe_loader::PeLoader;
 use crate::warp::{ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints};
+
 mod binary_format;
 mod mmap_source;
 mod pdb_analyzer;
 mod pdb_writer;
+mod pe_loader;
 mod warp;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,14 +33,6 @@ struct FunctionResult {
     match_info: Option<MatchInfo>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum OutputFormat {
-    /// Plain text output
-    Text,
-    /// JSON output
-    Json,
-}
-
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -51,9 +42,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Pe(CommandPe),
-    Pdb(CommandPdb),
-    Exception(CommandException),
+    GenDb(CommandGenDb),
+    Analyze(CommandAnalyze),
 }
 
 /// Compute WARP UUID for a function in a PE file
@@ -78,7 +68,7 @@ struct CommandExample;
 
 /// Analyze PDB file and compute GUIDs for all functions
 #[derive(Parser)]
-struct CommandPdb {
+struct CommandGenDb {
     /// Paths to PE/EXE files (can specify multiple)
     #[arg(short = 'e', long = "exe", required = true, num_args = 1..)]
     exe_paths: Vec<PathBuf>,
@@ -90,14 +80,10 @@ struct CommandPdb {
 
 /// Compute GUIDs for functions from PE exception directory
 #[derive(Parser)]
-struct CommandException {
+struct CommandAnalyze {
     /// Path to the PE file
     #[arg(short, long)]
     file: PathBuf,
-
-    /// Output format
-    #[arg(short = 'o', long, default_value_t = OutputFormat::Text, value_enum)]
-    format: OutputFormat,
 
     /// Optional binary database path for GUID lookups
     #[arg(long = "database")]
@@ -135,182 +121,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Pe(cmd) => command_pe(cmd),
-        Commands::Pdb(cmd) => command_pdb(cmd),
-        Commands::Exception(cmd) => command_exception(cmd),
+        Commands::GenDb(cmd) => command_gen_db(cmd),
+        Commands::Analyze(cmd) => command_analyze(cmd),
     }
 }
 
-fn command_pe(
-    CommandPe {
-        file,
-        address,
-        database,
-    }: CommandPe,
-) -> Result<()> {
-    let pe = PeLoader::load(file)?;
-    let func = compute_function_guid_with_contraints(&pe, address)?;
-
-    info!(target: "warp_testing::pe", address = %format!("0x{address:x}"), guid = %func.guid, "Computed function GUID");
-
-    println!("Function at 0x{address:x}:");
-    println!("WARP UUID: {}", func.guid);
-    println!("Constraints:");
-    for constraint in &func.constraints {
-        println!("  {constraint:x?}");
-    }
-    if !func.data_refs.is_empty() {
-        println!("Data References:");
-        for data_ref in &func.data_refs {
-            let size_str = data_ref
-                .estimated_size
-                .map(|s| format!("{s} bytes"))
-                .unwrap_or_else(|| "unknown".to_string());
-
-            print!(
-                "  target: 0x{:x}, offset: 0x{:x}, readonly: {}, estimated_size: {}",
-                data_ref.target, data_ref.offset, data_ref.is_readonly, size_str
-            );
-
-            // For read-only data with no size (potential strings), try to show the content
-            if data_ref.is_readonly && data_ref.estimated_size.is_none() {
-                if let Some(data) = warp::read_string_data(&pe, data_ref.target) {
-                    println!(" -> \"{}\"", String::from_utf8_lossy(&data));
-                } else {
-                    println!();
-                }
-            } else {
-                println!();
-            }
-        }
-    }
-
-    // // If database is provided, look up matches and compare constraints
-    // if let Some(db_path) = database {
-    //     use constraint_matcher::ConstraintMatcher;
-    //     use rusqlite::Connection;
-    //     use std::collections::HashSet;
-
-    //     let conn = Connection::open(db_path)?;
-
-    //     // Create constraint matcher with naive solver
-    //     let matcher = ConstraintMatcher::with_naive_solver();
-
-    //     // Convert our constraints to a HashSet of GUIDs
-    //     let query_constraints: HashSet<String> = func
-    //         .constraints
-    //         .iter()
-    //         .map(|c| c.guid.to_string())
-    //         .collect();
-
-    //     println!("\n=== Function Matching ===");
-
-    //     // Find matches by GUID (required)
-    //     let candidates_by_guid = load_candidates_by_guid(&conn, &func.guid)?;
-    //     if !candidates_by_guid.is_empty() {
-    //         println!(
-    //             "\nFound {} functions with matching GUID",
-    //             candidates_by_guid.len()
-    //         );
-
-    //         // If multiple matches, try constraint matching to narrow down
-    //         if candidates_by_guid.len() > 1 {
-    //             println!("\nMultiple GUID matches found. Using constraints to narrow down...");
-
-    //             if let Some(match_result) =
-    //                 matcher.match_function(&query_constraints, &candidates_by_guid)
-    //             {
-    //                 println!("\nBest match found:");
-    //                 println!(
-    //                     "  Function: {} (0x{:x} in {})",
-    //                     match_result.candidate.name,
-    //                     match_result.candidate.address,
-    //                     match_result.candidate.exe_name
-    //                 );
-    //                 println!("  Confidence: {:.2}", match_result.confidence);
-    //                 println!(
-    //                     "  Matching constraints: {}/{}",
-    //                     match_result.matching_constraints, match_result.total_constraints
-    //                 );
-    //             } else {
-    //                 println!("\nNo clear best match found among GUID matches");
-    //             }
-    //         } else {
-    //             // Single match - it's the unique match
-    //             let candidate = &candidates_by_guid[0];
-    //             println!("\nUnique match found:");
-    //             println!(
-    //                 "  Function: {} (0x{:x} in {})",
-    //                 candidate.name, candidate.address, candidate.exe_name
-    //             );
-    //         }
-
-    //         // Show detailed comparison for all GUID matches
-    //         if candidates_by_guid.len() > 1 {
-    //             println!("\nDetailed comparison of all GUID matches:");
-    //             for candidate in &candidates_by_guid {
-    //                 println!(
-    //                     "\n  {} (0x{:x} in {})",
-    //                     candidate.name, candidate.address, candidate.exe_name
-    //                 );
-
-    //                 let our_constraint_set: HashSet<_> =
-    //                     query_constraints.iter().cloned().collect();
-    //                 let db_constraint_set: HashSet<_> =
-    //                     candidate.constraints.iter().cloned().collect();
-
-    //                 let matching = our_constraint_set.intersection(&db_constraint_set).count();
-    //                 let only_in_ours: Vec<_> =
-    //                     our_constraint_set.difference(&db_constraint_set).collect();
-    //                 let only_in_db: Vec<_> =
-    //                     db_constraint_set.difference(&our_constraint_set).collect();
-
-    //                 println!(
-    //                     "    Constraints: {} in DB, {} in our function, {} matching",
-    //                     db_constraint_set.len(),
-    //                     our_constraint_set.len(),
-    //                     matching
-    //                 );
-
-    //                 if !only_in_ours.is_empty() {
-    //                     debug!(target: "warp_testing::pe", "Only in our function: {} constraints", only_in_ours.len());
-    //                     println!(
-    //                         "    Only in our function: {} constraints",
-    //                         only_in_ours.len()
-    //                     );
-    //                     for guid in only_in_ours.iter().take(3) {
-    //                         println!("      - {guid}");
-    //                     }
-    //                     if only_in_ours.len() > 3 {
-    //                         println!("      ... and {} more", only_in_ours.len() - 3);
-    //                     }
-    //                 }
-
-    //                 if !only_in_db.is_empty() {
-    //                     debug!(target: "warp_testing::pe", "Only in DB: {} constraints", only_in_db.len());
-    //                     println!("    Only in DB: {} constraints", only_in_db.len());
-    //                     for guid in only_in_db.iter().take(3) {
-    //                         println!("      - {guid}");
-    //                     }
-    //                     if only_in_db.len() > 3 {
-    //                         println!("      ... and {} more", only_in_db.len() - 3);
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     } else {
-    //         println!("\nNo functions found with matching GUID");
-    //     }
-    // }
-
-    Ok(())
-}
-
-fn command_pdb(
-    CommandPdb {
+fn command_gen_db(
+    CommandGenDb {
         exe_paths,
         database,
-    }: CommandPdb,
+    }: CommandGenDb,
 ) -> Result<()> {
     use indicatif::{MultiProgress, ProgressBar};
     use pdb_analyzer::PdbAnalyzer;
@@ -526,24 +346,21 @@ fn command_pdb(
     Ok(())
 }
 
-fn command_exception(
-    CommandException {
+fn command_analyze(
+    CommandAnalyze {
         file,
-        format,
         database,
         generate_pdb,
-    }: CommandException,
+    }: CommandAnalyze,
 ) -> Result<()> {
     let pe = PeLoader::load(&file)?;
     let functions = pe.find_all_functions_from_exception_directory()?;
 
     println!("Found {} functions in exception directory", functions.len());
 
-    let mut mmap = None;
-    let db_data = if let Some(db_path) = &database {
+    let mmap = if let Some(db_path) = database {
         let file = std::fs::File::open(db_path)?;
-        mmap = Some(unsafe { memmap2::MmapOptions::new().map(&file)? });
-        Some(BinaryDatabase::new(mmap.as_ref().unwrap())?)
+        Some(unsafe { memmap2::MmapOptions::new().map(&file)? })
     } else {
         None
     };
@@ -551,6 +368,7 @@ fn command_exception(
     let mut results: Vec<FunctionResult> = Vec::new();
 
     struct DbContext<'a> {
+        db: BinaryDatabase<'a>,
         cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, &'a str>>,
     }
 
@@ -623,15 +441,16 @@ fn command_exception(
         analyzed_functions.len()
     );
 
-    let db_context = if let Some(ref db_data) = db_data {
-        let pb = new_pb(function_guids.len() as u64, "Querying function GUIDs");
+    let db_context = if let Some(ref mmap) = mmap {
+        let db = BinaryDatabase::new(mmap)?;
 
+        let pb = new_pb(function_guids.len() as u64, "Loading function GUIDs");
         let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, &str>> =
             function_guids
                 .par_iter()
                 .progress_with(pb)
                 .map(|guid| -> Result<_> {
-                    let constraints = db_data.query_constraints_for_function(guid)?;
+                    let constraints = db.query_constraints_for_function(guid)?;
                     Ok((*guid, constraints))
                 })
                 .collect::<Result<_>>()?;
@@ -639,6 +458,7 @@ fn command_exception(
         println!("Found {} constraint guids", cache_unique_constraints.len());
 
         Some(DbContext {
+            db,
             cache_unique_constraints,
         })
     } else {
@@ -739,13 +559,13 @@ fn command_exception(
                 (String::new(), None)
             };
 
-        println!(
-            "Function {} at 0x{:x}: GUID {}{}",
-            idx + 1,
-            func.address,
-            func.guid,
-            text_match_info
-        );
+        // println!(
+        //     "Function {} at 0x{:x}: GUID {}{}",
+        //     idx + 1,
+        //     func.address,
+        //     func.guid,
+        //     text_match_info
+        // );
 
         let result = FunctionResult {
             address: format!("0x{:x}", func.address),
@@ -755,10 +575,6 @@ fn command_exception(
         };
 
         results.push(result);
-    }
-
-    if format == OutputFormat::Json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
     }
 
     // Generate PDB if requested
@@ -783,7 +599,7 @@ fn command_exception(
 
         // Generate PDB file
         let pdb_path = file.with_extension("pdb");
-        println!("\nGenerating PDB file at: {}", pdb_path.display());
+        println!("Generating PDB file at: {}", pdb_path.display());
 
         pdb_writer::generate_pdb(&pe, &pdb_info, &pdb_functions, &pdb_path)?;
 

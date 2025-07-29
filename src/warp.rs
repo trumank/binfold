@@ -51,6 +51,18 @@ new_guid!(BasicBlockGuid);
 new_guid!(SymbolGuid);
 new_guid!(ConstraintGuid);
 
+impl FunctionGuid {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self(Uuid::new_v5(&NAMESPACE_FUNCTION, bytes))
+    }
+}
+
+impl BasicBlockGuid {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self(Uuid::new_v5(&NAMESPACE_BASIC_BLOCK, bytes))
+    }
+}
+
 impl ConstraintGuid {
     /// constraint on call to target function
     pub fn from_child_call(target: FunctionGuid) -> Self {
@@ -276,10 +288,10 @@ pub fn compute_warp_uuid(
     // actually combines them in low-to-high address order
     let mut combined_bytes = Vec::new();
     for (_, uuid) in block_uuids.iter() {
-        combined_bytes.extend_from_slice(uuid.as_bytes());
+        combined_bytes.extend_from_slice(uuid.0.as_bytes());
     }
 
-    let function_uuid = FunctionGuid(Uuid::new_v5(&NAMESPACE_FUNCTION, &combined_bytes));
+    let function_uuid = FunctionGuid::from_bytes(&combined_bytes);
 
     debug!(
         target: "warp_testing::warp::guid",
@@ -439,10 +451,10 @@ fn create_basic_block_guid(
     calls: Option<&mut Vec<FunctionCall>>,
     data_refs: Option<&mut Vec<DataReference>>,
     pe: &PeLoader,
-) -> Uuid {
+) -> BasicBlockGuid {
     let instruction_bytes =
         get_instruction_bytes_for_guid(raw_bytes, base, function_bounds, calls, data_refs, pe);
-    Uuid::new_v5(&NAMESPACE_BASIC_BLOCK, &instruction_bytes)
+    BasicBlockGuid::from_bytes(&instruction_bytes)
 }
 
 fn get_instruction_bytes_for_guid(
@@ -476,9 +488,6 @@ fn get_instruction_bytes_for_guid(
 
         output.clear();
         formatter.format(&instruction, &mut output);
-
-        // NOPs handling is complex - Binary Ninja seems to include them
-        // Only skip register-to-itself NOPs for hot-patching
 
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
@@ -771,7 +780,7 @@ mod test {
 
     #[derive(Debug, Deserialize)]
     struct Block {
-        guid: Uuid,
+        guid: BasicBlockGuid,
         start: u64,
         end: u64,
     }
@@ -989,7 +998,7 @@ mod test {
         exe_path: impl AsRef<std::path::Path>,
         function_address: u64,
         expected_function_guid: FunctionGuid,
-        expected_blocks: Vec<(u64, u64, Uuid)>,
+        expected_blocks: Vec<(u64, u64, BasicBlockGuid)>,
     ) -> Stats {
         // Load main.exe from root directory
         let pe = PeLoader::load(exe_path).expect("Failed to load main.exe");

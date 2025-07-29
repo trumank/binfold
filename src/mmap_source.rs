@@ -42,10 +42,7 @@ impl<'s> SourceView<'s> for MmapView {
 }
 
 impl<'s> Source<'s> for MmapSource {
-    fn view(
-        &mut self,
-        slices: &[SourceSlice],
-    ) -> Result<Box<dyn SourceView<'s> + Send + Sync>, io::Error> {
+    fn view(&mut self, slices: &[SourceSlice]) -> Result<Box<dyn SourceView<'s>>, io::Error> {
         let total_size = slices.iter().map(|s| s.size).sum();
         let mut data = Vec::with_capacity(total_size);
 
