@@ -275,15 +275,7 @@ impl PeLoader {
                                 cfg.block_starts.insert(target);
                             }
                         }
-                        // The next instruction (if any) starts a new block
-                        let next_ip = decoder.ip();
-                        if let Some(cfg) = cfg_builder.as_deref_mut()
-                            && next_ip < va + scan_size as u64
-                        {
-                            cfg.block_starts.insert(next_ip);
-                        }
                         break;
-                        // External jump - end of function
                     }
                     FlowControl::ConditionalBranch => {
                         // Follow both paths
