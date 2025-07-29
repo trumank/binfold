@@ -63,9 +63,9 @@ struct CommandAnalyze {
     #[arg(short, long)]
     exe: PathBuf,
 
-    /// Optional database path for GUID lookups and symbol names
+    /// Optional database path(s) for GUID lookups and symbol names
     #[arg(long)]
-    database: Option<PathBuf>,
+    database: Vec<PathBuf>,
 
     /// Generate PDB file with matched function names
     #[arg(long)]
@@ -321,17 +321,17 @@ fn command_analyze(
 
     println!("Found {} functions in exception directory", functions.len());
 
-    let mmap = if let Some(db_path) = database {
-        let file = std::fs::File::open(db_path)?;
-        Some(unsafe { memmap2::MmapOptions::new().map(&file)? })
-    } else {
-        None
-    };
+    let mmap = database
+        .iter()
+        .map(|path| {
+            let file = std::fs::File::open(path)?;
+            Ok(unsafe { memmap2::MmapOptions::new().map(&file)? })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let mut results: Vec<FunctionResult> = Vec::new();
 
     struct DbContext<'a> {
-        db: Db<'a>,
         cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, &'a str>>,
     }
 
@@ -404,8 +404,11 @@ fn command_analyze(
         analyzed_functions.len()
     );
 
-    let db_context = if let Some(ref mmap) = mmap {
-        let db = Db::new(mmap)?;
+    let db_context = if !mmap.is_empty() {
+        let dbs = mmap
+            .iter()
+            .map(|m| Db::new(m))
+            .collect::<Result<Vec<_>>>()?;
 
         let pb = new_pb(function_guids.len() as u64, "Loading function GUIDs");
         let cache_unique_constraints: HashMap<FunctionGuid, HashMap<ConstraintGuid, &str>> =
@@ -413,12 +416,27 @@ fn command_analyze(
                 .par_iter()
                 .progress_with(pb)
                 .map(|guid| -> Result<_> {
-                    let constraints = db
-                        .iter_constraints(guid)
-                        .filter_map(|c| -> Option<Result<(ConstraintGuid, &str)>> {
-                            (c.symbol_count == 1).then(|| c.symbols().map(|s| (c.guid, s[0])))
+                    let mut constraints: HashMap<ConstraintGuid, HashSet<&str>> =
+                        Default::default();
+                    // collect unique symbols from each database
+                    for db in &dbs {
+                        for c in db.iter_constraints(guid) {
+                            if c.symbol_count == 1 {
+                                constraints
+                                    .entry(c.guid)
+                                    .or_default()
+                                    .insert(c.symbols()?[0]);
+                            }
+                        }
+                    }
+                    // filter contraints that remain unique after merge
+                    let constraints = constraints
+                        .into_iter()
+                        .filter_map(|(guid, symbols)| {
+                            (symbols.len() == 1)
+                                .then(|| (guid, symbols.into_iter().next().unwrap()))
                         })
-                        .collect::<Result<HashMap<ConstraintGuid, &str>>>()?;
+                        .collect();
                     Ok((*guid, constraints))
                 })
                 .collect::<Result<_>>()?;
@@ -426,7 +444,6 @@ fn command_analyze(
         println!("Found {} constraint guids", cache_unique_constraints.len());
 
         Some(DbContext {
-            db,
             cache_unique_constraints,
         })
     } else {
