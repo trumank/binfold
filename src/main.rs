@@ -350,23 +350,33 @@ fn command_analyze(
     while !to_analyze.is_empty() {
         println!("Found {} functions to analyze", to_analyze.len());
         let pb = new_pb(to_analyze.len() as u64, "Analyzing functions");
-        let (new_guids, new_functions): Res = to_analyze
+        let results = to_analyze
             .par_iter()
             .copied()
             .progress_with(pb)
-            .map(|func| compute_function_guid_with_contraints(&pe, func).map(|f| (f.guid, f)))
-            .collect::<Result<Res>>()?;
+            .map(|func| (func, compute_function_guid_with_contraints(&pe, func)))
+            .collect::<Vec<(u64, Result<_>)>>();
         analyzed.extend(std::mem::take(&mut to_analyze));
         if recurse {
             to_analyze.extend(
-                new_functions
+                results
                     .iter()
+                    .flat_map(|f| f.1.as_ref().ok())
                     .flat_map(|f| f.calls.iter().map(|c| c.target))
                     .filter(|t| !analyzed.contains(t)),
             );
         }
-        function_guids.extend(new_guids);
-        analyzed_functions.extend(new_functions);
+        for (addr, result) in results {
+            match result {
+                Ok(f) => {
+                    function_guids.insert(f.guid);
+                    analyzed_functions.push(f);
+                }
+                Err(err) => {
+                    println!("Failed to analyze function at 0x{addr:x}: {:?}", err);
+                }
+            }
+        }
     }
     analyzed_functions.sort_by_key(|f| f.address);
 
