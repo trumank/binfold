@@ -26,14 +26,39 @@ pub struct FunctionRange {
 /// Control flow graph built during recursive descent
 #[derive(Debug, Default)]
 pub struct ControlFlowGraph {
-    /// Set of all instruction addresses that were visited
-    pub visited_instructions: BTreeSet<u64>,
-    /// Map from instruction address to its successors
-    pub edges: BTreeMap<u64, Vec<u64>>,
-    /// Basic block boundaries (start addresses)
-    pub block_starts: BTreeSet<u64>,
-    /// Function entry point
+    /// Block bounds start -> end
+    pub basic_blocks: BTreeMap<u64, u64>,
     pub entry_point: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlockBound {
+    Start(u64),
+    End(u64),
+}
+impl BlockBound {
+    pub fn address(&self) -> u64 {
+        match self {
+            BlockBound::Start(a) => *a,
+            BlockBound::End(a) => *a,
+        }
+    }
+}
+impl std::cmp::Ord for BlockBound {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.address()
+            .cmp(&other.address())
+            .then_with(|| match (self, other) {
+                (BlockBound::End(_), BlockBound::Start(_)) => std::cmp::Ordering::Less,
+                (BlockBound::Start(_), BlockBound::End(_)) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            })
+    }
+}
+impl std::cmp::PartialOrd for BlockBound {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug)]
@@ -136,7 +161,7 @@ impl PeLoader {
         use std::collections::{HashSet, VecDeque};
 
         let max_scan = 0x10000; // Maximum function size to scan (64KB)
-        let tail_call_threshold = 0x100;
+        let tail_call_threshold = 0x50;
 
         let start_offset = self.rva_to_file_offset(va.saturating_sub(self.image_base))?;
 
@@ -165,6 +190,7 @@ impl PeLoader {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         let mut tailcall_queue = VecDeque::new();
+        let mut block_intervals: BTreeSet<BlockBound> = Default::default();
 
         queue.push_back((va, None));
 
@@ -173,7 +199,7 @@ impl PeLoader {
         // Initialize CFG if requested
         if let Some(cfg) = cfg_builder.as_deref_mut() {
             cfg.entry_point = va;
-            cfg.block_starts.insert(va);
+            block_intervals.insert(BlockBound::Start(va));
         }
 
         debug!(
@@ -209,11 +235,6 @@ impl PeLoader {
                 let ip = instruction.ip();
                 visited.insert(ip);
 
-                // Record instruction in CFG
-                if let Some(cfg) = cfg_builder.as_deref_mut() {
-                    cfg.visited_instructions.insert(ip);
-                }
-
                 trace!(
                     target: "warp_testing::pe_loader::size",
                     offset = format!("0x{:<5x}", ip - va),
@@ -223,60 +244,32 @@ impl PeLoader {
                     "Instruction"
                 );
 
-                // Update max address - but not for returns or interrupts
-                match instruction.flow_control() {
-                    FlowControl::Return | FlowControl::Interrupt => {
-                        // For returns and interrupts, the current instruction end is the max
-                        if ip + instruction.len() as u64 > max_address {
-                            max_address = ip + instruction.len() as u64;
-                        }
-                    }
-                    _ => {
-                        // For other instructions, track the next address
-                        let next_addr = decoder.ip();
-                        if next_addr > max_address {
-                            max_address = next_addr;
-                        }
-                    }
+                // Update max address
+                let next_ip = decoder.ip();
+                if next_ip > max_address {
+                    max_address = next_ip;
                 }
 
                 match instruction.flow_control() {
-                    FlowControl::Next => {
-                        // Continue to next instruction
-                        let next_ip = decoder.ip();
-                        if let Some(cfg) = cfg_builder.as_deref_mut() {
-                            cfg.edges.entry(ip).or_default().push(next_ip);
-                        }
-                    }
-                    FlowControl::Call | FlowControl::IndirectCall => {
-                        // For calls, always continue to next instruction
-                        // (both direct and indirect calls return to the next instruction)
-                        let next_ip = decoder.ip();
-                        if let Some(cfg) = cfg_builder.as_deref_mut() {
-                            cfg.edges.entry(ip).or_default().push(next_ip);
-                        }
-                    }
+                    FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {}
                     FlowControl::UnconditionalBranch => {
+                        if cfg_builder.is_some() {
+                            block_intervals.insert(BlockBound::End(next_ip));
+                        }
                         // Check if it's a tail call (jmp to external function)
                         if let Some(target) = get_branch_target(&instruction)
                             && target >= va
                             && target < va + scan_size as u64
                         {
-                            // Internal jump - follow it
+                            // Unknown if tail call, defer analysis
                             tailcall_queue.push_back((target, Some(ip)));
-                            if let Some(cfg) = cfg_builder.as_deref_mut() {
-                                cfg.edges.entry(ip).or_default().push(target);
-                                cfg.block_starts.insert(target);
-                            }
                         }
                         break;
                     }
                     FlowControl::ConditionalBranch => {
                         // Follow both paths
-                        let next_ip = decoder.ip();
-                        if let Some(cfg) = cfg_builder.as_deref_mut() {
-                            // Edge to fall-through
-                            cfg.edges.entry(ip).or_default().push(next_ip);
+                        if cfg_builder.is_some() {
+                            block_intervals.insert(BlockBound::Start(next_ip));
                         }
 
                         if let Some(target) = get_branch_target(&instruction)
@@ -285,20 +278,16 @@ impl PeLoader {
                         {
                             // Internal jump - follow it
                             queue.push_back((target, Some(ip)));
-                            if let Some(cfg) = cfg_builder.as_deref_mut() {
-                                cfg.edges.entry(ip).or_default().push(target);
-                                cfg.block_starts.insert(target);
+                            if cfg_builder.is_some() {
+                                block_intervals.insert(BlockBound::Start(target));
                             }
                         }
                     }
                     FlowControl::Return => {
                         // Return instruction - path ends here
                         // The next instruction (if any) starts a new block
-                        let next_ip = decoder.ip();
-                        if let Some(cfg) = cfg_builder.as_deref_mut()
-                            && next_ip < va + scan_size as u64
-                        {
-                            cfg.block_starts.insert(next_ip);
+                        if cfg_builder.is_some() && next_ip < va + scan_size as u64 {
+                            block_intervals.insert(BlockBound::End(next_ip));
                         }
                         break;
                     }
@@ -312,11 +301,8 @@ impl PeLoader {
                             "Found indirect branch"
                         );
                         // The next instruction (if any) starts a new block
-                        let next_ip = decoder.ip();
-                        if let Some(cfg) = cfg_builder.as_deref_mut()
-                            && next_ip < va + scan_size as u64
-                        {
-                            cfg.block_starts.insert(next_ip);
+                        if cfg_builder.is_some() && next_ip < va + scan_size as u64 {
+                            block_intervals.insert(BlockBound::End(next_ip));
                         }
                         // For now, we can't follow indirect jumps
                         // This is a limitation that might cause us to miss code
@@ -335,10 +321,16 @@ impl PeLoader {
             }
 
             tailcall_queue.retain(|item| {
-                if item.0 < max_address + tail_call_threshold {
+                let target = item.0;
+                if target < max_address + tail_call_threshold {
+                    // Internal jump
+                    if cfg_builder.is_some() {
+                        block_intervals.insert(BlockBound::Start(target));
+                    }
                     queue.push_back(*item);
                     false
                 } else {
+                    // Tail call
                     true
                 }
             });
@@ -349,12 +341,31 @@ impl PeLoader {
             bail!("Could not determine function size")
         }
 
+        if let Some(cfg) = cfg_builder {
+            let mut start = None;
+            for bound in &block_intervals {
+                if let Some(addr) = start
+                    && addr != bound.address()
+                {
+                    cfg.basic_blocks.insert(addr, bound.address());
+                    start = None;
+                }
+                if let BlockBound::Start(a) = bound {
+                    start = Some(*a);
+                }
+            }
+            if let Some(start) = start
+                && start != max_address
+            {
+                cfg.basic_blocks.insert(start, max_address);
+            }
+        }
+
         debug!(
             target: "warp_testing::pe_loader::size",
             start = format!("0x{va:x}"),
             end = format!("0x{max_address:x}"),
             size = format!("0x{size:x}"),
-            visited_instructions = visited.len(),
             "Function size analysis complete"
         );
 

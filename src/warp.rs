@@ -1,7 +1,6 @@
 use crate::pe_loader::PeLoader;
 use anyhow::Result;
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use std::ops::Range;
 use tracing::{debug, trace};
 use uuid::{Uuid, uuid};
@@ -203,18 +202,15 @@ pub fn compute_warp_uuid(
     cfg: &crate::pe_loader::ControlFlowGraph,
     pe: &PeLoader,
 ) -> FunctionGuid {
-    // Disassemble and identify basic blocks
-    let basic_blocks = identify_basic_blocks(raw_bytes, base, cfg);
-
     debug!(
         target: "warp_testing::warp",
-        blocks = basic_blocks.len(),
+        blocks = cfg.basic_blocks.len(),
         "Identified basic blocks"
     );
 
     // Create UUID for each basic block
     let mut block_uuids = Vec::new();
-    for (&start_addr, &end_addr) in basic_blocks.iter() {
+    for (&start_addr, &end_addr) in cfg.basic_blocks.iter() {
         // println!("{:x?}", (start_addr - base, end_addr - base, base));
         let block_bytes = &raw_bytes[(start_addr - base) as usize..(end_addr - base) as usize];
         let uuid = create_basic_block_guid(
@@ -238,7 +234,7 @@ pub fn compute_warp_uuid(
 
     // Print disassembly for each basic block if requested
     if tracing::enabled!(target: "warp_testing::warp::blocks", tracing::Level::DEBUG) {
-        for (&start_addr, &end_addr) in &basic_blocks {
+        for (&start_addr, &end_addr) in &cfg.basic_blocks {
             debug!(
                 target: "warp_testing::warp::blocks",
                 start = format!("0x{start_addr:x}"),
@@ -285,138 +281,6 @@ pub fn compute_warp_uuid(
     );
 
     function_uuid
-}
-
-// Helper function to decode all instructions in a byte array
-fn decode_instructions(raw_bytes: &[u8], base: u64) -> BTreeMap<u64, (Instruction, u64)> {
-    let mut decoder = Decoder::with_ip(64, raw_bytes, base, DecoderOptions::NONE);
-    let mut instructions = BTreeMap::new();
-
-    while decoder.can_decode() {
-        let start = decoder.ip();
-        let instruction = decoder.decode();
-        let end = decoder.ip();
-        instructions.insert(start, (instruction, end));
-    }
-
-    instructions
-}
-
-pub fn identify_basic_blocks(
-    raw_bytes: &[u8],
-    base: u64,
-    cfg: &crate::pe_loader::ControlFlowGraph,
-) -> BTreeMap<u64, u64> {
-    let instructions = decode_instructions(raw_bytes, base);
-
-    debug!(
-        target: "warp_testing::warp::blocks",
-        instruction_count = instructions.len(),
-        base = format!("0x{:x}", base),
-        "Decoded instructions"
-    );
-
-    // Use the pre-built CFG from recursive descent
-    debug!(
-        target: "warp_testing::warp::blocks",
-        block_starts = cfg.block_starts.len(),
-        "Using CFG from recursive descent"
-    );
-
-    // The CFG from recursive descent only marks some block boundaries.
-    // We need to enhance it with additional boundaries based on edge analysis
-    let mut block_starts = cfg.block_starts.clone();
-
-    // Build incoming/outgoing edge maps from the CFG
-    let mut incoming_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
-    let mut outgoing_edges: HashMap<u64, HashSet<u64>> = HashMap::new();
-
-    for (from, targets) in &cfg.edges {
-        for &to in targets {
-            incoming_edges.entry(to).or_default().insert(*from);
-            outgoing_edges.entry(*from).or_default().insert(to);
-        }
-    }
-
-    // Apply the same logic as linear sweep to find additional block boundaries
-    for addr in cfg.visited_instructions.iter() {
-        // Block start if multiple incoming edges
-        if incoming_edges.get(addr).map(|s| s.len()).unwrap_or(0) > 1 {
-            block_starts.insert(*addr);
-        }
-
-        // Block start if predecessor has multiple outgoing edges
-        if let Some(predecessors) = incoming_edges.get(addr) {
-            for &pred in predecessors {
-                if outgoing_edges.get(&pred).map(|s| s.len()).unwrap_or(0) > 1 {
-                    block_starts.insert(*addr);
-                }
-            }
-        }
-    }
-
-    debug!(
-        target: "warp_testing::warp::blocks",
-        original_count = cfg.block_starts.len(),
-        enhanced_count = block_starts.len(),
-        "Enhanced CFG block starts"
-    );
-
-    // Filter block starts to only include those within our function bytes
-    let end_addr = base + raw_bytes.len() as u64;
-    block_starts.retain(|&addr| addr >= base && addr < end_addr);
-
-    debug!(
-        target: "warp_testing::warp::blocks",
-        count = block_starts.len(),
-        "Identified block start addresses"
-    );
-
-    // Build basic blocks for ALL code (not just reachable)
-    // This is key - Binary Ninja identifies blocks even in unreachable code
-    let mut basic_blocks = BTreeMap::new();
-    let starts: Vec<u64> = block_starts.iter().cloned().collect();
-
-    for start in starts {
-        // Include ALL blocks, not just reachable ones
-        // Binary Ninja includes unreachable blocks in its analysis
-
-        let mut end = start;
-
-        // Find the end of this basic block
-        let mut current = start;
-        while let Some((instruction, next)) = instructions.get(&current) {
-            // Include current instruction in block
-            end = *next;
-
-            // Stop if this instruction doesn't fall through to the next
-            if matches!(
-                instruction.flow_control(),
-                FlowControl::UnconditionalBranch | FlowControl::Return
-            ) {
-                break;
-            }
-
-            // Stop if the next instruction is the start of another block
-            if block_starts.contains(next) && *next != start {
-                break;
-            }
-
-            // Move to next instruction
-            current = *next;
-
-            // Stop if we've reached the end of instructions
-            if !instructions.contains_key(&current) {
-                break;
-            }
-        }
-
-        if start != end {
-            basic_blocks.insert(start, end);
-        }
-    }
-
-    basic_blocks
 }
 
 fn get_branch_target(instruction: &Instruction) -> Option<u64> {
