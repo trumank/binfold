@@ -218,13 +218,7 @@ impl PeLoader {
                     target: "warp_testing::pe_loader::size",
                     offset = format!("0x{:<5x}", ip - va),
                     address = format!("0x{:x}", ip),
-                    instruction = {
-                        use iced_x86::Formatter;
-                        let mut formatter = iced_x86::NasmFormatter::new();
-                        let mut output = String::new();
-                        formatter.format(&instruction, &mut output);
-                        output
-                    },
+                    instruction = %instruction,
                     flow_control = ?instruction.flow_control(),
                     "Instruction"
                 );

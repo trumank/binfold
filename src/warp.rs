@@ -1,8 +1,6 @@
 use crate::pe_loader::PeLoader;
 use anyhow::Result;
-use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, OpKind, Register,
-};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use tracing::{debug, trace};
@@ -254,17 +252,15 @@ pub fn compute_warp_uuid(
             let block_bytes = &raw_bytes[block_start_offset..block_end_offset];
 
             let mut decoder = Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
-            let mut formatter = iced_x86::NasmFormatter::new();
             let mut output = String::new();
 
             while decoder.can_decode() {
                 let instruction = decoder.decode();
                 output.clear();
-                formatter.format(&instruction, &mut output);
                 trace!(
                     target: "warp_testing::warp::blocks",
                     addr = format!("0x{:x}", instruction.ip()),
-                    instruction = %output,
+                    instruction = %instruction,
                     "Instruction"
                 );
             }
@@ -453,15 +449,10 @@ fn get_instruction_bytes_for_guid(
     mut data_refs: Option<&mut Vec<DataReference>>,
     pe: &PeLoader,
 ) -> Vec<u8> {
-    use iced_x86::Formatter;
-
     let mut bytes = Vec::new();
 
     let mut decoder = Decoder::new(64, raw_bytes, DecoderOptions::NONE);
     decoder.set_ip(base);
-
-    let mut formatter = iced_x86::NasmFormatter::new();
-    let mut output = String::new();
 
     debug!(
         target: "warp_testing::warp::guid",
@@ -474,15 +465,12 @@ fn get_instruction_bytes_for_guid(
         let end = (decoder.ip() - base) as usize;
         let instr_bytes = &raw_bytes[start..end];
 
-        output.clear();
-        formatter.format(&instruction, &mut output);
-
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
             trace!(
                 target: "warp_testing::warp::guid",
                 addr = format!("0x{:x}", instruction.ip()),
-                instruction = %output,
+                instruction = %instruction,
                 "Skipping register-to-itself NOP"
             );
             continue;
@@ -501,7 +489,7 @@ fn get_instruction_bytes_for_guid(
             trace!(
                 target: "warp_testing::warp::guid",
                 addr = format!("0x{:x}", instruction.ip()),
-                instruction = %output,
+                instruction = %instruction,
                 bytes = format!("{:02x?}", instr_bytes),
                 "Zeroing relocatable instruction"
             );
@@ -511,7 +499,7 @@ fn get_instruction_bytes_for_guid(
             trace!(
                 target: "warp_testing::warp::guid",
                 addr = format!("0x{:x}", instruction.ip()),
-                instruction = %output,
+                instruction = %instruction,
                 bytes = format!("{:02x?}", instr_bytes),
                 "Keeping instruction bytes"
             );
