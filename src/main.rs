@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 use crate::db::{Db, DbWriter};
 use crate::pe_loader::PeLoader;
@@ -42,6 +43,7 @@ struct Cli {
 enum Commands {
     GenDb(CommandGenDb),
     Analyze(CommandAnalyze),
+    DumpDb(CommandDumpDb),
 }
 
 /// Create a database of function GUIDs/constraint GUIDs and their mappings to symbol names
@@ -70,6 +72,22 @@ struct CommandAnalyze {
     /// Generate PDB file with matched function names
     #[arg(long)]
     generate_pdb: bool,
+}
+
+/// Dump function and constraint information from a database as JSON
+#[derive(Parser)]
+struct CommandDumpDb {
+    /// Path to database file
+    #[arg(short, long)]
+    database: PathBuf,
+
+    /// Output JSON file path (defaults to stdout if not specified)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Only dump a specific function by its GUID
+    #[arg(short, long)]
+    function: Option<Uuid>,
 }
 
 fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
@@ -101,6 +119,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::GenDb(cmd) => command_gen_db(cmd),
         Commands::Analyze(cmd) => command_analyze(cmd),
+        Commands::DumpDb(cmd) => command_dump_db(cmd),
     }
 }
 
@@ -431,9 +450,9 @@ fn command_analyze(
                     // collect unique symbols from each database
                     for db in &dbs {
                         for c in db.iter_constraints(guid) {
-                            if c.symbol_count == 1 {
+                            if c.symbol_count() == 1 {
                                 constraints
-                                    .entry(c.guid)
+                                    .entry(*c.guid())
                                     .or_default()
                                     .insert(c.symbols()?[0]);
                             }
@@ -539,11 +558,11 @@ fn command_analyze(
     }
 
     // Generate results for all functions
-    for (idx, func) in analyzed_functions.iter().enumerate() {
+    for func in analyzed_functions.iter() {
         let size = pe.find_function_size(func.address)?;
 
         // Look up match info
-        let (text_match_info, struct_match_info) =
+        let (_text_match_info, struct_match_info) =
             if let Some(func_name) = matched_functions.get(&func.address) {
                 let text = format!(" [Match: {func_name}]");
                 let match_info = MatchInfo {
@@ -603,6 +622,79 @@ fn command_analyze(
             pdb_functions.len()
         );
     }
+    Ok(())
+}
+
+fn command_dump_db(
+    CommandDumpDb {
+        database,
+        output,
+        function,
+    }: CommandDumpDb,
+) -> Result<()> {
+    use std::fs;
+    use std::io;
+    use struson::writer::{JsonStreamWriter, JsonWriter};
+
+    let file = fs::File::open(&database)?;
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+    let db = Db::new(&mmap)?;
+
+    let writer: Box<dyn io::Write> = if let Some(output_path) = output {
+        Box::new(fs::File::create(output_path)?)
+    } else {
+        Box::new(io::stdout())
+    };
+
+    let mut json_writer = JsonStreamWriter::new(writer);
+    json_writer.begin_array()?;
+
+    let functions: Box<dyn Iterator<Item = FunctionGuid>> = if let Some(function) = function {
+        Box::new(std::iter::once(FunctionGuid(function)))
+    } else {
+        Box::new(db.iter_functions())
+    };
+
+    // Stream functions one at a time
+    for func_guid in functions {
+        // Get constraints for this function
+        let constraints = db.query_constraints_for_function(&func_guid)?;
+
+        // Write function object
+        json_writer.begin_object()?;
+        json_writer.name("function")?;
+        json_writer.string_value(&func_guid.to_string())?;
+
+        json_writer.name("constraints")?;
+        json_writer.begin_array()?;
+
+        // Write constraints
+        for (constraint_guid, symbols) in constraints {
+            json_writer.begin_object()?;
+
+            json_writer.name("constraint")?;
+            json_writer.string_value(&constraint_guid.to_string())?;
+
+            json_writer.name("symbols")?;
+            json_writer.begin_array()?;
+
+            // Write symbols
+            for symbol in symbols {
+                json_writer.string_value(symbol)?;
+            }
+
+            json_writer.end_array()?;
+            json_writer.end_object()?;
+        }
+
+        json_writer.end_array()?;
+        json_writer.end_object()?;
+    }
+
+    // Close JSON array and finish
+    json_writer.end_array()?;
+    json_writer.finish_document()?;
+
     Ok(())
 }
 

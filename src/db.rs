@@ -102,6 +102,19 @@ impl<'a> Db<'a> {
         u32::from_le_bytes(self.slice_at(offset, 4).try_into().unwrap())
     }
 
+    pub fn function_count(&self) -> usize {
+        let functions_start = self.header.functions_offset as usize;
+        self.u32_at(functions_start) as usize
+    }
+
+    pub fn iter_functions<'db>(&'db self) -> FunctionIterator<'db, 'a> {
+        FunctionIterator {
+            db: self,
+            current: 0,
+            total: self.function_count(),
+        }
+    }
+
     pub fn iter_constraints<'db>(
         &'db self,
         function_guid: &FunctionGuid,
@@ -149,67 +162,9 @@ impl<'a> Db<'a> {
         &self,
         function_guid: &FunctionGuid,
     ) -> Result<HashMap<ConstraintGuid, Vec<&'a str>>> {
-        // Find the function in the functions section using binary search
-        let functions_start = self.header.functions_offset as usize;
-        let num_functions = self.u32_at(functions_start) as usize;
-
-        // Binary search for the function
-        let mut left = 0;
-        let mut right = num_functions;
-        let mut found_function = None;
-
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let function_offset = functions_start + 4 + (mid * FUNCTION_SIZE);
-
-            let current_guid = FunctionGuid(self.uuid_at(function_offset));
-
-            match current_guid.cmp(function_guid) {
-                std::cmp::Ordering::Less => left = mid + 1,
-                std::cmp::Ordering::Greater => right = mid,
-                std::cmp::Ordering::Equal => {
-                    let constraint_index = self.u32_at(function_offset + 16) as usize;
-                    let num_constraints = self.u32_at(function_offset + 20) as usize;
-                    found_function = Some((constraint_index, num_constraints));
-                    break;
-                }
-            }
-        }
-
-        let (constraint_index, num_constraints) = match found_function {
-            Some(f) => f,
-            None => return Ok(Default::default()),
-        };
-
-        // Read constraints
-        let constraints_start = self.header.function_constraints_offset as usize + 4;
-        let mut constraints = HashMap::with_capacity(num_constraints);
-
-        // Skip to the right constraint index
-        let constraint_offset = constraints_start + (constraint_index * FUNCTION_CONSTRAINTS_SIZE);
-
-        for i in 0..num_constraints {
-            let offset = constraint_offset + (i * FUNCTION_CONSTRAINTS_SIZE);
-            let constraint_index = self.u32_at(offset) as usize;
-            let constraint_guid = ConstraintGuid(
-                self.uuid_at(self.header.constraints_offset as usize + 4 + constraint_index * 16),
-            );
-            let string_count = self.u32_at(offset + 4) as usize;
-            let string_index = self.u32_at(offset + 8) as usize;
-
-            let constraint_strings_start = self.header.constraint_strings_offset as usize + 4;
-            let mut strings = vec![];
-            for j in 0..string_count {
-                let offset =
-                    constraint_strings_start + (string_index + j) * CONSTRAINT_STRINGS_SIZE;
-                let offset = self.u32_at(offset);
-                strings.push(self.read_string_at_offset(offset)?);
-            }
-
-            constraints.insert(constraint_guid, strings);
-        }
-
-        Ok(constraints)
+        self.iter_constraints(function_guid)
+            .map(|c| c.symbols().map(|s| (c.guid, s)))
+            .collect()
     }
 
     fn read_string_at_offset(&self, offset: u32) -> Result<&'a str> {
@@ -337,13 +292,19 @@ pub struct ConstraintIterator<'db, 'a> {
 }
 
 pub struct ConstraintInfo<'db, 'a> {
-    pub guid: ConstraintGuid,
-    pub symbol_count: usize,
-    string_index: usize,
     db: &'db Db<'a>,
+    guid: ConstraintGuid,
+    symbol_count: usize,
+    string_index: usize,
 }
 
 impl<'db, 'a> ConstraintInfo<'db, 'a> {
+    pub fn guid(&self) -> &ConstraintGuid {
+        &self.guid
+    }
+    pub fn symbol_count(&self) -> usize {
+        self.symbol_count
+    }
     pub fn symbols(&self) -> Result<Vec<&'a str>> {
         let constraint_strings_start = self.db.header.constraint_strings_offset as usize + 4;
         let mut strings = Vec::with_capacity(self.symbol_count);
@@ -361,6 +322,11 @@ impl<'db, 'a> ConstraintInfo<'db, 'a> {
 
 impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
     type Item = ConstraintInfo<'db, 'a>;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.total - self.current;
+        (remaining, Some(remaining))
+    }
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current >= self.total {
@@ -387,6 +353,35 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
             string_index,
             db: self.db,
         })
+    }
+}
+
+pub struct FunctionIterator<'db, 'a> {
+    db: &'db Db<'a>,
+    current: usize,
+    total: usize,
+}
+
+impl<'db, 'a> Iterator for FunctionIterator<'db, 'a> {
+    type Item = FunctionGuid;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.total - self.current;
+        (remaining, Some(remaining))
+    }
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.total {
+            return None;
+        }
+
+        let functions_start = self.db.header.functions_offset as usize;
+        let function_offset = functions_start + 4 + (self.current * FUNCTION_SIZE);
+
+        let func_guid = FunctionGuid(self.db.uuid_at(function_offset));
+        self.current += 1;
+
+        Some(func_guid)
     }
 }
 
