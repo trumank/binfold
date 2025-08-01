@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::db::{Db, DbWriter, StringRef};
 use crate::pe_loader::PeLoader;
-use crate::warp::{ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints};
+use crate::warp::{
+    Constraint, ConstraintGuid, Function, FunctionGuid, compute_function_guid_with_contraints,
+};
 
 mod db;
 mod mmap_source;
@@ -196,9 +198,8 @@ fn command_gen_db(
     multi_progress.add(pb.clone());
 
     // Shared data structure for building unique constraints
-    let constraint_to_names: Arc<
-        Mutex<BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>>,
-    > = Default::default();
+    let constraint_to_names: Arc<Mutex<BTreeMap<FunctionGuid, HashMap<Constraint, HashSet<u64>>>>> =
+        Default::default();
 
     // Process executables sequentially to avoid OOM
     let constraint_to_names_clone = constraint_to_names.clone();
@@ -237,15 +238,16 @@ fn command_gen_db(
 
                     // Insert constraints and build constraint_to_names mapping
                     let mut constraint_map = constraint_to_names_clone.lock().unwrap();
-                    for constraint in [ConstraintGuid::nil()]
-                        .into_iter()
-                        .chain(func.constraints.iter().map(|c| c.guid))
-                    {
-                        // Update constraint_to_names for unique constraint calculation
-                        constraint_map
-                            .entry(func.guid)
-                            .or_default()
-                            .entry(constraint)
+                    let func_entry = constraint_map.entry(func.guid).or_default();
+                    // Add the nil constraint first
+                    func_entry
+                        .entry(Constraint::nil())
+                        .or_default()
+                        .insert(function_name_id);
+                    // Add all other constraints
+                    for constraint in &func.constraints {
+                        func_entry
+                            .entry(*constraint)
                             .or_default()
                             .insert(function_name_id);
                     }
@@ -341,7 +343,7 @@ fn command_analyze(
 
     struct DbContext<'a> {
         cache_unique_constraints:
-            HashMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<StringRef<'a>>>>,
+            HashMap<FunctionGuid, HashMap<Constraint, HashSet<StringRef<'a>>>>,
     }
 
     let new_pb = |len, msg| {
@@ -409,7 +411,7 @@ fn command_analyze(
             for (parent_addr, offset) in parent_calls {
                 if let Some(parent_guid) = functions_by_addr.get(parent_addr) {
                     func.constraints.push(warp::Constraint {
-                        guid: warp::ConstraintGuid::from_parent_call(*parent_guid),
+                        guid: ConstraintGuid::from_parent_call(*parent_guid),
                         offset: Some(*offset as i64),
                     });
                 }
@@ -429,7 +431,7 @@ fn command_analyze(
         let pb = new_pb(function_guids.len() as u64, "Loading function GUIDs");
         let cache_unique_constraints: HashMap<
             FunctionGuid,
-            HashMap<ConstraintGuid, HashSet<StringRef>>,
+            HashMap<Constraint, HashSet<StringRef>>,
         > = function_guids
             .par_iter()
             .progress_with(pb)
@@ -437,7 +439,7 @@ fn command_analyze(
                 (
                     *guid,
                     db.iter_constraints(guid)
-                        .map(|c| (*c.guid(), c.iter_symbols().collect()))
+                        .map(|c| (*c.constraint(), c.iter_symbols().collect()))
                         .collect(),
                 )
             })
@@ -466,7 +468,7 @@ fn command_analyze(
             .with_message("Matching functions");
 
         unmatched_functions.iter().progress_with(pb).try_for_each(
-            |(_, func): (&u64, &&warp::Function)| -> Result<()> {
+            |(_, func): (&u64, &&Function)| -> Result<()> {
                 // Add symbol-based constraints for already matched functions
                 let mut constraints = func.constraints.clone();
 
@@ -477,8 +479,8 @@ fn command_analyze(
                         .and_then(|m| m.unique_name.as_deref())
                     {
                         let target_symbol = warp::SymbolGuid::from_symbol(unique_name);
-                        constraints.push(warp::Constraint {
-                            guid: warp::ConstraintGuid::from_symbol_child_call(target_symbol),
+                        constraints.push(Constraint {
+                            guid: ConstraintGuid::from_symbol_child_call(target_symbol),
                             offset: Some(call.offset as i64),
                         });
                     }
@@ -492,8 +494,8 @@ fn command_analyze(
                             .and_then(|m| m.unique_name.as_deref())
                         {
                             let parent_symbol = warp::SymbolGuid::from_symbol(unique_name);
-                            constraints.push(warp::Constraint {
-                                guid: warp::ConstraintGuid::from_symbol_parent_call(parent_symbol),
+                            constraints.push(Constraint {
+                                guid: ConstraintGuid::from_symbol_parent_call(parent_symbol),
                                 offset: Some(*offset as i64),
                             });
                         }
@@ -505,10 +507,9 @@ fn command_analyze(
                     let db_constraints =
                         db_context.cache_unique_constraints.get(&func.guid).unwrap();
 
-                    let query_constraints: HashSet<ConstraintGuid> =
-                        constraints.iter().map(|c| c.guid).collect();
+                    let query_constraints: HashSet<&Constraint> = constraints.iter().collect();
 
-                    let mut unique_name = [ConstraintGuid::nil()]
+                    let mut unique_name = [&Constraint::nil()]
                         .iter()
                         .chain(query_constraints.iter())
                         .find_map(|c| {
@@ -685,9 +686,6 @@ fn command_dump_db(
 
     // Stream functions one at a time
     for func_guid in functions {
-        // Get constraints for this function
-        let constraints = db.query_constraints_for_function(&func_guid)?;
-
         // Write function object
         json_writer.begin_object()?;
         json_writer.name("function")?;
@@ -696,19 +694,25 @@ fn command_dump_db(
         json_writer.name("constraints")?;
         json_writer.begin_array()?;
 
-        // Write constraints
-        for (constraint_guid, symbols) in constraints {
+        // Write constraints using iterator to get offset information
+        for constraint_info in db.iter_constraints(&func_guid) {
             json_writer.begin_object()?;
 
             json_writer.name("constraint")?;
-            json_writer.string_value(&constraint_guid.to_string())?;
+            json_writer.string_value(&constraint_info.constraint().guid.to_string())?;
+
+            // Add offset field if present
+            if let Some(offset) = constraint_info.constraint().offset {
+                json_writer.name("offset")?;
+                json_writer.number_value(offset)?;
+            }
 
             json_writer.name("symbols")?;
             json_writer.begin_array()?;
 
             // Write symbols
-            for symbol in symbols {
-                json_writer.string_value(symbol)?;
+            for symbol in constraint_info.iter_symbols() {
+                json_writer.string_value(symbol.as_str()?)?;
             }
 
             json_writer.end_array()?;
