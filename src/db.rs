@@ -4,7 +4,6 @@ use byteorder::{LE, WriteBytesExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Seek, SeekFrom, Write};
-use uuid::Uuid;
 use varint_rs::{VarintReader, VarintWriter};
 
 // header (fixed size: 48 bytes)
@@ -25,7 +24,7 @@ use varint_rs::{VarintReader, VarintWriter};
 // constraints section (fixed width)
 // [ 4 bytes] count
 // for each:
-//   [16 bytes] ConstraintGUID
+//   [8 bytes] ConstraintGUID (u64)
 //
 // constraint strings section (variable width)
 // [ 4 bytes] count
@@ -43,15 +42,15 @@ use varint_rs::{VarintReader, VarintWriter};
 // functions section (fixed width for binary search)
 // [ 4 bytes] count
 // for each:
-//   [16 bytes] FunctionGUID
+//   [8 bytes] FunctionGUID (u64)
 //   [ 4 bytes] byte offset to first constraint in function constraints section
 //   [ 4 bytes] number of constraints
 
 const MAGIC: &[u8; 7] = b"BINFOLD";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
-const CONSTRAINTS_SIZE: usize = 16;
-const FUNCTION_SIZE: usize = 16 + 4 + 4;
+const CONSTRAINTS_SIZE: usize = 8;
+const FUNCTION_SIZE: usize = 8 + 4 + 4;
 
 fn write_varint_u64<W: Write>(writer: &mut W, value: u64) -> io::Result<usize> {
     let mut buf = Vec::with_capacity(9);
@@ -152,8 +151,8 @@ impl<'a> Db<'a> {
     fn slice_at(&self, offset: usize, len: usize) -> &'a [u8] {
         &self.data[offset..offset + len]
     }
-    fn uuid_at(&self, offset: usize) -> Uuid {
-        Uuid::from_bytes(self.slice_at(offset, 16).try_into().unwrap())
+    fn u64_at(&self, offset: usize) -> u64 {
+        u64::from_le_bytes(self.slice_at(offset, 8).try_into().unwrap())
     }
     fn u32_at(&self, offset: usize) -> u32 {
         u32::from_le_bytes(self.slice_at(offset, 4).try_into().unwrap())
@@ -233,7 +232,7 @@ impl<'a> Db<'a> {
 
     pub fn iter_constraints<'db>(
         &'db self,
-        function_guid: &FunctionGuid,
+        function_guid: FunctionGuid,
     ) -> ConstraintIterator<'db, 'a> {
         // Find the function in the functions section using binary search
         let functions_start = self.header.functions_offset as usize;
@@ -247,14 +246,14 @@ impl<'a> Db<'a> {
             let mid = left + (right - left) / 2;
             let function_offset = functions_start + 4 + (mid * FUNCTION_SIZE);
 
-            let current_guid = FunctionGuid(self.uuid_at(function_offset));
+            let current_guid = FunctionGuid(self.u64_at(function_offset));
 
-            match current_guid.cmp(function_guid) {
+            match current_guid.cmp(&function_guid) {
                 std::cmp::Ordering::Less => left = mid + 1,
                 std::cmp::Ordering::Greater => right = mid,
                 std::cmp::Ordering::Equal => {
-                    let constraint_byte_offset = self.u32_at(function_offset + 16) as usize;
-                    let num_constraints = self.u32_at(function_offset + 20) as usize;
+                    let constraint_byte_offset = self.u32_at(function_offset + 8) as usize;
+                    let num_constraints = self.u32_at(function_offset + 12) as usize;
 
                     return ConstraintIterator {
                         db: self,
@@ -276,7 +275,7 @@ impl<'a> Db<'a> {
 
     pub fn query_constraints_for_function(
         &self,
-        function_guid: &FunctionGuid,
+        function_guid: FunctionGuid,
     ) -> Result<HashMap<ConstraintGuid, Vec<&'a str>>> {
         self.iter_constraints(function_guid)
             .map(|c| {
@@ -290,7 +289,7 @@ impl<'a> Db<'a> {
 
     pub fn query_constraints_for_function_refs(
         &self,
-        function_guid: &FunctionGuid,
+        function_guid: FunctionGuid,
     ) -> HashMap<ConstraintGuid, Vec<StringRef<'a>>> {
         self.iter_constraints(function_guid)
             .map(|c| (c.constraint.guid, c.iter_symbols().collect()))
@@ -346,19 +345,19 @@ impl<'a> DbWriter<'a> {
 
         // Write constraints section
         let constraints_offset = writer.stream_position()?;
-        let mut constraints_map: HashMap<&ConstraintGuid, u64> = Default::default();
-        let mut constraints_vec: Vec<&ConstraintGuid> = Default::default();
+        let mut constraints_map: HashMap<ConstraintGuid, u64> = Default::default();
+        let mut constraints_vec: Vec<ConstraintGuid> = Default::default();
         for f in self.functions.values() {
             for constraint in f.keys() {
-                constraints_map.entry(&constraint.guid).or_insert_with(|| {
-                    constraints_vec.push(&constraint.guid);
+                constraints_map.entry(constraint.guid).or_insert_with(|| {
+                    constraints_vec.push(constraint.guid);
                     (constraints_vec.len() - 1).try_into().unwrap()
                 });
             }
         }
         writer.write_u32::<LE>(constraints_vec.len().try_into().unwrap())?;
         for guid in constraints_vec {
-            writer.write_all(guid.0.as_bytes())?;
+            writer.write_u64::<LE>(guid.0)?;
         }
 
         // Write constraint strings
@@ -416,7 +415,7 @@ impl<'a> DbWriter<'a> {
         for ((func_guid, constraints), byte_offset) in
             self.functions.iter().zip(function_constraint_byte_offsets)
         {
-            writer.write_all(func_guid.0.as_bytes())?;
+            writer.write_u64::<LE>(func_guid.0)?;
             writer.write_u32::<LE>(byte_offset.try_into().unwrap())?;
             writer.write_u32::<LE>(constraints.len().try_into().unwrap())?;
         }
@@ -492,7 +491,7 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
         let constraints_start = self.db.header.constraints_offset as usize;
         let constraint_guid = ConstraintGuid(
             self.db
-                .uuid_at(constraints_start + 4 + constraint_index as usize * CONSTRAINTS_SIZE),
+                .u64_at(constraints_start + 4 + constraint_index as usize * CONSTRAINTS_SIZE),
         );
 
         self.current += 1;
@@ -563,7 +562,7 @@ impl<'db, 'a> Iterator for FunctionIterator<'db, 'a> {
         let functions_start = self.db.header.functions_offset as usize;
         let function_offset = functions_start + 4 + (self.current * FUNCTION_SIZE);
 
-        let func_guid = FunctionGuid(self.db.uuid_at(function_offset));
+        let func_guid = FunctionGuid(self.db.u64_at(function_offset));
         self.current += 1;
 
         Some(func_guid)
@@ -575,13 +574,13 @@ mod tests {
     use super::*;
 
     fn test_db() -> Vec<u8> {
-        let func_guid = FunctionGuid(Uuid::from_bytes([b'A'; 16]));
+        let func_guid = FunctionGuid(0x4141414141414141);
         let constraint1 = Constraint {
-            guid: ConstraintGuid(Uuid::from_bytes([b'B'; 16])),
+            guid: ConstraintGuid(0x4242424242424242),
             offset: Some(100),
         };
         let constraint2 = Constraint {
-            guid: ConstraintGuid(Uuid::from_bytes([b'C'; 16])),
+            guid: ConstraintGuid(0x4343434343434343),
             offset: None,
         };
 
@@ -609,14 +608,14 @@ mod tests {
 
     #[test]
     fn test_write_and_read() {
-        let func_guid = FunctionGuid(Uuid::from_bytes([b'A'; 16]));
-        let constraint1 = ConstraintGuid(Uuid::from_bytes([b'B'; 16]));
-        let constraint2 = ConstraintGuid(Uuid::from_bytes([b'C'; 16]));
+        let func_guid = FunctionGuid(0x4141414141414141);
+        let constraint1 = ConstraintGuid(0x4242424242424242);
+        let constraint2 = ConstraintGuid(0x4343434343434343);
 
         let buffer = test_db();
 
         let db = Db::new(&buffer).unwrap();
-        let constraints = db.query_constraints_for_function(&func_guid).unwrap();
+        let constraints = db.query_constraints_for_function(func_guid).unwrap();
 
         use std::collections::HashSet;
 
@@ -633,20 +632,20 @@ mod tests {
 
     #[test]
     fn test_direct_constraint_iterator() {
-        let func_guid1 = FunctionGuid(Uuid::from_bytes([b'A'; 16]));
-        let func_guid2 = FunctionGuid(Uuid::from_bytes([b'D'; 16]));
+        let func_guid1 = FunctionGuid(0x4141414141414141);
+        let func_guid2 = FunctionGuid(0x4444444444444444);
 
         let buffer = test_db();
 
         let db = Db::new(&buffer).unwrap();
 
         // Test direct constraint iterator lookup
-        let constraints: Vec<_> = db.iter_constraints(&func_guid1).collect();
+        let constraints: Vec<_> = db.iter_constraints(func_guid1).collect();
         assert_eq!(constraints.len(), 2);
 
         // Find constraints by their GUIDs
-        let constraint1_guid = ConstraintGuid(Uuid::from_bytes([b'B'; 16]));
-        let constraint2_guid = ConstraintGuid(Uuid::from_bytes([b'C'; 16]));
+        let constraint1_guid = ConstraintGuid(0x4242424242424242);
+        let constraint2_guid = ConstraintGuid(0x4343434343434343);
 
         let c1 = constraints
             .iter()
@@ -663,6 +662,6 @@ mod tests {
         assert_eq!(c2.constraint.offset, None);
 
         // Test non-existent function
-        assert_eq!(0, db.iter_constraints(&func_guid2).count());
+        assert_eq!(0, db.iter_constraints(func_guid2).count());
     }
 }

@@ -8,7 +8,6 @@ debug = true
 
 [dependencies]
 iced-x86 = "1.21"
-uuid = { version = "1.10", features = ["v5"] }
 object = { version = "0.36", features = ["read", "pe"] }
 memmap2 = "0.9"
 byteorder = "1.5"
@@ -22,3 +21,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 struson = "0.5"
 varint-rs = "2.2"
+twox-hash = "2.1.1"
