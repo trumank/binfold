@@ -5,53 +5,66 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Seek, SeekFrom, Write};
 use uuid::Uuid;
+use varint_rs::{VarintReader, VarintWriter};
 
-// header
-// [8 bytes] magic
-// [file offset of strings section]
-// [file offset of constraints section]
-// [file offset of constraint strings section]
-// [file offset of function constraints section]
-// [file offset of functions section]
+// header (fixed size: 48 bytes)
+// [ 7 bytes] magic: "BINFOLD"
+// [ 1 byte ] version
+// [ 8 bytes] file offset of strings section
+// [ 8 bytes] file offset of constraints section
+// [ 8 bytes] file offset of constraint strings section
+// [ 8 bytes] file offset of function constraints section
+// [ 8 bytes] file offset of functions section
 //
-// strings section
-// [4 bytes] count
+// strings section (variable width)
+// [varint] count
 // for each:
-//   [4 bytes] String length
-//   [N bytes] UTF-8 string data
+//   [varint] string length
+//   [ N bytes] UTF-8 string data
 //
-// constraints section
-// [4 bytes] count
+// constraints section (fixed width)
+// [ 4 bytes] count
 // for each:
 //   [16 bytes] ConstraintGUID
 //
-// constraint strings section
-// [4 bytes] count
+// constraint strings section (variable width)
+// [ 4 bytes] count
 // for each:
-//   [4 bytes] byte offset into strings section
+//   [varint] byte offset into strings section
 //
-// function constraints section
-// [4 bytes] count
+// function constraints section (variable width)
+// [ 4 bytes] count
 // for each:
-//   [4 bytes] index of constraint
-//   [8 bytes] constraint offset (i64::MAX if None)
-//   [4 bytes] number of strings
-//   [4 bytes] index of constraint strings
+//   [varint] index of constraint in constraints section
+//   [varint] constraint offset (i64::MAX if None)
+//   [varint] number of strings
+//   [varint] byte offset into constraint strings section
 //
-// functions section
-// [4 bytes] count
+// functions section (fixed width for binary search)
+// [ 4 bytes] count
 // for each:
 //   [16 bytes] FunctionGUID
-//   [4 bytes] index of constraints
-//   [4 bytes] number of constraints
+//   [ 4 bytes] byte offset to first constraint in function constraints section
+//   [ 4 bytes] number of constraints
 
 const MAGIC: &[u8; 7] = b"BINFOLD";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 const CONSTRAINTS_SIZE: usize = 16;
-const CONSTRAINT_STRINGS_SIZE: usize = 4;
-const FUNCTION_CONSTRAINTS_SIZE: usize = 4 + 8 + 4 + 4;
 const FUNCTION_SIZE: usize = 16 + 4 + 4;
+
+fn write_varint_u64<W: Write>(writer: &mut W, value: u64) -> io::Result<usize> {
+    let mut buf = Vec::with_capacity(9);
+    buf.write_u64_varint(value)?;
+    writer.write_all(&buf)?;
+    Ok(buf.len())
+}
+fn write_varint_i64<W: Write>(writer: &mut W, value: i64) -> io::Result<usize> {
+    let mut buf = Vec::with_capacity(9);
+    buf.write_i64_varint(value)?;
+    writer.write_all(&buf)?;
+    Ok(buf.len())
+}
 
 /// A reference to a string in the database that can be compared without loading the actual string
 #[derive(Clone, Copy)]
@@ -145,8 +158,12 @@ impl<'a> Db<'a> {
     fn u32_at(&self, offset: usize) -> u32 {
         u32::from_le_bytes(self.slice_at(offset, 4).try_into().unwrap())
     }
-    fn i64_at(&self, offset: usize) -> i64 {
-        i64::from_le_bytes(self.slice_at(offset, 8).try_into().unwrap())
+
+    fn read_varint_u64_at(&self, offset: usize) -> Result<(u64, usize)> {
+        let mut cursor = std::io::Cursor::new(&self.data[offset..]);
+        let value = cursor.read_u64_varint()?;
+        let bytes_read = cursor.position() as usize;
+        Ok((value, bytes_read))
     }
 
     pub fn function_count(&self) -> usize {
@@ -236,12 +253,12 @@ impl<'a> Db<'a> {
                 std::cmp::Ordering::Less => left = mid + 1,
                 std::cmp::Ordering::Greater => right = mid,
                 std::cmp::Ordering::Equal => {
-                    let constraint_index = self.u32_at(function_offset + 16) as usize;
+                    let constraint_byte_offset = self.u32_at(function_offset + 16) as usize;
                     let num_constraints = self.u32_at(function_offset + 20) as usize;
 
                     return ConstraintIterator {
                         db: self,
-                        constraint_index,
+                        current_byte_offset: constraint_byte_offset,
                         current: 0,
                         total: num_constraints,
                     };
@@ -251,7 +268,7 @@ impl<'a> Db<'a> {
 
         ConstraintIterator {
             db: self,
-            constraint_index: 0,
+            current_byte_offset: 0,
             current: 0,
             total: 0,
         }
@@ -280,17 +297,12 @@ impl<'a> Db<'a> {
             .collect()
     }
 
-    fn read_string_at_offset(&self, offset: u32) -> Result<&'a str> {
-        let file_offset = self.header.strings_offset as usize + offset as usize;
-        let len = self.u32_at(file_offset) as usize;
-        Ok(str::from_utf8(self.slice_at(file_offset + 4, len))?)
-    }
+    fn string_ref_at_offset(&self, offset: usize) -> StringRef<'a> {
+        let start = self.header.strings_offset as usize + offset;
 
-    fn string_ref_at_offset(&self, offset: u32) -> StringRef<'a> {
-        let file_offset = self.header.strings_offset as usize + offset as usize;
-        let len = self.u32_at(file_offset) as usize;
+        let (len, bytes_read) = self.read_varint_u64_at(start).unwrap();
         StringRef {
-            data: self.slice_at(file_offset + 4, len),
+            data: self.slice_at(start + bytes_read, len as usize),
         }
     }
 }
@@ -318,22 +330,23 @@ impl<'a> DbWriter<'a> {
         writer.write_u64::<LE>(0)?; // function_constraints_offset placeholder
         writer.write_u64::<LE>(0)?; // functions_offset placeholder
 
-        // Write strings section and record offsets as we go
+        // Write strings section with varints
         let strings_offset = writer.stream_position()?;
         writer.write_u32::<LE>(self.strings.len().try_into().unwrap())?;
 
-        let mut string_offsets = Vec::with_capacity(self.strings.len());
-        let mut offset = 4;
+        let mut string_byte_offsets = Vec::with_capacity(self.strings.len());
+        let mut byte_offset = 4u64;
+
         for string in self.strings {
-            string_offsets.push(offset);
-            writer.write_u32::<LE>(string.len().try_into().unwrap())?;
+            string_byte_offsets.push(byte_offset);
+            let len_bytes = write_varint_u64(writer, string.len() as u64)?;
             writer.write_all(string.as_bytes())?;
-            offset += 4 + string.len() as u32;
+            byte_offset += len_bytes as u64 + string.len() as u64;
         }
 
         // Write constraints section
         let constraints_offset = writer.stream_position()?;
-        let mut constraints_map: HashMap<&ConstraintGuid, u32> = Default::default();
+        let mut constraints_map: HashMap<&ConstraintGuid, u64> = Default::default();
         let mut constraints_vec: Vec<&ConstraintGuid> = Default::default();
         for f in self.functions.values() {
             for constraint in f.keys() {
@@ -348,7 +361,7 @@ impl<'a> DbWriter<'a> {
             writer.write_all(guid.0.as_bytes())?;
         }
 
-        // Write constraint strings section
+        // Write constraint strings
         let constraint_strings_offset = writer.stream_position()?;
         let all_constraint_strings: usize = self
             .functions
@@ -356,42 +369,56 @@ impl<'a> DbWriter<'a> {
             .map(|c| c.values().map(|s| s.len()).sum::<usize>())
             .sum();
         writer.write_u32::<LE>(all_constraint_strings.try_into().unwrap())?;
-        let mut constraint_string_indexes = vec![];
-        let mut index = 0;
+
+        let mut constraint_string_byte_offsets = Vec::with_capacity(all_constraint_strings);
+        let mut byte_offset = 4u64;
+
         for f in self.functions.values() {
             for strings in f.values() {
-                constraint_string_indexes.push(index);
+                constraint_string_byte_offsets.push(byte_offset);
                 for string_idx in strings {
-                    writer.write_u32::<LE>(string_offsets[*string_idx as usize])?;
-                    index += 1;
+                    let string_offset = string_byte_offsets[*string_idx as usize];
+                    byte_offset += write_varint_u64(writer, string_offset)? as u64;
                 }
             }
         }
 
-        // Write function constraints section
+        // Write function constraints section with varints
         let function_constraints_offset = writer.stream_position()?;
         let all_constraints: usize = self.functions.values().map(|c| c.len()).sum();
         writer.write_u32::<LE>(all_constraints.try_into().unwrap())?;
+
+        let mut function_constraint_byte_offsets = Vec::with_capacity(self.functions.len());
+        let mut current_byte_offset = 4u64;
         let mut constraint_index = 0;
-        for f in self.functions.values() {
-            for (constraint, strings) in f {
-                writer.write_u32::<LE>(constraints_map[&constraint.guid])?;
-                writer.write_i64::<LE>(constraint.offset.unwrap_or(i64::MAX))?;
-                writer.write_u32::<LE>(strings.len().try_into().unwrap())?;
-                writer.write_u32::<LE>(constraint_string_indexes[constraint_index])?;
+
+        for constraints in self.functions.values() {
+            function_constraint_byte_offsets.push(current_byte_offset);
+
+            for (constraint, strings) in constraints {
+                current_byte_offset +=
+                    write_varint_u64(writer, constraints_map[&constraint.guid])? as u64;
+                current_byte_offset +=
+                    write_varint_i64(writer, constraint.offset.unwrap_or(i64::MAX))? as u64;
+                current_byte_offset += write_varint_u64(writer, strings.len() as u64)? as u64;
+                current_byte_offset +=
+                    write_varint_u64(writer, constraint_string_byte_offsets[constraint_index])?
+                        as u64;
+
                 constraint_index += 1;
             }
         }
 
-        // Write functions section
+        // Write functions section (fixed width for binary search)
         let functions_offset = writer.stream_position()?;
         writer.write_u32::<LE>(self.functions.len().try_into().unwrap())?;
-        let mut constraint_index = 0;
-        for (func_guid, constraints) in self.functions {
+
+        for ((func_guid, constraints), byte_offset) in
+            self.functions.iter().zip(function_constraint_byte_offsets)
+        {
             writer.write_all(func_guid.0.as_bytes())?;
-            writer.write_u32::<LE>(constraint_index)?;
+            writer.write_u32::<LE>(byte_offset.try_into().unwrap())?;
             writer.write_u32::<LE>(constraints.len().try_into().unwrap())?;
-            constraint_index += constraints.len() as u32;
         }
 
         // Go back and write the actual offsets
@@ -408,7 +435,7 @@ impl<'a> DbWriter<'a> {
 
 pub struct ConstraintIterator<'db, 'a> {
     db: &'db Db<'a>,
-    constraint_index: usize,
+    current_byte_offset: usize,
     current: usize,
     total: usize,
 }
@@ -417,7 +444,7 @@ pub struct ConstraintInfo<'db, 'a> {
     db: &'db Db<'a>,
     constraint: Constraint,
     symbol_count: usize,
-    string_index: usize,
+    string_byte_offset: usize,
 }
 
 impl<'db, 'a> ConstraintInfo<'db, 'a> {
@@ -431,7 +458,7 @@ impl<'db, 'a> ConstraintInfo<'db, 'a> {
     pub fn iter_symbols(&self) -> SymbolIterator<'db, 'a> {
         SymbolIterator {
             db: self.db,
-            string_index: self.string_index,
+            current_byte_offset: self.string_byte_offset,
             current: 0,
             total: self.symbol_count,
         }
@@ -451,24 +478,25 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
             return None;
         }
 
-        let constraints_start = self.db.header.function_constraints_offset as usize + 4;
-        let offset = constraints_start
-            + ((self.constraint_index + self.current) * FUNCTION_CONSTRAINTS_SIZE);
+        let offset = self.db.header.function_constraints_offset as usize + self.current_byte_offset;
+        let mut cursor = std::io::Cursor::new(&self.db.data[offset..]);
 
-        let constraint_index = self.db.u32_at(offset) as usize;
-        let constraint_guid = ConstraintGuid(self.db.uuid_at(
-            self.db.header.constraints_offset as usize + 4 + constraint_index * CONSTRAINTS_SIZE,
-        ));
-        let constraint_offset_raw = self.db.i64_at(offset + 4);
-        let constraint_offset = if constraint_offset_raw == i64::MAX {
-            None
-        } else {
-            Some(constraint_offset_raw)
-        };
-        let string_count = self.db.u32_at(offset + 12) as usize;
-        let string_index = self.db.u32_at(offset + 16) as usize;
+        let constraint_index = cursor.read_u64_varint().unwrap();
+        let constraint_offset_raw = cursor.read_i64_varint().unwrap();
+        let constraint_offset =
+            (constraint_offset_raw != i64::MAX).then_some(constraint_offset_raw);
+        let string_count = cursor.read_u64_varint().unwrap() as usize;
+        let string_byte_offset = cursor.read_u64_varint().unwrap();
+
+        // Calculate constraint GUID from byte offset
+        let constraints_start = self.db.header.constraints_offset as usize;
+        let constraint_guid = ConstraintGuid(
+            self.db
+                .uuid_at(constraints_start + 4 + constraint_index as usize * CONSTRAINTS_SIZE),
+        );
 
         self.current += 1;
+        self.current_byte_offset += cursor.position() as usize;
 
         Some(ConstraintInfo {
             constraint: Constraint {
@@ -476,7 +504,7 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
                 offset: constraint_offset,
             },
             symbol_count: string_count,
-            string_index,
+            string_byte_offset: string_byte_offset as usize,
             db: self.db,
         })
     }
@@ -484,7 +512,7 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
 
 pub struct SymbolIterator<'db, 'a> {
     db: &'db Db<'a>,
-    string_index: usize,
+    current_byte_offset: usize,
     current: usize,
     total: usize,
 }
@@ -502,13 +530,14 @@ impl<'db, 'a> Iterator for SymbolIterator<'db, 'a> {
             return None;
         }
 
-        let constraint_strings_start = self.db.header.constraint_strings_offset as usize + 4;
-        let offset =
-            constraint_strings_start + (self.string_index + self.current) * CONSTRAINT_STRINGS_SIZE;
-        let string_offset = self.db.u32_at(offset);
+        let offset = self.db.header.constraint_strings_offset as usize + self.current_byte_offset;
+
+        // Read string byte offset
+        let (string_byte_offset, bytes_read) = self.db.read_varint_u64_at(offset).unwrap();
+        self.current_byte_offset += bytes_read;
 
         self.current += 1;
-        Some(self.db.string_ref_at_offset(string_offset))
+        Some(self.db.string_ref_at_offset(string_byte_offset as usize))
     }
 }
 

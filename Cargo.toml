@@ -21,3 +21,4 @@ pdb-sdk = { git = "https://github.com/jac3km4/pdb-sdk", version = "0.1.0" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 struson = "0.5"
+varint-rs = "2.2"
