@@ -95,8 +95,8 @@ fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
 fn main() -> Result<()> {
     // Initialize tracing subscriber with environment filter
     // Users can control logging via RUST_LOG env var, e.g.:
-    // RUST_LOG=warp_testing=debug
-    // RUST_LOG=warp_testing::warp=trace,warp_testing::constraint_matcher=debug
+    // RUST_LOG=binfold=debug
+    // RUST_LOG=binfold::warp=trace,binfold::constraint_matcher=debug
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(

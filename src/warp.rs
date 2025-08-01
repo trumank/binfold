@@ -128,7 +128,7 @@ pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64) -> Result<Function
     let func_size = pe.find_function_size_with_cfg(address, Some(&mut cfg))?;
 
     debug!(
-        target: "warp_testing::warp",
+        target: "binfold::warp",
         size = format!("0x{func_size:x}"),
         "Function size"
     );
@@ -144,7 +144,7 @@ pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Res
     let func_size = pe.find_function_size_with_cfg(address, Some(&mut cfg))?;
 
     debug!(
-        target: "warp_testing::warp",
+        target: "binfold::warp",
         size = format!("0x{func_size:x}"),
         "Function size"
     );
@@ -205,7 +205,7 @@ pub fn compute_warp_uuid(
     pe: &PeLoader,
 ) -> FunctionGuid {
     debug!(
-        target: "warp_testing::warp",
+        target: "binfold::warp",
         blocks = cfg.basic_blocks.len(),
         "Identified basic blocks"
     );
@@ -226,7 +226,7 @@ pub fn compute_warp_uuid(
         block_uuids.push((start_addr, uuid));
 
         debug!(
-            target: "warp_testing::warp::guid",
+            target: "binfold::warp::guid",
             block_start = format!("0x{start_addr:x}"),
             block_end = format!("0x{end_addr:x}"),
             uuid = %uuid,
@@ -235,10 +235,10 @@ pub fn compute_warp_uuid(
     }
 
     // Print disassembly for each basic block if requested
-    if tracing::enabled!(target: "warp_testing::warp::blocks", tracing::Level::DEBUG) {
+    if tracing::enabled!(target: "binfold::warp::blocks", tracing::Level::DEBUG) {
         for (&start_addr, &end_addr) in &cfg.basic_blocks {
             debug!(
-                target: "warp_testing::warp::blocks",
+                target: "binfold::warp::blocks",
                 start = format!("0x{start_addr:x}"),
                 end = format!("0x{end_addr:x}"),
                 "Basic block"
@@ -256,7 +256,7 @@ pub fn compute_warp_uuid(
                 let instruction = decoder.decode();
                 output.clear();
                 trace!(
-                    target: "warp_testing::warp::blocks",
+                    target: "binfold::warp::blocks",
                     addr = format!("0x{:x}", instruction.ip()),
                     instruction = %instruction,
                     "Instruction"
@@ -276,7 +276,7 @@ pub fn compute_warp_uuid(
     let function_uuid = FunctionGuid::from_bytes(&combined_bytes);
 
     debug!(
-        target: "warp_testing::warp::guid",
+        target: "binfold::warp::guid",
         block_count = block_uuids.len(),
         function_uuid = %function_uuid,
         "Function UUID calculated"
@@ -321,7 +321,7 @@ fn get_instruction_bytes_for_guid(
     decoder.set_ip(base);
 
     debug!(
-        target: "warp_testing::warp::guid",
+        target: "binfold::warp::guid",
         "Starting instruction processing for GUID"
     );
 
@@ -334,7 +334,7 @@ fn get_instruction_bytes_for_guid(
         // Skip instructions that set a register to itself (if they're effectively NOPs)
         if is_register_to_itself_nop(&instruction) {
             trace!(
-                target: "warp_testing::warp::guid",
+                target: "binfold::warp::guid",
                 addr = format!("0x{:x}", instruction.ip()),
                 instruction = %instruction,
                 "Skipping register-to-itself NOP"
@@ -353,7 +353,7 @@ fn get_instruction_bytes_for_guid(
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
             trace!(
-                target: "warp_testing::warp::guid",
+                target: "binfold::warp::guid",
                 addr = format!("0x{:x}", instruction.ip()),
                 instruction = %instruction,
                 bytes = format!("{:02x?}", instr_bytes),
@@ -363,7 +363,7 @@ fn get_instruction_bytes_for_guid(
             // Use actual instruction bytes
             bytes.extend_from_slice(instr_bytes);
             trace!(
-                target: "warp_testing::warp::guid",
+                target: "binfold::warp::guid",
                 addr = format!("0x{:x}", instruction.ip()),
                 instruction = %instruction,
                 bytes = format!("{:02x?}", instr_bytes),

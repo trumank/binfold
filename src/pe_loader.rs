@@ -176,7 +176,7 @@ impl PeLoader {
         let bytes = &self.mmap[start_offset..start_offset + scan_size];
 
         debug!(
-            target: "warp_testing::pe_loader::size",
+            target: "binfold::pe_loader::size",
             start = format!("0x{va:x}"),
             scan_range = format!("0x{scan_size:x}"),
             "Scanning function size"
@@ -203,14 +203,14 @@ impl PeLoader {
         }
 
         debug!(
-            target: "warp_testing::pe_loader::size",
+            target: "binfold::pe_loader::size",
             start = format!("0x{va:x}"),
             "Starting recursive descent"
         );
 
         while let Some((ip, from)) = queue.pop_front() {
             trace!(
-                target: "warp_testing::pe_loader::size",
+                target: "binfold::pe_loader::size",
                 at = format!("0x{ip:x}"),
                 from = from.map(|f| format!("0x{f:x}")),
                 "Disassembling"
@@ -224,7 +224,7 @@ impl PeLoader {
                 decoder.set_ip(ip);
             } else {
                 trace!(
-                    target: "warp_testing::pe_loader::size",
+                    target: "binfold::pe_loader::size",
                     address = format!("0x{ip:x}"),
                     "Out of function bounds"
                 );
@@ -236,7 +236,7 @@ impl PeLoader {
                 visited.insert(ip);
 
                 trace!(
-                    target: "warp_testing::pe_loader::size",
+                    target: "binfold::pe_loader::size",
                     offset = format!("0x{:<5x}", ip - va),
                     address = format!("0x{:x}", ip),
                     instruction = %instruction,
@@ -296,7 +296,7 @@ impl PeLoader {
                         // We can't determine the target statically, but we should
                         // at least handle known patterns
                         trace!(
-                            target: "warp_testing::pe_loader::size",
+                            target: "binfold::pe_loader::size",
                             address = format!("0x{ip:x}"),
                             "Found indirect branch"
                         );
@@ -310,7 +310,7 @@ impl PeLoader {
                     }
                     _ => {
                         trace!(
-                            target: "warp_testing::pe_loader::size",
+                            target: "binfold::pe_loader::size",
                             flow_control = ?instruction.flow_control(),
                             address = format!("0x{:x}", ip),
                             "Unhandled flow control"
@@ -362,7 +362,7 @@ impl PeLoader {
         }
 
         debug!(
-            target: "warp_testing::pe_loader::size",
+            target: "binfold::pe_loader::size",
             start = format!("0x{va:x}"),
             end = format!("0x{max_address:x}"),
             size = format!("0x{size:x}"),
