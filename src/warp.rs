@@ -3,29 +3,30 @@ use anyhow::Result;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use std::ops::Range;
 use tracing::{debug, trace};
-use uuid::{Uuid, uuid};
+use twox_hash::XxHash64;
 
-const NAMESPACE_FUNCTION: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
-const NAMESPACE_BASIC_BLOCK: Uuid = uuid!("0192a178-7a5f-7936-8653-3cbaa7d6afe7");
-const NAMESPACE_SYMBOL: Uuid = uuid!("6d5ace5a-0050-4e71-815e-5536e9e61484");
-const NAMESPACE_CHILD_CALL: Uuid = uuid!("7e3d0b40-56dd-4b77-a825-9c75b0b607c5");
-const NAMESPACE_PARENT_CALL: Uuid = uuid!("dc0e3d9d-72ea-46df-81fc-ebe4295f0977");
-const NAMESPACE_SYMBOL_CHILD_CALL: Uuid = uuid!("18811911-ca5d-4d97-a1c3-dd526ae818a5");
-const NAMESPACE_SYMBOL_PARENT_CALL: Uuid = uuid!("e4b07ff0-e798-4427-b533-174aebda4858");
-const NAMESPACE_DATA_CONST: Uuid = uuid!("db056d71-7d64-4660-a937-aeb6e8136af2");
+// Seeds for different hash namespaces
+const SEED_FUNCTION: u64 = 0x0192a17961ac7cef;
+const SEED_BASIC_BLOCK: u64 = 0x0192a1787a5f7936;
+const SEED_SYMBOL: u64 = 0x6d5ace5a00504e71;
+const SEED_CHILD_CALL: u64 = 0x7e3d0b4056dd4b77;
+const SEED_PARENT_CALL: u64 = 0xdc0e3d9d72ea46df;
+const SEED_SYMBOL_CHILD_CALL: u64 = 0x18811911ca5d4d97;
+const SEED_SYMBOL_PARENT_CALL: u64 = 0xe4b07ff0e7984427;
+const SEED_DATA_CONST: u64 = 0xdb056d717d644660;
 
 macro_rules! new_guid {
     ($name:ident) => {
         #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(pub Uuid);
+        pub struct $name(pub u64);
         impl $name {
             pub fn nil() -> Self {
-                Self(Uuid::nil())
+                Self(0)
             }
         }
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.0.fmt(f)
+                write!(f, "{:016x}", self.0)
             }
         }
     };
@@ -38,49 +39,49 @@ new_guid!(ConstraintGuid);
 
 impl FunctionGuid {
     fn from_bytes(bytes: &[u8]) -> Self {
-        Self(Uuid::new_v5(&NAMESPACE_FUNCTION, bytes))
+        Self(XxHash64::oneshot(SEED_FUNCTION, bytes))
     }
 }
 
 impl BasicBlockGuid {
     fn from_bytes(bytes: &[u8]) -> Self {
-        Self(Uuid::new_v5(&NAMESPACE_BASIC_BLOCK, bytes))
+        Self(XxHash64::oneshot(SEED_BASIC_BLOCK, bytes))
     }
 }
 
 impl ConstraintGuid {
     /// constraint on call to target function
     pub fn from_child_call(target: FunctionGuid) -> Self {
-        Self(Uuid::new_v5(&NAMESPACE_CHILD_CALL, target.0.as_bytes()))
+        Self(XxHash64::oneshot(SEED_CHILD_CALL, &target.0.to_le_bytes()))
     }
     /// constraint on target calling this function
     pub fn from_parent_call(target: FunctionGuid) -> Self {
-        Self(Uuid::new_v5(&NAMESPACE_PARENT_CALL, target.0.as_bytes()))
+        Self(XxHash64::oneshot(SEED_PARENT_CALL, &target.0.to_le_bytes()))
     }
     /// constraint on call to target function
     pub fn from_symbol_child_call(target: SymbolGuid) -> Self {
-        Self(Uuid::new_v5(
-            &NAMESPACE_SYMBOL_CHILD_CALL,
-            target.0.as_bytes(),
+        Self(XxHash64::oneshot(
+            SEED_SYMBOL_CHILD_CALL,
+            &target.0.to_le_bytes(),
         ))
     }
     /// constraint on target calling this function
     pub fn from_symbol_parent_call(target: SymbolGuid) -> Self {
-        Self(Uuid::new_v5(
-            &NAMESPACE_SYMBOL_PARENT_CALL,
-            target.0.as_bytes(),
+        Self(XxHash64::oneshot(
+            SEED_SYMBOL_PARENT_CALL,
+            &target.0.to_le_bytes(),
         ))
     }
     /// constraint on reference to read-only data
     pub fn from_data_const(data: &[u8]) -> Self {
-        Self(Uuid::new_v5(&NAMESPACE_DATA_CONST, data))
+        Self(XxHash64::oneshot(SEED_DATA_CONST, data))
     }
 }
 
 impl SymbolGuid {
     pub fn from_symbol(symbol_name: impl AsRef<str>) -> SymbolGuid {
-        Self(Uuid::new_v5(
-            &NAMESPACE_SYMBOL,
+        Self(XxHash64::oneshot(
+            SEED_SYMBOL,
             symbol_name.as_ref().as_bytes(),
         ))
     }
@@ -278,7 +279,7 @@ pub fn compute_warp_uuid(
     // actually combines them in low-to-high address order
     let mut combined_bytes = Vec::new();
     for (_, uuid) in block_uuids.iter() {
-        combined_bytes.extend_from_slice(uuid.0.as_bytes());
+        combined_bytes.extend_from_slice(&uuid.0.to_le_bytes());
     }
 
     let function_uuid = FunctionGuid::from_bytes(&combined_bytes);

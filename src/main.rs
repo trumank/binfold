@@ -6,12 +6,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use uuid::Uuid;
 
 use crate::db::{Db, DbWriter, StringRef};
 use crate::pe_loader::PeLoader;
 use crate::warp::{
-    Constraint, ConstraintGuid, Function, FunctionGuid, compute_function_guid_with_contraints,
+    Constraint, ConstraintGuid, Function, FunctionGuid, SymbolGuid,
+    compute_function_guid_with_contraints,
 };
 
 mod db;
@@ -82,9 +82,9 @@ struct CommandDumpDb {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Only dump a specific function by its GUID
-    #[arg(short, long)]
-    function: Option<Uuid>,
+    /// Only dump a specific function by its GUID (hex format)
+    #[arg(short, long, value_parser = parse_hex_guid)]
+    function: Option<u64>,
 }
 
 /// Display database statistics and structure information
@@ -101,6 +101,10 @@ fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
     } else {
         s.parse()
     }
+}
+
+fn parse_hex_guid(s: &str) -> Result<u64, String> {
+    u64::from_str_radix(s, 16).map_err(|e| e.to_string())
 }
 
 fn main() -> Result<()> {
@@ -448,7 +452,7 @@ fn command_analyze(
             .map(|guid| {
                 (
                     *guid,
-                    db.iter_constraints(guid)
+                    db.iter_constraints(*guid)
                         .map(|c| (*c.constraint(), c.iter_symbols().collect()))
                         .collect(),
                 )
@@ -488,7 +492,7 @@ fn command_analyze(
                         .get(&call.target)
                         .and_then(|m| m.unique_name.as_deref())
                     {
-                        let target_symbol = warp::SymbolGuid::from_symbol(unique_name);
+                        let target_symbol = SymbolGuid::from_symbol(unique_name);
                         constraints.push(Constraint {
                             guid: ConstraintGuid::from_symbol_child_call(target_symbol),
                             offset: Some(call.offset as i64),
@@ -503,7 +507,7 @@ fn command_analyze(
                             .get(parent_addr)
                             .and_then(|m| m.unique_name.as_deref())
                         {
-                            let parent_symbol = warp::SymbolGuid::from_symbol(unique_name);
+                            let parent_symbol = SymbolGuid::from_symbol(unique_name);
                             constraints.push(Constraint {
                                 guid: ConstraintGuid::from_symbol_parent_call(parent_symbol),
                                 offset: Some(*offset as i64),
@@ -705,7 +709,7 @@ fn command_dump_db(
         json_writer.begin_array()?;
 
         // Write constraints using iterator to get offset information
-        for constraint_info in db.iter_constraints(&func_guid) {
+        for constraint_info in db.iter_constraints(func_guid) {
             json_writer.begin_object()?;
 
             json_writer.name("constraint")?;
