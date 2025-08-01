@@ -51,7 +51,7 @@ The core matching algorithm is based on [WARP](https://github.com/vector35/warp)
 - function call names (hash of symbol name)
 - const string references
 
-Constraints can have an optional offset attached but they are not currently used. Constraints are only used in cases where the `(ConstraintGUID, FunctionGUID)` pair can uniquely identify a function. It should be possible to utilize multiple constraints to narrow and uniquely identify functions, but this comes a significant computation cost.
+Constraints can have an optional offset attached but they are not currently used.
 
 ## Future
 
@@ -59,6 +59,5 @@ Some more ideas worth exploring:
 - matching and naming global variables (tricky because there is nothing to hash like a function body)
 - add constraints based on variable names
 - add type information to symbols (like WARP does)
-- find ways of utilizing more than one constraint that is fast enough for analyzing an entire binary
 - improve function basic block analysis (notably jump tables)
 

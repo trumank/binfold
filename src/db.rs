@@ -2,6 +2,7 @@ use crate::warp::{ConstraintGuid, FunctionGuid};
 use anyhow::{Result, bail};
 use byteorder::{LE, WriteBytesExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Seek, SeekFrom, Write};
 use uuid::Uuid;
 
@@ -50,6 +51,38 @@ const CONSTRAINTS_SIZE: usize = 16;
 const CONSTRAINT_STRINGS_SIZE: usize = 4;
 const FUNCTION_CONSTRAINTS_SIZE: usize = 4 + 4 + 4;
 const FUNCTION_SIZE: usize = 16 + 4 + 4;
+
+/// A reference to a string in the database that can be compared without loading the actual string
+#[derive(Clone, Copy)]
+pub struct StringRef<'a> {
+    data: &'a [u8],
+}
+
+impl std::fmt::Debug for StringRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        String::from_utf8_lossy(self.data).fmt(f)
+    }
+}
+
+impl<'a> StringRef<'a> {
+    pub fn as_str(&self) -> Result<&'a str> {
+        Ok(std::str::from_utf8(self.data)?)
+    }
+}
+
+impl<'a> PartialEq for StringRef<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.data.as_ptr(), other.data.as_ptr())
+    }
+}
+
+impl<'a> Eq for StringRef<'a> {}
+
+impl<'a> Hash for StringRef<'a> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.data.as_ptr()).hash(state);
+    }
+}
 
 pub struct Db<'a> {
     data: &'a [u8],
@@ -167,10 +200,27 @@ impl<'a> Db<'a> {
             .collect()
     }
 
+    pub fn query_constraints_for_function_refs(
+        &self,
+        function_guid: &FunctionGuid,
+    ) -> HashMap<ConstraintGuid, Vec<StringRef<'a>>> {
+        self.iter_constraints(function_guid)
+            .map(|c| (*c.guid(), c.symbol_refs()))
+            .collect()
+    }
+
     fn read_string_at_offset(&self, offset: u32) -> Result<&'a str> {
         let file_offset = self.header.strings_offset as usize + offset as usize;
         let len = self.u32_at(file_offset) as usize;
         Ok(str::from_utf8(self.slice_at(file_offset + 4, len))?)
+    }
+
+    fn string_ref_at_offset(&self, offset: u32) -> StringRef<'a> {
+        let file_offset = self.header.strings_offset as usize + offset as usize;
+        let len = self.u32_at(file_offset) as usize;
+        StringRef {
+            data: self.slice_at(file_offset + 4, len),
+        }
     }
 }
 
@@ -317,6 +367,20 @@ impl<'db, 'a> ConstraintInfo<'db, 'a> {
         }
 
         Ok(strings)
+    }
+
+    pub fn symbol_refs(&self) -> Vec<StringRef<'a>> {
+        let constraint_strings_start = self.db.header.constraint_strings_offset as usize + 4;
+        let mut strings = Vec::with_capacity(self.symbol_count);
+
+        for j in 0..self.symbol_count {
+            let offset =
+                constraint_strings_start + (self.string_index + j) * CONSTRAINT_STRINGS_SIZE;
+            let offset = self.db.u32_at(offset);
+            strings.push(self.db.string_ref_at_offset(offset));
+        }
+
+        strings
     }
 }
 

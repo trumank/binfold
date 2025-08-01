@@ -90,6 +90,7 @@ impl SymbolGuid {
 pub struct Function {
     pub guid: FunctionGuid,
     pub address: u64,
+    pub size: usize,
     pub constraints: Vec<Constraint>,
     pub calls: Vec<FunctionCall>,
     pub data_refs: Vec<DataReference>,
@@ -187,6 +188,7 @@ pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Res
 
     Ok(Function {
         address,
+        size: func_size,
         guid,
         constraints,
         calls,
