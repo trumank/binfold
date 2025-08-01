@@ -87,7 +87,17 @@ impl<'a> Hash for StringRef<'a> {
 
 pub struct Db<'a> {
     data: &'a [u8],
-    header: Header,
+    pub header: Header,
+}
+
+#[derive(Debug)]
+pub struct SectionSizes {
+    pub header_size: usize,
+    pub strings_size: usize,
+    pub constraints_size: usize,
+    pub constraint_strings_size: usize,
+    pub function_constraints_size: usize,
+    pub functions_size: usize,
 }
 
 #[derive(Debug)]
@@ -142,6 +152,58 @@ impl<'a> Db<'a> {
     pub fn function_count(&self) -> usize {
         let functions_start = self.header.functions_offset as usize;
         self.u32_at(functions_start) as usize
+    }
+
+    pub fn constraint_count(&self) -> usize {
+        let constraints_start = self.header.constraints_offset as usize;
+        self.u32_at(constraints_start) as usize
+    }
+
+    pub fn string_count(&self) -> usize {
+        let strings_start = self.header.strings_offset as usize;
+        self.u32_at(strings_start) as usize
+    }
+
+    pub fn constraint_strings_count(&self) -> usize {
+        let constraint_strings_start = self.header.constraint_strings_offset as usize;
+        self.u32_at(constraint_strings_start) as usize
+    }
+
+    pub fn function_constraints_count(&self) -> usize {
+        let function_constraints_start = self.header.function_constraints_offset as usize;
+        self.u32_at(function_constraints_start) as usize
+    }
+
+    pub fn calculate_section_sizes(&self) -> SectionSizes {
+        // Header size is fixed at 48 bytes
+        let header_size = 48;
+
+        // Strings section
+        let strings_size = (self.header.constraints_offset - self.header.strings_offset) as usize;
+
+        // Constraints section
+        let constraints_size =
+            (self.header.constraint_strings_offset - self.header.constraints_offset) as usize;
+
+        // Constraint strings section
+        let constraint_strings_size = (self.header.function_constraints_offset
+            - self.header.constraint_strings_offset) as usize;
+
+        // Function constraints section
+        let function_constraints_size =
+            (self.header.functions_offset - self.header.function_constraints_offset) as usize;
+
+        // Functions section (to end of file)
+        let functions_size = self.data.len() - self.header.functions_offset as usize;
+
+        SectionSizes {
+            header_size,
+            strings_size,
+            constraints_size,
+            constraint_strings_size,
+            function_constraints_size,
+            functions_size,
+        }
     }
 
     pub fn iter_functions<'db>(&'db self) -> FunctionIterator<'db, 'a> {

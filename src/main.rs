@@ -40,6 +40,7 @@ enum Commands {
     GenDb(CommandGenDb),
     Analyze(CommandAnalyze),
     DumpDb(CommandDumpDb),
+    DbInfo(CommandDbInfo),
 }
 
 /// Create a database of function GUIDs/constraint GUIDs and their mappings to symbol names
@@ -86,6 +87,14 @@ struct CommandDumpDb {
     function: Option<Uuid>,
 }
 
+/// Display database statistics and structure information
+#[derive(Parser)]
+struct CommandDbInfo {
+    /// Path to database file
+    #[arg(short, long)]
+    database: PathBuf,
+}
+
 fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16)
@@ -116,6 +125,7 @@ fn main() -> Result<()> {
         Commands::GenDb(cmd) => command_gen_db(cmd),
         Commands::Analyze(cmd) => command_analyze(cmd),
         Commands::DumpDb(cmd) => command_dump_db(cmd),
+        Commands::DbInfo(cmd) => command_db_info(cmd),
     }
 }
 
@@ -726,6 +736,92 @@ fn command_dump_db(
     // Close JSON array and finish
     json_writer.end_array()?;
     json_writer.finish_document()?;
+
+    Ok(())
+}
+
+fn command_db_info(CommandDbInfo { database }: CommandDbInfo) -> Result<()> {
+    use std::fs;
+
+    let file = fs::File::open(&database)?;
+    let file_size = file.metadata()?.len();
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+    let db = Db::new(&mmap)?;
+
+    println!("Database Information");
+    println!("===================");
+    println!("File: {}", database.display());
+    println!(
+        "Total size: {} bytes ({:.2} MB)",
+        file_size,
+        file_size as f64 / 1_048_576.0
+    );
+    println!();
+
+    // Entry counts
+    println!("Entry Counts");
+    println!("------------");
+    println!("Functions: {}", db.function_count());
+    println!("Unique constraints: {}", db.constraint_count());
+    println!("Strings: {}", db.string_count());
+    println!(
+        "Constraint string references: {}",
+        db.constraint_strings_count()
+    );
+    println!("Function constraints: {}", db.function_constraints_count());
+    println!();
+
+    // Section offsets
+    let header = &db.header;
+    println!("Section Offsets");
+    println!("---------------");
+    println!("Strings: 0x{:08x}", header.strings_offset);
+    println!("Constraints: 0x{:08x}", header.constraints_offset);
+    println!(
+        "Constraint strings: 0x{:08x}",
+        header.constraint_strings_offset
+    );
+    println!(
+        "Function constraints: 0x{:08x}",
+        header.function_constraints_offset
+    );
+    println!("Functions: 0x{:08x}", header.functions_offset);
+    println!();
+
+    // Section sizes and disk usage
+    let sizes = db.calculate_section_sizes();
+    println!("Disk Usage by Section");
+    println!("--------------------");
+    println!(
+        "Header: {} bytes ({:.1}%)",
+        sizes.header_size,
+        sizes.header_size as f64 / file_size as f64 * 100.0
+    );
+    println!(
+        "Strings: {} bytes ({:.1}%)",
+        sizes.strings_size,
+        sizes.strings_size as f64 / file_size as f64 * 100.0
+    );
+    println!(
+        "Constraints: {} bytes ({:.1}%)",
+        sizes.constraints_size,
+        sizes.constraints_size as f64 / file_size as f64 * 100.0
+    );
+    println!(
+        "Constraint strings: {} bytes ({:.1}%)",
+        sizes.constraint_strings_size,
+        sizes.constraint_strings_size as f64 / file_size as f64 * 100.0
+    );
+    println!(
+        "Function constraints: {} bytes ({:.1}%)",
+        sizes.function_constraints_size,
+        sizes.function_constraints_size as f64 / file_size as f64 * 100.0
+    );
+    println!(
+        "Functions: {} bytes ({:.1}%)",
+        sizes.functions_size,
+        sizes.functions_size as f64 / file_size as f64 * 100.0
+    );
 
     Ok(())
 }
