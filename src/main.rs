@@ -433,19 +433,15 @@ fn command_analyze(
         > = function_guids
             .par_iter()
             .progress_with(pb)
-            .map(|guid| -> Result<_> {
-                let mut constraints: HashMap<ConstraintGuid, HashSet<StringRef>> =
-                    Default::default();
-                // collect unique symbols from each database
-                for c in db.iter_constraints(guid) {
-                    constraints
-                        .entry(*c.guid())
-                        .or_default()
-                        .extend(c.symbol_refs());
-                }
-                Ok((*guid, constraints))
+            .map(|guid| {
+                (
+                    *guid,
+                    db.iter_constraints(guid)
+                        .map(|c| (*c.guid(), c.iter_symbols().collect()))
+                        .collect(),
+                )
             })
-            .collect::<Result<_>>()?;
+            .collect();
 
         println!("Found {} constraint guids", cache_unique_constraints.len());
 

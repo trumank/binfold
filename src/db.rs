@@ -196,7 +196,12 @@ impl<'a> Db<'a> {
         function_guid: &FunctionGuid,
     ) -> Result<HashMap<ConstraintGuid, Vec<&'a str>>> {
         self.iter_constraints(function_guid)
-            .map(|c| c.symbols().map(|s| (c.guid, s)))
+            .map(|c| {
+                c.iter_symbols()
+                    .map(|s| s.as_str())
+                    .collect::<Result<_>>()
+                    .map(|s| (c.guid, s))
+            })
             .collect()
     }
 
@@ -205,7 +210,7 @@ impl<'a> Db<'a> {
         function_guid: &FunctionGuid,
     ) -> HashMap<ConstraintGuid, Vec<StringRef<'a>>> {
         self.iter_constraints(function_guid)
-            .map(|c| (*c.guid(), c.symbol_refs()))
+            .map(|c| (*c.guid(), c.iter_symbols().collect()))
             .collect()
     }
 
@@ -355,32 +360,14 @@ impl<'db, 'a> ConstraintInfo<'db, 'a> {
     pub fn symbol_count(&self) -> usize {
         self.symbol_count
     }
-    pub fn symbols(&self) -> Result<Vec<&'a str>> {
-        let constraint_strings_start = self.db.header.constraint_strings_offset as usize + 4;
-        let mut strings = Vec::with_capacity(self.symbol_count);
 
-        for j in 0..self.symbol_count {
-            let offset =
-                constraint_strings_start + (self.string_index + j) * CONSTRAINT_STRINGS_SIZE;
-            let offset = self.db.u32_at(offset);
-            strings.push(self.db.read_string_at_offset(offset)?);
+    pub fn iter_symbols(&self) -> SymbolIterator<'db, 'a> {
+        SymbolIterator {
+            db: self.db,
+            string_index: self.string_index,
+            current: 0,
+            total: self.symbol_count,
         }
-
-        Ok(strings)
-    }
-
-    pub fn symbol_refs(&self) -> Vec<StringRef<'a>> {
-        let constraint_strings_start = self.db.header.constraint_strings_offset as usize + 4;
-        let mut strings = Vec::with_capacity(self.symbol_count);
-
-        for j in 0..self.symbol_count {
-            let offset =
-                constraint_strings_start + (self.string_index + j) * CONSTRAINT_STRINGS_SIZE;
-            let offset = self.db.u32_at(offset);
-            strings.push(self.db.string_ref_at_offset(offset));
-        }
-
-        strings
     }
 }
 
@@ -417,6 +404,36 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
             string_index,
             db: self.db,
         })
+    }
+}
+
+pub struct SymbolIterator<'db, 'a> {
+    db: &'db Db<'a>,
+    string_index: usize,
+    current: usize,
+    total: usize,
+}
+
+impl<'db, 'a> Iterator for SymbolIterator<'db, 'a> {
+    type Item = StringRef<'a>;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.total - self.current;
+        (remaining, Some(remaining))
+    }
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.total {
+            return None;
+        }
+
+        let constraint_strings_start = self.db.header.constraint_strings_offset as usize + 4;
+        let offset =
+            constraint_strings_start + (self.string_index + self.current) * CONSTRAINT_STRINGS_SIZE;
+        let string_offset = self.db.u32_at(offset);
+
+        self.current += 1;
+        Some(self.db.string_ref_at_offset(string_offset))
     }
 }
 
