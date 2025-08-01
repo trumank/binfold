@@ -1,4 +1,4 @@
-use crate::warp::{ConstraintGuid, FunctionGuid};
+use crate::warp::{Constraint, ConstraintGuid, FunctionGuid};
 use anyhow::{Result, bail};
 use byteorder::{LE, WriteBytesExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -34,6 +34,7 @@ use uuid::Uuid;
 // [4 bytes] count
 // for each:
 //   [4 bytes] index of constraint
+//   [8 bytes] constraint offset (i64::MAX if None)
 //   [4 bytes] number of strings
 //   [4 bytes] index of constraint strings
 //
@@ -45,11 +46,11 @@ use uuid::Uuid;
 //   [4 bytes] number of constraints
 
 const MAGIC: &[u8; 7] = b"BINFOLD";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 const CONSTRAINTS_SIZE: usize = 16;
 const CONSTRAINT_STRINGS_SIZE: usize = 4;
-const FUNCTION_CONSTRAINTS_SIZE: usize = 4 + 4 + 4;
+const FUNCTION_CONSTRAINTS_SIZE: usize = 4 + 8 + 4 + 4;
 const FUNCTION_SIZE: usize = 16 + 4 + 4;
 
 /// A reference to a string in the database that can be compared without loading the actual string
@@ -134,6 +135,9 @@ impl<'a> Db<'a> {
     fn u32_at(&self, offset: usize) -> u32 {
         u32::from_le_bytes(self.slice_at(offset, 4).try_into().unwrap())
     }
+    fn i64_at(&self, offset: usize) -> i64 {
+        i64::from_le_bytes(self.slice_at(offset, 8).try_into().unwrap())
+    }
 
     pub fn function_count(&self) -> usize {
         let functions_start = self.header.functions_offset as usize;
@@ -200,7 +204,7 @@ impl<'a> Db<'a> {
                 c.iter_symbols()
                     .map(|s| s.as_str())
                     .collect::<Result<_>>()
-                    .map(|s| (c.guid, s))
+                    .map(|s| (c.constraint.guid, s))
             })
             .collect()
     }
@@ -210,7 +214,7 @@ impl<'a> Db<'a> {
         function_guid: &FunctionGuid,
     ) -> HashMap<ConstraintGuid, Vec<StringRef<'a>>> {
         self.iter_constraints(function_guid)
-            .map(|c| (*c.guid(), c.iter_symbols().collect()))
+            .map(|c| (c.constraint.guid, c.iter_symbols().collect()))
             .collect()
     }
 
@@ -230,13 +234,13 @@ impl<'a> Db<'a> {
 }
 
 pub struct DbWriter<'a> {
-    functions: &'a BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>,
+    functions: &'a BTreeMap<FunctionGuid, HashMap<Constraint, HashSet<u64>>>,
     strings: &'a Vec<String>,
 }
 
 impl<'a> DbWriter<'a> {
     pub fn new(
-        functions: &'a BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>,
+        functions: &'a BTreeMap<FunctionGuid, HashMap<Constraint, HashSet<u64>>>,
         strings: &'a Vec<String>,
     ) -> Self {
         DbWriter { functions, strings }
@@ -270,9 +274,9 @@ impl<'a> DbWriter<'a> {
         let mut constraints_map: HashMap<&ConstraintGuid, u32> = Default::default();
         let mut constraints_vec: Vec<&ConstraintGuid> = Default::default();
         for f in self.functions.values() {
-            for guid in f.keys() {
-                constraints_map.entry(guid).or_insert_with(|| {
-                    constraints_vec.push(guid);
+            for constraint in f.keys() {
+                constraints_map.entry(&constraint.guid).or_insert_with(|| {
+                    constraints_vec.push(&constraint.guid);
                     (constraints_vec.len() - 1).try_into().unwrap()
                 });
             }
@@ -308,8 +312,9 @@ impl<'a> DbWriter<'a> {
         writer.write_u32::<LE>(all_constraints.try_into().unwrap())?;
         let mut constraint_index = 0;
         for f in self.functions.values() {
-            for (guid, strings) in f {
-                writer.write_u32::<LE>(constraints_map[guid])?;
+            for (constraint, strings) in f {
+                writer.write_u32::<LE>(constraints_map[&constraint.guid])?;
+                writer.write_i64::<LE>(constraint.offset.unwrap_or(i64::MAX))?;
                 writer.write_u32::<LE>(strings.len().try_into().unwrap())?;
                 writer.write_u32::<LE>(constraint_string_indexes[constraint_index])?;
                 constraint_index += 1;
@@ -348,14 +353,14 @@ pub struct ConstraintIterator<'db, 'a> {
 
 pub struct ConstraintInfo<'db, 'a> {
     db: &'db Db<'a>,
-    guid: ConstraintGuid,
+    constraint: Constraint,
     symbol_count: usize,
     string_index: usize,
 }
 
 impl<'db, 'a> ConstraintInfo<'db, 'a> {
-    pub fn guid(&self) -> &ConstraintGuid {
-        &self.guid
+    pub fn constraint(&self) -> &Constraint {
+        &self.constraint
     }
     pub fn symbol_count(&self) -> usize {
         self.symbol_count
@@ -389,17 +394,25 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
             + ((self.constraint_index + self.current) * FUNCTION_CONSTRAINTS_SIZE);
 
         let constraint_index = self.db.u32_at(offset) as usize;
-        let constraint_guid = ConstraintGuid(
-            self.db
-                .uuid_at(self.db.header.constraints_offset as usize + 4 + constraint_index * 16),
-        );
-        let string_count = self.db.u32_at(offset + 4) as usize;
-        let string_index = self.db.u32_at(offset + 8) as usize;
+        let constraint_guid = ConstraintGuid(self.db.uuid_at(
+            self.db.header.constraints_offset as usize + 4 + constraint_index * CONSTRAINTS_SIZE,
+        ));
+        let constraint_offset_raw = self.db.i64_at(offset + 4);
+        let constraint_offset = if constraint_offset_raw == i64::MAX {
+            None
+        } else {
+            Some(constraint_offset_raw)
+        };
+        let string_count = self.db.u32_at(offset + 12) as usize;
+        let string_index = self.db.u32_at(offset + 16) as usize;
 
         self.current += 1;
 
         Some(ConstraintInfo {
-            guid: constraint_guid,
+            constraint: Constraint {
+                guid: constraint_guid,
+                offset: constraint_offset,
+            },
             symbol_count: string_count,
             string_index,
             db: self.db,
@@ -472,8 +485,14 @@ mod tests {
 
     fn test_db() -> Vec<u8> {
         let func_guid = FunctionGuid(Uuid::from_bytes([b'A'; 16]));
-        let constraint1 = ConstraintGuid(Uuid::from_bytes([b'B'; 16]));
-        let constraint2 = ConstraintGuid(Uuid::from_bytes([b'C'; 16]));
+        let constraint1 = Constraint {
+            guid: ConstraintGuid(Uuid::from_bytes([b'B'; 16])),
+            offset: Some(100),
+        };
+        let constraint2 = Constraint {
+            guid: ConstraintGuid(Uuid::from_bytes([b'C'; 16])),
+            offset: None,
+        };
 
         let strings = vec![
             "test_value_1".to_string(),
@@ -531,15 +550,26 @@ mod tests {
         let db = Db::new(&buffer).unwrap();
 
         // Test direct constraint iterator lookup
-        let mut iter = db.iter_constraints(&func_guid1);
+        let constraints: Vec<_> = db.iter_constraints(&func_guid1).collect();
+        assert_eq!(constraints.len(), 2);
 
-        let c1 = iter.next().unwrap();
+        // Find constraints by their GUIDs
+        let constraint1_guid = ConstraintGuid(Uuid::from_bytes([b'B'; 16]));
+        let constraint2_guid = ConstraintGuid(Uuid::from_bytes([b'C'; 16]));
+
+        let c1 = constraints
+            .iter()
+            .find(|c| c.constraint.guid == constraint1_guid)
+            .unwrap();
         assert_eq!(c1.symbol_count, 2);
+        assert_eq!(c1.constraint.offset, Some(100));
 
-        let c2 = iter.next().unwrap();
+        let c2 = constraints
+            .iter()
+            .find(|c| c.constraint.guid == constraint2_guid)
+            .unwrap();
         assert_eq!(c2.symbol_count, 2);
-
-        assert!(iter.next().is_none());
+        assert_eq!(c2.constraint.offset, None);
 
         // Test non-existent function
         assert_eq!(0, db.iter_constraints(&func_guid2).count());

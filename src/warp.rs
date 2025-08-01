@@ -96,10 +96,18 @@ pub struct Function {
     pub data_refs: Vec<DataReference>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Constraint {
     pub guid: ConstraintGuid,
     pub offset: Option<i64>,
+}
+impl Constraint {
+    pub fn nil() -> Self {
+        Self {
+            guid: ConstraintGuid::nil(),
+            offset: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
