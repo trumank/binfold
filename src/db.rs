@@ -11,7 +11,7 @@ use varint_rs::{VarintReader, VarintWriter};
 // [ 1 byte ] version
 // [ 8 bytes] file offset of strings section
 // [ 8 bytes] file offset of constraints section
-// [ 8 bytes] file offset of constraint strings section
+// [ 8 bytes] reserved (was constraint strings offset)
 // [ 8 bytes] file offset of function constraints section
 // [ 8 bytes] file offset of functions section
 //
@@ -26,18 +26,14 @@ use varint_rs::{VarintReader, VarintWriter};
 // for each:
 //   [8 bytes] ConstraintGUID (u64)
 //
-// constraint strings section (variable width)
-// [ 4 bytes] count
-// for each:
-//   [varint] byte offset into strings section
-//
 // function constraints section (variable width)
 // [ 4 bytes] count
 // for each:
 //   [varint] index of constraint in constraints section
 //   [varint] constraint offset (i64::MAX if None)
 //   [varint] number of strings
-//   [varint] byte offset into constraint strings section
+//   for each string:
+//     [varint] byte offset into strings section
 //
 // functions section (fixed width for binary search)
 // [ 4 bytes] count
@@ -47,7 +43,7 @@ use varint_rs::{VarintReader, VarintWriter};
 //   [ 4 bytes] number of constraints
 
 const MAGIC: &[u8; 7] = b"BINFOLD";
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 
 const CONSTRAINTS_SIZE: usize = 8;
 const FUNCTION_SIZE: usize = 8 + 4 + 4;
@@ -116,7 +112,7 @@ pub struct SectionSizes {
 pub struct Header {
     pub strings_offset: u64,
     pub constraints_offset: u64,
-    pub constraint_strings_offset: u64,
+    pub reserved: u64, // Was constraint_strings_offset in v4
     pub function_constraints_offset: u64,
     pub functions_offset: u64,
 }
@@ -140,7 +136,7 @@ impl<'a> Db<'a> {
         let header = Header {
             strings_offset: u64::from_le_bytes(data[8..16].try_into().unwrap()),
             constraints_offset: u64::from_le_bytes(data[16..24].try_into().unwrap()),
-            constraint_strings_offset: u64::from_le_bytes(data[24..32].try_into().unwrap()),
+            reserved: u64::from_le_bytes(data[24..32].try_into().unwrap()),
             function_constraints_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
             functions_offset: u64::from_le_bytes(data[40..48].try_into().unwrap()),
         };
@@ -180,11 +176,6 @@ impl<'a> Db<'a> {
         self.u32_at(strings_start) as usize
     }
 
-    pub fn constraint_strings_count(&self) -> usize {
-        let constraint_strings_start = self.header.constraint_strings_offset as usize;
-        self.u32_at(constraint_strings_start) as usize
-    }
-
     pub fn function_constraints_count(&self) -> usize {
         let function_constraints_start = self.header.function_constraints_offset as usize;
         self.u32_at(function_constraints_start) as usize
@@ -199,11 +190,10 @@ impl<'a> Db<'a> {
 
         // Constraints section
         let constraints_size =
-            (self.header.constraint_strings_offset - self.header.constraints_offset) as usize;
+            (self.header.function_constraints_offset - self.header.constraints_offset) as usize;
 
-        // Constraint strings section
-        let constraint_strings_size = (self.header.function_constraints_offset
-            - self.header.constraint_strings_offset) as usize;
+        // Constraint strings section is removed in v5
+        let constraint_strings_size = 0;
 
         // Function constraints section
         let function_constraints_size =
@@ -360,27 +350,8 @@ impl<'a> DbWriter<'a> {
             writer.write_u64::<LE>(guid.0)?;
         }
 
-        // Write constraint strings
-        let constraint_strings_offset = writer.stream_position()?;
-        let all_constraint_strings: usize = self
-            .functions
-            .values()
-            .map(|c| c.values().map(|s| s.len()).sum::<usize>())
-            .sum();
-        writer.write_u32::<LE>(all_constraint_strings.try_into().unwrap())?;
-
-        let mut constraint_string_byte_offsets = Vec::with_capacity(all_constraint_strings);
-        let mut byte_offset = 4u64;
-
-        for f in self.functions.values() {
-            for strings in f.values() {
-                constraint_string_byte_offsets.push(byte_offset);
-                for string_idx in strings {
-                    let string_offset = string_byte_offsets[*string_idx as usize];
-                    byte_offset += write_varint_u64(writer, string_offset)? as u64;
-                }
-            }
-        }
+        // Skip constraint strings section (reserved space in header)
+        let reserved_offset = writer.stream_position()?;
 
         // Write function constraints section with varints
         let function_constraints_offset = writer.stream_position()?;
@@ -389,7 +360,6 @@ impl<'a> DbWriter<'a> {
 
         let mut function_constraint_byte_offsets = Vec::with_capacity(self.functions.len());
         let mut current_byte_offset = 4u64;
-        let mut constraint_index = 0;
 
         for constraints in self.functions.values() {
             function_constraint_byte_offsets.push(current_byte_offset);
@@ -400,11 +370,12 @@ impl<'a> DbWriter<'a> {
                 current_byte_offset +=
                     write_varint_i64(writer, constraint.offset.unwrap_or(i64::MAX))? as u64;
                 current_byte_offset += write_varint_u64(writer, strings.len() as u64)? as u64;
-                current_byte_offset +=
-                    write_varint_u64(writer, constraint_string_byte_offsets[constraint_index])?
-                        as u64;
 
-                constraint_index += 1;
+                // Write string offsets directly inline
+                for string_idx in strings {
+                    let string_offset = string_byte_offsets[*string_idx as usize];
+                    current_byte_offset += write_varint_u64(writer, string_offset)? as u64;
+                }
             }
         }
 
@@ -424,7 +395,7 @@ impl<'a> DbWriter<'a> {
         writer.seek(SeekFrom::Start(8))?;
         writer.write_u64::<LE>(strings_offset)?;
         writer.write_u64::<LE>(constraints_offset)?;
-        writer.write_u64::<LE>(constraint_strings_offset)?;
+        writer.write_u64::<LE>(0)?; // Reserved (was constraint_strings_offset)
         writer.write_u64::<LE>(function_constraints_offset)?;
         writer.write_u64::<LE>(functions_offset)?;
 
@@ -443,7 +414,7 @@ pub struct ConstraintInfo<'db, 'a> {
     db: &'db Db<'a>,
     constraint: Constraint,
     symbol_count: usize,
-    string_byte_offset: usize,
+    symbol_byte_offsets: Vec<u64>,
 }
 
 impl<'db, 'a> ConstraintInfo<'db, 'a> {
@@ -457,9 +428,8 @@ impl<'db, 'a> ConstraintInfo<'db, 'a> {
     pub fn iter_symbols(&self) -> SymbolIterator<'db, 'a> {
         SymbolIterator {
             db: self.db,
-            current_byte_offset: self.string_byte_offset,
+            symbol_byte_offsets: self.symbol_byte_offsets.clone(),
             current: 0,
-            total: self.symbol_count,
         }
     }
 }
@@ -485,7 +455,12 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
         let constraint_offset =
             (constraint_offset_raw != i64::MAX).then_some(constraint_offset_raw);
         let string_count = cursor.read_u64_varint().unwrap() as usize;
-        let string_byte_offset = cursor.read_u64_varint().unwrap();
+
+        // Read string offsets directly inline
+        let mut symbol_byte_offsets = Vec::with_capacity(string_count);
+        for _ in 0..string_count {
+            symbol_byte_offsets.push(cursor.read_u64_varint().unwrap());
+        }
 
         // Calculate constraint GUID from byte offset
         let constraints_start = self.db.header.constraints_offset as usize;
@@ -503,7 +478,7 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
                 offset: constraint_offset,
             },
             symbol_count: string_count,
-            string_byte_offset: string_byte_offset as usize,
+            symbol_byte_offsets,
             db: self.db,
         })
     }
@@ -511,30 +486,24 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
 
 pub struct SymbolIterator<'db, 'a> {
     db: &'db Db<'a>,
-    current_byte_offset: usize,
+    symbol_byte_offsets: Vec<u64>,
     current: usize,
-    total: usize,
 }
 
 impl<'db, 'a> Iterator for SymbolIterator<'db, 'a> {
     type Item = StringRef<'a>;
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.total - self.current;
+        let remaining = self.symbol_byte_offsets.len() - self.current;
         (remaining, Some(remaining))
     }
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current >= self.total {
+        if self.current >= self.symbol_byte_offsets.len() {
             return None;
         }
 
-        let offset = self.db.header.constraint_strings_offset as usize + self.current_byte_offset;
-
-        // Read string byte offset
-        let (string_byte_offset, bytes_read) = self.db.read_varint_u64_at(offset).unwrap();
-        self.current_byte_offset += bytes_read;
-
+        let string_byte_offset = self.symbol_byte_offsets[self.current];
         self.current += 1;
         Some(self.db.string_ref_at_offset(string_byte_offset as usize))
     }
