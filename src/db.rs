@@ -339,18 +339,34 @@ impl<'a> DbWriter<'a> {
         writer.write_u64::<LE>(0)?; // function_constraints_offset placeholder
         writer.write_u64::<LE>(0)?; // functions_offset placeholder
 
+        // Sort strings for better compression
+        let mut sorted_strings: Vec<(usize, &String)> = self.strings.iter().enumerate().collect();
+        sorted_strings.sort_by(|a, b| a.1.cmp(b.1));
+
+        // Create mapping from old indices to new indices
+        let mut old_to_new_index: Vec<u64> = vec![0; self.strings.len()];
+        for (new_idx, (old_idx, _)) in sorted_strings.iter().enumerate() {
+            old_to_new_index[*old_idx] = new_idx as u64;
+        }
+
         // Write strings section with varints
         let strings_offset = writer.stream_position()?;
         writer.write_u32::<LE>(self.strings.len().try_into().unwrap())?;
 
-        let mut string_byte_offsets = Vec::with_capacity(self.strings.len());
+        let mut string_byte_offsets_sorted = Vec::with_capacity(self.strings.len());
         let mut byte_offset = 4u64;
 
-        for string in self.strings {
-            string_byte_offsets.push(byte_offset);
+        for (_, string) in &sorted_strings {
+            string_byte_offsets_sorted.push(byte_offset);
             let len_bytes = write_varint_u64(writer, string.len() as u64)?;
             writer.write_all(string.as_bytes())?;
             byte_offset += len_bytes as u64 + string.len() as u64;
+        }
+
+        // Create a mapping from original index to byte offset
+        let mut string_byte_offsets = vec![0u64; self.strings.len()];
+        for (new_idx, (old_idx, _)) in sorted_strings.iter().enumerate() {
+            string_byte_offsets[*old_idx] = string_byte_offsets_sorted[new_idx];
         }
 
         // Write constraints section
