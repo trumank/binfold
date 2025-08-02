@@ -29,6 +29,7 @@ use varint_rs::{VarintReader, VarintWriter};
 // function constraints section (variable width)
 // [ 4 bytes] count
 // for each function:
+//   [varint] number of constraints for this function
 //   [varint] number of unique string refs for this function
 //   for each unique string ref:
 //     [varint] byte offset into strings section
@@ -44,13 +45,12 @@ use varint_rs::{VarintReader, VarintWriter};
 // for each:
 //   [8 bytes] FunctionGUID (u64)
 //   [ 4 bytes] byte offset to first constraint in function constraints section
-//   [ 4 bytes] number of constraints
 
 const MAGIC: &[u8; 7] = b"BINFOLD";
 const VERSION: u8 = 5;
 
 const CONSTRAINTS_SIZE: usize = 8;
-const FUNCTION_SIZE: usize = 8 + 4 + 4;
+const FUNCTION_SIZE: usize = 8 + 4;
 
 fn write_varint_u64<W: Write>(writer: &mut W, value: u64) -> io::Result<usize> {
     let mut buf = Vec::with_capacity(9);
@@ -247,13 +247,13 @@ impl<'a> Db<'a> {
                 std::cmp::Ordering::Greater => right = mid,
                 std::cmp::Ordering::Equal => {
                     let constraint_byte_offset = self.u32_at(function_offset + 8) as usize;
-                    let num_constraints = self.u32_at(function_offset + 12) as usize;
 
-                    // Read the string ref table at the beginning of this function's constraints
+                    // Read the constraint count and string ref table at the beginning of this function's constraints
                     let offset =
                         self.header.function_constraints_offset as usize + constraint_byte_offset;
                     let mut cursor = std::io::Cursor::new(&self.data[offset..]);
 
+                    let num_constraints = cursor.read_u64_varint().unwrap() as usize;
                     let string_ref_count = cursor.read_u64_varint().unwrap() as usize;
                     let mut string_ref_table = Vec::with_capacity(string_ref_count);
 
@@ -383,6 +383,9 @@ impl<'a> DbWriter<'a> {
         for constraints in self.functions.values() {
             function_constraint_byte_offsets.push(current_byte_offset);
 
+            // Write constraint count for this function
+            current_byte_offset += write_varint_u64(writer, constraints.len() as u64)? as u64;
+
             // Build unique string ref table for this function
             let mut unique_string_refs: Vec<u64> = Vec::new();
             let mut string_ref_to_index: HashMap<u64, u64> = HashMap::new();
@@ -390,7 +393,9 @@ impl<'a> DbWriter<'a> {
             for strings in constraints.values() {
                 for string_idx in strings {
                     let string_offset = string_byte_offsets[*string_idx as usize];
-                    if let std::collections::hash_map::Entry::Vacant(e) = string_ref_to_index.entry(string_offset) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        string_ref_to_index.entry(string_offset)
+                    {
                         e.insert(unique_string_refs.len() as u64);
                         unique_string_refs.push(string_offset);
                     }
@@ -425,12 +430,11 @@ impl<'a> DbWriter<'a> {
         let functions_offset = writer.stream_position()?;
         writer.write_u32::<LE>(self.functions.len().try_into().unwrap())?;
 
-        for ((func_guid, constraints), byte_offset) in
+        for ((func_guid, _), byte_offset) in
             self.functions.iter().zip(function_constraint_byte_offsets)
         {
             writer.write_u64::<LE>(func_guid.0)?;
             writer.write_u32::<LE>(byte_offset.try_into().unwrap())?;
-            writer.write_u32::<LE>(constraints.len().try_into().unwrap())?;
         }
 
         // Go back and write the actual offsets
