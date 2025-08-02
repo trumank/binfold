@@ -768,10 +768,6 @@ fn command_db_info(CommandDbInfo { database }: CommandDbInfo) -> Result<()> {
     println!("Functions: {}", db.function_count());
     println!("Unique constraints: {}", db.constraint_count());
     println!("Strings: {}", db.string_count());
-    println!(
-        "Constraint string references: {}",
-        db.constraint_strings_count()
-    );
     println!("Function constraints: {}", db.function_constraints_count());
     println!();
 
@@ -781,10 +777,7 @@ fn command_db_info(CommandDbInfo { database }: CommandDbInfo) -> Result<()> {
     println!("---------------");
     println!("Strings: 0x{:08x}", header.strings_offset);
     println!("Constraints: 0x{:08x}", header.constraints_offset);
-    println!(
-        "Constraint strings: 0x{:08x}",
-        header.constraint_strings_offset
-    );
+    println!("Reserved: 0x{:08x}", header.reserved);
     println!(
         "Function constraints: 0x{:08x}",
         header.function_constraints_offset
@@ -810,11 +803,6 @@ fn command_db_info(CommandDbInfo { database }: CommandDbInfo) -> Result<()> {
         "Constraints: {} bytes ({:.1}%)",
         sizes.constraints_size,
         sizes.constraints_size as f64 / file_size as f64 * 100.0
-    );
-    println!(
-        "Constraint strings: {} bytes ({:.1}%)",
-        sizes.constraint_strings_size,
-        sizes.constraint_strings_size as f64 / file_size as f64 * 100.0
     );
     println!(
         "Function constraints: {} bytes ({:.1}%)",
