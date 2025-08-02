@@ -28,12 +28,16 @@ use varint_rs::{VarintReader, VarintWriter};
 //
 // function constraints section (variable width)
 // [ 4 bytes] count
-// for each:
-//   [varint] index of constraint in constraints section
-//   [varint] constraint offset (i64::MAX if None)
-//   [varint] number of strings
-//   for each string:
+// for each function:
+//   [varint] number of unique string refs for this function
+//   for each unique string ref:
 //     [varint] byte offset into strings section
+//   for each constraint:
+//     [varint] index of constraint in constraints section
+//     [varint] constraint offset (i64::MAX if None)
+//     [varint] number of strings
+//     for each string:
+//       [varint] index into this function's string ref table
 //
 // functions section (fixed width for binary search)
 // [ 4 bytes] count
@@ -245,11 +249,26 @@ impl<'a> Db<'a> {
                     let constraint_byte_offset = self.u32_at(function_offset + 8) as usize;
                     let num_constraints = self.u32_at(function_offset + 12) as usize;
 
+                    // Read the string ref table at the beginning of this function's constraints
+                    let offset =
+                        self.header.function_constraints_offset as usize + constraint_byte_offset;
+                    let mut cursor = std::io::Cursor::new(&self.data[offset..]);
+
+                    let string_ref_count = cursor.read_u64_varint().unwrap() as usize;
+                    let mut string_ref_table = Vec::with_capacity(string_ref_count);
+
+                    for _ in 0..string_ref_count {
+                        string_ref_table.push(cursor.read_u64_varint().unwrap());
+                    }
+
+                    let table_bytes_read = cursor.position() as usize;
+
                     return ConstraintIterator {
                         db: self,
-                        current_byte_offset: constraint_byte_offset,
+                        current_byte_offset: constraint_byte_offset + table_bytes_read,
                         current: 0,
                         total: num_constraints,
+                        string_ref_table,
                     };
                 }
             }
@@ -260,6 +279,7 @@ impl<'a> Db<'a> {
             current_byte_offset: 0,
             current: 0,
             total: 0,
+            string_ref_table: Vec::new(),
         }
     }
 
@@ -351,12 +371,11 @@ impl<'a> DbWriter<'a> {
         }
 
         // Skip constraint strings section (reserved space in header)
-        let reserved_offset = writer.stream_position()?;
+        let _reserved_offset = writer.stream_position()?;
 
         // Write function constraints section with varints
         let function_constraints_offset = writer.stream_position()?;
-        let all_constraints: usize = self.functions.values().map(|c| c.len()).sum();
-        writer.write_u32::<LE>(all_constraints.try_into().unwrap())?;
+        writer.write_u32::<LE>(self.functions.len().try_into().unwrap())?;
 
         let mut function_constraint_byte_offsets = Vec::with_capacity(self.functions.len());
         let mut current_byte_offset = 4u64;
@@ -364,6 +383,28 @@ impl<'a> DbWriter<'a> {
         for constraints in self.functions.values() {
             function_constraint_byte_offsets.push(current_byte_offset);
 
+            // Build unique string ref table for this function
+            let mut unique_string_refs: Vec<u64> = Vec::new();
+            let mut string_ref_to_index: HashMap<u64, u64> = HashMap::new();
+
+            for strings in constraints.values() {
+                for string_idx in strings {
+                    let string_offset = string_byte_offsets[*string_idx as usize];
+                    if let std::collections::hash_map::Entry::Vacant(e) = string_ref_to_index.entry(string_offset) {
+                        e.insert(unique_string_refs.len() as u64);
+                        unique_string_refs.push(string_offset);
+                    }
+                }
+            }
+
+            // Write string ref table
+            current_byte_offset +=
+                write_varint_u64(writer, unique_string_refs.len() as u64)? as u64;
+            for string_ref in &unique_string_refs {
+                current_byte_offset += write_varint_u64(writer, *string_ref)? as u64;
+            }
+
+            // Write constraints with indices into string ref table
             for (constraint, strings) in constraints {
                 current_byte_offset +=
                     write_varint_u64(writer, constraints_map[&constraint.guid])? as u64;
@@ -371,10 +412,11 @@ impl<'a> DbWriter<'a> {
                     write_varint_i64(writer, constraint.offset.unwrap_or(i64::MAX))? as u64;
                 current_byte_offset += write_varint_u64(writer, strings.len() as u64)? as u64;
 
-                // Write string offsets directly inline
+                // Write indices into string ref table
                 for string_idx in strings {
                     let string_offset = string_byte_offsets[*string_idx as usize];
-                    current_byte_offset += write_varint_u64(writer, string_offset)? as u64;
+                    let table_index = string_ref_to_index[&string_offset];
+                    current_byte_offset += write_varint_u64(writer, table_index)? as u64;
                 }
             }
         }
@@ -408,6 +450,7 @@ pub struct ConstraintIterator<'db, 'a> {
     current_byte_offset: usize,
     current: usize,
     total: usize,
+    string_ref_table: Vec<u64>,
 }
 
 pub struct ConstraintInfo<'db, 'a> {
@@ -456,10 +499,11 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
             (constraint_offset_raw != i64::MAX).then_some(constraint_offset_raw);
         let string_count = cursor.read_u64_varint().unwrap() as usize;
 
-        // Read string offsets directly inline
+        // Read indices into string ref table
         let mut symbol_byte_offsets = Vec::with_capacity(string_count);
         for _ in 0..string_count {
-            symbol_byte_offsets.push(cursor.read_u64_varint().unwrap());
+            let table_index = cursor.read_u64_varint().unwrap() as usize;
+            symbol_byte_offsets.push(self.string_ref_table[table_index]);
         }
 
         // Calculate constraint GUID from byte offset
