@@ -614,31 +614,35 @@ fn command_analyze(
 
     // Generate PDB if requested
     if generate_pdb {
-        let pdb_info = pdb_writer::extract_pdb_info(&pe)?;
-
-        let mut pdb_functions = Vec::new();
-
-        for func in &analyzed_functions {
-            let match_info = matched_functions.get(&func.address).unwrap();
-            if let Some(symbol) = &match_info.unique_name {
-                pdb_functions.push(pdb_writer::FunctionInfo {
-                    address: func.address,
-                    size: func.size as u32,
-                    name: symbol.clone(),
-                });
-            }
-        }
-
-        // Generate PDB file
         let pdb_path = file.with_extension("pdb");
-        println!("Generating PDB file at: {}", pdb_path.display());
+        if !pdb_path.exists() || pdb_analyzer::should_replace(&pdb_path).unwrap_or(false) {
+            let pdb_info = pdb_writer::extract_pdb_info(&pe)?;
 
-        pdb_writer::generate_pdb(&pe, &pdb_info, &pdb_functions, &pdb_path)?;
+            let mut pdb_functions = Vec::new();
 
-        println!(
-            "PDB file generated successfully with {} functions",
-            pdb_functions.len()
-        );
+            for func in &analyzed_functions {
+                let match_info = matched_functions.get(&func.address).unwrap();
+                if let Some(symbol) = &match_info.unique_name {
+                    pdb_functions.push(pdb_writer::FunctionInfo {
+                        address: func.address,
+                        size: func.size as u32,
+                        name: symbol.clone(),
+                    });
+                }
+            }
+
+            println!("Generating PDB file at: {}", pdb_path.display());
+            pdb_writer::generate_pdb(&pe, &pdb_info, &pdb_functions, &pdb_path)?;
+            println!(
+                "PDB file generated successfully with {} functions",
+                pdb_functions.len()
+            );
+        } else {
+            eprintln!(
+                "Error: Refusing to overwrite existing PDB file at: {}",
+                pdb_path.display()
+            );
+        }
     }
 
     // let the OS clean all this up
