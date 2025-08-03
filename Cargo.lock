@@ -511,8 +511,7 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 [[package]]
 name = "pdb"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82040a392923abe6279c00ab4aff62d5250d1c8555dc780e4b02783a7aa74863"
+source = "git+https://github.com/trumank/pdb#25f9bc275a47415a7e7207403b793cb79bfd7ab9"
 dependencies = [
  "fallible-iterator",
  "scroll",
@@ -522,7 +521,7 @@ dependencies = [
 [[package]]
 name = "pdb-sdk"
 version = "0.1.0"
-source = "git+https://github.com/jac3km4/pdb-sdk#103dfce2e6315765f1a7f9af9ce99871333b48c0"
+source = "git+https://github.com/jac3km4/pdb-sdk#eed72909d56b6ccbbfa738203388e23b6c47aef5"
 dependencies = [
  "declio",
  "derive-getters",
