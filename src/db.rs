@@ -22,12 +22,12 @@ use varint_rs::{VarintReader, VarintWriter};
 //   [ N bytes] UTF-8 string data
 //
 // constraints section (fixed width)
-// [ 4 bytes] count
+// [ 4 bytes] count (COUNT_FIELD_SIZE)
 // for each:
 //   [8 bytes] ConstraintGUID (u64)
 //
 // function constraints section (variable width)
-// [ 4 bytes] count
+// [ 4 bytes] count (COUNT_FIELD_SIZE)
 // for each function:
 //   [varint] number of constraints for this function
 //   [varint] number of unique string refs for this function
@@ -41,7 +41,7 @@ use varint_rs::{VarintReader, VarintWriter};
 //       [varint] index into this function's string ref table
 //
 // functions section (fixed width for binary search)
-// [ 4 bytes] count
+// [ 4 bytes] count (COUNT_FIELD_SIZE)
 // for each:
 //   [8 bytes] FunctionGUID (u64)
 //   [ 4 bytes] byte offset to first constraint in function constraints section
@@ -49,8 +49,10 @@ use varint_rs::{VarintReader, VarintWriter};
 const MAGIC: &[u8; 7] = b"BINFOLD";
 const VERSION: u8 = 5;
 
+/// Size of count fields in the database format (4 bytes for u32)
+const COUNT_FIELD_SIZE: usize = 4;
 const CONSTRAINTS_SIZE: usize = 8;
-const FUNCTION_SIZE: usize = 8 + 4;
+const FUNCTION_SIZE: usize = 8 + COUNT_FIELD_SIZE;
 
 fn write_varint_u64<W: Write>(writer: &mut W, value: u64) -> io::Result<usize> {
     let mut buf = Vec::with_capacity(9);
@@ -155,7 +157,7 @@ impl<'a> Db<'a> {
         u64::from_le_bytes(self.slice_at(offset, 8).try_into().unwrap())
     }
     fn u32_at(&self, offset: usize) -> u32 {
-        u32::from_le_bytes(self.slice_at(offset, 4).try_into().unwrap())
+        u32::from_le_bytes(self.slice_at(offset, COUNT_FIELD_SIZE).try_into().unwrap())
     }
 
     fn read_varint_u64_at(&self, offset: usize) -> Result<(u64, usize)> {
@@ -178,6 +180,23 @@ impl<'a> Db<'a> {
     pub fn string_count(&self) -> usize {
         let strings_start = self.header.strings_offset as usize;
         self.u32_at(strings_start) as usize
+    }
+    
+    pub fn iter_strings<'db>(&'db self) -> StringIterator<'db, 'a> {
+        StringIterator {
+            db: self,
+            current: 0,
+            total: self.string_count(),
+            current_offset: COUNT_FIELD_SIZE, // skip count
+        }
+    }
+    
+    pub fn iter_all_constraints<'db>(&'db self) -> AllConstraintIterator<'db, 'a> {
+        AllConstraintIterator {
+            db: self,
+            current: 0,
+            total: self.constraint_count(),
+        }
     }
 
     pub fn function_constraints_count(&self) -> usize {
@@ -238,7 +257,7 @@ impl<'a> Db<'a> {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let function_offset = functions_start + 4 + (mid * FUNCTION_SIZE);
+            let function_offset = functions_start + COUNT_FIELD_SIZE + (mid * FUNCTION_SIZE);
 
             let current_guid = FunctionGuid(self.u64_at(function_offset));
 
@@ -282,6 +301,98 @@ impl<'a> Db<'a> {
             string_ref_table: Vec::new(),
         }
     }
+    
+    /// Get raw constraint data for a function, including string byte offsets
+    /// Returns (constraints with offsets, string ref table byte offsets)
+    pub fn get_function_constraints_raw(&self, function_guid: FunctionGuid) 
+        -> Result<Option<(Vec<(Constraint, Vec<u64>)>, Vec<u64>)>> 
+    {
+        // Find the function in the functions section using binary search
+        let functions_start = self.header.functions_offset as usize;
+        let num_functions = self.u32_at(functions_start) as usize;
+
+        // Binary search for the function
+        let mut left = 0;
+        let mut right = num_functions;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let function_offset = functions_start + 4 + (mid * FUNCTION_SIZE);
+
+            let current_guid = FunctionGuid(self.u64_at(function_offset));
+
+            match current_guid.cmp(&function_guid) {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Greater => right = mid,
+                std::cmp::Ordering::Equal => {
+                    let constraint_byte_offset = self.u32_at(function_offset + 8) as usize;
+
+                    // Read the constraint count and string ref table at the beginning of this function's constraints
+                    let offset =
+                        self.header.function_constraints_offset as usize + constraint_byte_offset;
+                    let mut cursor = std::io::Cursor::new(&self.data[offset..]);
+
+                    let num_constraints = cursor.read_u64_varint()? as usize;
+                    let string_ref_count = cursor.read_u64_varint()? as usize;
+                    let mut string_ref_table = Vec::with_capacity(string_ref_count);
+
+                    for _ in 0..string_ref_count {
+                        string_ref_table.push(cursor.read_u64_varint()?);
+                    }
+
+                    let table_bytes_read = cursor.position() as usize;
+                    
+                    // Now read all constraints
+                    let mut constraints = Vec::with_capacity(num_constraints);
+                    let mut current_byte_offset = constraint_byte_offset + table_bytes_read;
+                    
+                    for _ in 0..num_constraints {
+                        let offset = self.header.function_constraints_offset as usize + current_byte_offset;
+                        let mut cursor = std::io::Cursor::new(&self.data[offset..]);
+
+                        let constraint_index = cursor.read_u64_varint()?;
+                        let constraint_offset_raw = cursor.read_i64_varint()?;
+                        let constraint_offset =
+                            (constraint_offset_raw != i64::MAX).then_some(constraint_offset_raw);
+                        let string_count = cursor.read_u64_varint()? as usize;
+
+                        // Read indices into string ref table and convert to byte offsets
+                        let mut symbol_byte_offsets = Vec::with_capacity(string_count);
+                        for _ in 0..string_count {
+                            let table_index = cursor.read_u64_varint()? as usize;
+                            if table_index >= string_ref_table.len() {
+                                bail!("String ref table index out of bounds");
+                            }
+                            symbol_byte_offsets.push(string_ref_table[table_index]);
+                        }
+
+                        // Calculate constraint GUID from byte offset with overflow check
+                        let constraints_start = self.header.constraints_offset as usize;
+                        let constraint_guid_offset = (constraint_index as usize)
+                            .checked_mul(CONSTRAINTS_SIZE)
+                            .and_then(|v| v.checked_add(COUNT_FIELD_SIZE))
+                            .and_then(|v| constraints_start.checked_add(v))
+                            .ok_or_else(|| anyhow::anyhow!("Integer overflow calculating constraint offset"))?;
+                        let constraint_guid = ConstraintGuid(self.u64_at(constraint_guid_offset));
+
+                        constraints.push((
+                            Constraint {
+                                guid: constraint_guid,
+                                offset: constraint_offset,
+                            },
+                            symbol_byte_offsets,
+                        ));
+                        
+                        current_byte_offset += cursor.position() as usize;
+                    }
+
+                    return Ok(Some((constraints, string_ref_table)));
+                }
+            }
+        }
+
+        Ok(None)
+    }
 
     pub fn query_constraints_for_function(
         &self,
@@ -313,6 +424,26 @@ impl<'a> Db<'a> {
         StringRef {
             data: self.slice_at(start + bytes_read, len as usize),
         }
+    }
+    
+    /// Build a mapping from byte offset to string index for efficient lookups during merge
+    pub fn build_string_offset_to_index_map(&self) -> Result<HashMap<u64, u64>> {
+        let mut offset_to_index = HashMap::new();
+        let strings_start = self.header.strings_offset as usize;
+        let mut current_offset = COUNT_FIELD_SIZE; // skip count
+        
+        for idx in 0..self.string_count() {
+            offset_to_index.insert(current_offset as u64, idx as u64);
+            
+            let offset = strings_start + current_offset;
+            let (len, bytes_read) = self.read_varint_u64_at(offset)?;
+            current_offset = current_offset
+                .checked_add(bytes_read)
+                .and_then(|v| v.checked_add(len as usize))
+                .ok_or_else(|| anyhow::anyhow!("Integer overflow calculating string offset"))?;
+        }
+        
+        Ok(offset_to_index)
     }
 }
 
@@ -526,12 +657,19 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
             symbol_byte_offsets.push(self.string_ref_table[table_index]);
         }
 
-        // Calculate constraint GUID from byte offset
+        // Calculate constraint GUID from byte offset with overflow check
         let constraints_start = self.db.header.constraints_offset as usize;
-        let constraint_guid = ConstraintGuid(
-            self.db
-                .u64_at(constraints_start + 4 + constraint_index as usize * CONSTRAINTS_SIZE),
-        );
+        let constraint_guid_offset = (constraint_index as usize)
+            .checked_mul(CONSTRAINTS_SIZE)
+            .and_then(|v| v.checked_add(COUNT_FIELD_SIZE))
+            .and_then(|v| constraints_start.checked_add(v));
+        
+        let constraint_guid = if let Some(offset) = constraint_guid_offset {
+            ConstraintGuid(self.db.u64_at(offset))
+        } else {
+            // Handle overflow gracefully by returning None
+            return None;
+        };
 
         self.current += 1;
         self.current_byte_offset += cursor.position() as usize;
@@ -593,12 +731,75 @@ impl<'db, 'a> Iterator for FunctionIterator<'db, 'a> {
         }
 
         let functions_start = self.db.header.functions_offset as usize;
-        let function_offset = functions_start + 4 + (self.current * FUNCTION_SIZE);
+        let function_offset = functions_start + COUNT_FIELD_SIZE + (self.current * FUNCTION_SIZE);
 
         let func_guid = FunctionGuid(self.db.u64_at(function_offset));
         self.current += 1;
 
         Some(func_guid)
+    }
+}
+
+pub struct StringIterator<'db, 'a> {
+    db: &'db Db<'a>,
+    current: usize,
+    total: usize,
+    current_offset: usize,
+}
+
+impl<'db, 'a> Iterator for StringIterator<'db, 'a> {
+    type Item = String;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.total - self.current;
+        (remaining, Some(remaining))
+    }
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.total {
+            return None;
+        }
+
+        let strings_start = self.db.header.strings_offset as usize;
+        let offset = strings_start + self.current_offset;
+        
+        let (len, bytes_read) = self.db.read_varint_u64_at(offset).ok()?;
+        let string_data = self.db.slice_at(offset + bytes_read, len as usize);
+        let string = String::from_utf8_lossy(string_data).into_owned();
+        
+        self.current_offset += bytes_read + len as usize;
+        self.current += 1;
+        
+        Some(string)
+    }
+}
+
+pub struct AllConstraintIterator<'db, 'a> {
+    db: &'db Db<'a>,
+    current: usize,
+    total: usize,
+}
+
+impl<'db, 'a> Iterator for AllConstraintIterator<'db, 'a> {
+    type Item = ConstraintGuid;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.total - self.current;
+        (remaining, Some(remaining))
+    }
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.total {
+            return None;
+        }
+
+        let constraints_start = self.db.header.constraints_offset as usize;
+        let constraint_offset = constraints_start + 4 + (self.current * CONSTRAINTS_SIZE);
+
+        let constraint_guid = ConstraintGuid(self.db.u64_at(constraint_offset));
+        self.current += 1;
+
+        Some(constraint_guid)
     }
 }
 
