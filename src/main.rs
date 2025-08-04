@@ -15,6 +15,7 @@ use crate::warp::{
 };
 
 mod db;
+mod db_merge;
 mod mmap_source;
 mod pdb_analyzer;
 mod pdb_writer;
@@ -41,6 +42,7 @@ enum Commands {
     Analyze(CommandAnalyze),
     DumpDb(CommandDumpDb),
     DbInfo(CommandDbInfo),
+    MergeDb(CommandMergeDb),
 }
 
 /// Create a database of function GUIDs/constraint GUIDs and their mappings to symbol names
@@ -95,6 +97,20 @@ struct CommandDbInfo {
     database: PathBuf,
 }
 
+/// Merge multiple databases into one
+#[derive(Parser)]
+struct CommandMergeDb {
+    /// Input database files or directories to merge.
+    /// When given a directory, recursively scans for all .fold files.
+    /// At least 2 database files are required after expansion.
+    #[arg(short = 'd', long = "database", required = true, num_args = 1..)]
+    databases: Vec<PathBuf>,
+
+    /// Output path for merged database
+    #[arg(short = 'o', long = "output", required = true)]
+    output: PathBuf,
+}
+
 fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16)
@@ -130,6 +146,7 @@ fn main() -> Result<()> {
         Commands::Analyze(cmd) => command_analyze(cmd),
         Commands::DumpDb(cmd) => command_dump_db(cmd),
         Commands::DbInfo(cmd) => command_db_info(cmd),
+        Commands::MergeDb(cmd) => command_merge_db(cmd),
     }
 }
 
@@ -884,4 +901,116 @@ fn progress_style() -> ProgressStyle {
         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) {msg}")
         .unwrap()
         .progress_chars("#>-")
+}
+
+fn command_merge_db(
+    CommandMergeDb {
+        databases,
+        output,
+    }: CommandMergeDb,
+) -> Result<()> {
+    use crate::db_merge::merge_databases;
+    use std::fs;
+    
+    // Check if output path is writable before processing
+    check_output_path_writable(&output)?;
+    
+    // Expand directories to find .fold files
+    let mut expanded_databases = Vec::new();
+    
+    fn find_fold_files_recursive(
+        dir: &std::path::Path,
+        fold_files: &mut Vec<PathBuf>,
+    ) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            // Get metadata without following symlinks
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Warning: Cannot read metadata for '{}': {}. Skipping.", path.display(), e);
+                    continue;
+                }
+            };
+            
+            // Check if it's a symlink using file_type() from DirEntry
+            let is_symlink = entry.file_type()
+                .map(|ft| ft.is_symlink())
+                .unwrap_or(false);
+                
+            if is_symlink {
+                // Skip symlinks during recursive scanning to avoid infinite loops
+                eprintln!("Warning: Skipping symlink '{}' during recursive scan. To include it, specify its target path explicitly.", path.display());
+                continue;
+            }
+            
+            if metadata.is_dir() {
+                // Recursively search subdirectories
+                match find_fold_files_recursive(&path, fold_files) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        eprintln!("Warning: Failed to read directory '{}': {}. Skipping.", path.display(), e);
+                    }
+                }
+            } else if metadata.is_file() {
+                if let Some(ext) = path.extension()
+                    && ext.eq_ignore_ascii_case("fold")
+                {
+                    fold_files.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    for path in databases {
+        // Check if it's a symlink first
+        let is_symlink = path.symlink_metadata()
+            .map(|m| m.is_symlink())
+            .unwrap_or(false);
+        
+        if is_symlink {
+            // For explicitly provided symlinks, resolve and follow them
+            match fs::canonicalize(&path) {
+                Ok(resolved_path) => {
+                    if resolved_path.is_file() {
+                        // It's a symlink to a file, add the resolved path
+                        expanded_databases.push(resolved_path);
+                    } else if resolved_path.is_dir() {
+                        // It's a symlink to a directory, recursively find .fold files
+                        find_fold_files_recursive(&resolved_path, &mut expanded_databases)?;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to resolve symlink '{}': {}. Skipping.", path.display(), e);
+                }
+            }
+        } else if path.is_dir() {
+            // Regular directory, recursively find all .fold files
+            find_fold_files_recursive(&path, &mut expanded_databases)?;
+        } else {
+            // Regular file, add it directly
+            expanded_databases.push(path);
+        }
+    }
+    
+    if expanded_databases.len() < 2 {
+        anyhow::bail!("At least 2 database files are required for merging. Found: {}", expanded_databases.len());
+    }
+    
+    // Sort for consistent output
+    expanded_databases.sort();
+    
+    println!("Found {} database files to merge:", expanded_databases.len());
+    for db in &expanded_databases {
+        println!("  - {}", db.display());
+    }
+    
+    merge_databases(&expanded_databases, &output)?;
+    
+    println!("\nSuccessfully merged databases to: {}", output.display());
+    
+    Ok(())
 }

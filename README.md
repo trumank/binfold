@@ -44,6 +44,21 @@ Analyze functions in a binary and optionally match against a database:
 cargo run --release analyze --exe /path/to/binary.exe --database db.fold --generate-pdb
 ```
 
+### 3. Merge databases
+
+Merge multiple database files into a single database:
+
+```bash
+# Merge two or more database files
+cargo run --release merge-db -d db1.fold -d db2.fold -o merged.fold
+
+# Recursively scan directories for .fold files
+cargo run --release merge-db -d /path/to/database/directory -o combined.fold
+
+# Mix files and directories
+cargo run --release merge-db -d db1.fold -d /path/to/more/databases -d db3.fold -o all.fold
+```
+
 ## Matching algorithm
 
 The core matching algorithm is based on [WARP](https://github.com/vector35/warp) which is essentially a hash of function body bytes. However, my implementation has deviated significantly where it comes to constraints. The current implementation populates and matches against the following types of constraints:
