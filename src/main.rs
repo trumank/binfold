@@ -133,6 +133,59 @@ fn main() -> Result<()> {
     }
 }
 
+/// Checks if the output path is writable by testing the parent directory.
+/// 
+/// This function verifies that:
+/// 1. The output path is not an existing directory
+/// 2. The parent directory exists (handling bare filenames by using current directory)
+/// 3. The directory is writable by creating and removing a temporary test file
+/// 
+/// # Arguments
+/// 
+/// * `output_path` - The path where output will be written
+/// 
+/// # Returns
+/// 
+/// Returns `Ok(())` if the path is writable, or an error with a descriptive message.
+fn check_output_path_writable(output_path: &std::path::Path) -> Result<()> {
+    use tempfile::NamedTempFile;
+    
+    // First check if output_path already exists as a directory
+    if output_path.exists() && output_path.is_dir() {
+        anyhow::bail!("Output path already exists as a directory: {}", output_path.display());
+    }
+    
+    // Get the parent directory, handling edge cases
+    let parent = if let Some(parent) = output_path.parent() {
+        // Handle the case where parent() returns Some("") for bare filenames
+        if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        }
+    } else {
+        // This shouldn't happen for normal paths, but handle it gracefully
+        std::path::Path::new(".")
+    };
+    
+    // Check if parent directory exists
+    if !parent.exists() {
+        anyhow::bail!("Output directory does not exist: {}", parent.display());
+    }
+    
+    // Test writability by creating a temporary file using tempfile crate
+    // This handles unique naming and automatic cleanup even in concurrent scenarios
+    match NamedTempFile::new_in(parent) {
+        Ok(_temp_file) => {
+            // The temporary file is automatically deleted when _temp_file goes out of scope
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!("Output directory is not writable: {} - {}", parent.display(), e);
+        }
+    }
+}
+
 fn command_gen_db(
     CommandGenDb {
         exe: exe_paths,
@@ -143,6 +196,9 @@ fn command_gen_db(
     use pdb_analyzer::PdbAnalyzer;
     use std::fs;
     use std::io::BufWriter;
+
+    // Check if output path is writable before processing
+    check_output_path_writable(&database)?;
 
     // Expand directories to find EXE files with PDB files
     let mut expanded_exe_paths = Vec::new();
@@ -678,6 +734,11 @@ fn command_dump_db(
     use std::fs;
     use std::io;
     use struson::writer::{JsonStreamWriter, JsonWriter};
+
+    // Check if output path is writable before processing (if specified)
+    if let Some(ref output_path) = output {
+        check_output_path_writable(output_path)?;
+    }
 
     let file = fs::File::open(&database)?;
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };

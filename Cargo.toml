@@ -22,3 +22,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 struson = "0.5"
 varint-rs = "2.2"
 twox-hash = "2.1.1"
+tempfile = "3.13"
