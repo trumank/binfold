@@ -22,12 +22,12 @@ use varint_rs::{VarintReader, VarintWriter};
 //   [ N bytes] UTF-8 string data
 //
 // constraints section (fixed width)
-// [ 4 bytes] count
+// [ 4 bytes] count (COUNT_FIELD_SIZE)
 // for each:
 //   [8 bytes] ConstraintGUID (u64)
 //
 // function constraints section (variable width)
-// [ 4 bytes] count
+// [ 4 bytes] count (COUNT_FIELD_SIZE)
 // for each function:
 //   [varint] number of constraints for this function
 //   [varint] number of unique string refs for this function
@@ -41,7 +41,7 @@ use varint_rs::{VarintReader, VarintWriter};
 //       [varint] index into this function's string ref table
 //
 // functions section (fixed width for binary search)
-// [ 4 bytes] count
+// [ 4 bytes] count (COUNT_FIELD_SIZE)
 // for each:
 //   [8 bytes] FunctionGUID (u64)
 //   [ 4 bytes] byte offset to first constraint in function constraints section
@@ -49,8 +49,10 @@ use varint_rs::{VarintReader, VarintWriter};
 const MAGIC: &[u8; 7] = b"BINFOLD";
 const VERSION: u8 = 5;
 
+/// Size of count fields in the database format (4 bytes for u32)
+const COUNT_FIELD_SIZE: usize = 4;
 const CONSTRAINTS_SIZE: usize = 8;
-const FUNCTION_SIZE: usize = 8 + 4;
+const FUNCTION_SIZE: usize = 8 + COUNT_FIELD_SIZE;
 
 fn write_varint_u64<W: Write>(writer: &mut W, value: u64) -> io::Result<usize> {
     let mut buf = Vec::with_capacity(9);
@@ -155,7 +157,7 @@ impl<'a> Db<'a> {
         u64::from_le_bytes(self.slice_at(offset, 8).try_into().unwrap())
     }
     fn u32_at(&self, offset: usize) -> u32 {
-        u32::from_le_bytes(self.slice_at(offset, 4).try_into().unwrap())
+        u32::from_le_bytes(self.slice_at(offset, COUNT_FIELD_SIZE).try_into().unwrap())
     }
 
     fn read_varint_u64_at(&self, offset: usize) -> Result<(u64, usize)> {
@@ -238,7 +240,7 @@ impl<'a> Db<'a> {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let function_offset = functions_start + 4 + (mid * FUNCTION_SIZE);
+            let function_offset = functions_start + COUNT_FIELD_SIZE + (mid * FUNCTION_SIZE);
 
             let current_guid = FunctionGuid(self.u64_at(function_offset));
 
@@ -593,7 +595,7 @@ impl<'db, 'a> Iterator for FunctionIterator<'db, 'a> {
         }
 
         let functions_start = self.db.header.functions_offset as usize;
-        let function_offset = functions_start + 4 + (self.current * FUNCTION_SIZE);
+        let function_offset = functions_start + COUNT_FIELD_SIZE + (self.current * FUNCTION_SIZE);
 
         let func_guid = FunctionGuid(self.db.u64_at(function_offset));
         self.current += 1;
