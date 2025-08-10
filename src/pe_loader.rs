@@ -463,36 +463,29 @@ impl PeLoader {
         // Second pass: build parent-child relationships based on unwind info
         for func in runtime_functions_by_start.values() {
             // Try to parse unwind info to find chained exceptions
-            if let Ok(unwind_offset) =
-                self.rva_to_file_offset((func.unwind as u64).saturating_sub(self.image_base()))
-            {
-                // Check if this has chain info (first byte's upper 5 bits == 0x4)
-                if let Ok(flags) = self.read_u8(unwind_offset) {
-                    let has_chain_info = (flags >> 3) == 0x4;
+            let unwind_offset =
+                self.rva_to_file_offset((func.unwind as u64).saturating_sub(self.image_base()))?;
+            // Check if this has chain info (first byte's upper 5 bits == 0x4)
+            let flags = self.read_u8(unwind_offset)?;
+            let has_chain_info = (flags >> 3) == 0x4;
 
-                    if has_chain_info {
-                        // Read unwind code count
-                        if let Ok(unwind_code_count) = self.read_u8(unwind_offset + 2) {
-                            let mut chain_offset =
-                                unwind_offset + 4 + 2 * unwind_code_count as usize;
+            if has_chain_info {
+                // Read unwind code count
+                let unwind_code_count = self.read_u8(unwind_offset + 2)?;
+                let mut chain_offset = unwind_offset + 4 + 2 * unwind_code_count as usize;
 
-                            // Align to 4 bytes
-                            if !chain_offset.is_multiple_of(4) {
-                                chain_offset += 2;
-                            }
+                // Align to 4 bytes
+                if !chain_offset.is_multiple_of(4) {
+                    chain_offset += 2;
+                }
 
-                            // Parse chained runtime function
-                            let file_data = self.file.borrow_owner();
-                            if chain_offset + 12 <= file_data.len()
-                                && let Ok(chained) = self.parse_runtime_function(chain_offset)
-                            {
-                                exception_children_cache
-                                    .entry(chained.range.start)
-                                    .or_default()
-                                    .push(func.clone());
-                            }
-                        }
-                    }
+                // Parse chained runtime function
+                if chain_offset + 12 <= self.file.borrow_owner().len() {
+                    let chained = self.parse_runtime_function(chain_offset)?;
+                    exception_children_cache
+                        .entry(chained.range.start)
+                        .or_default()
+                        .push(func.clone());
                 }
             }
         }
