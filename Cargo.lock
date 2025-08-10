@@ -82,6 +82,7 @@ dependencies = [
  "clap",
  "iced-x86",
  "indicatif",
+ "iset",
  "memmap2",
  "object",
  "pdb",
@@ -369,6 +370,12 @@ name = "is_terminal_polyfill"
 version = "1.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
+
+[[package]]
+name = "iset"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "855de4169757ca6b92b396d7a0380ef234e9a1ec2ec603c80779453ed0ab45e4"
 
 [[package]]
 name = "itoa"

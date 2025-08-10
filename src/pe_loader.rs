@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use iset::IntervalMap;
 use memmap2::Mmap;
-use object::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION;
+use object::pe::{IMAGE_DIRECTORY_ENTRY_EXCEPTION, IMAGE_SCN_MEM_EXECUTE};
 use object::read::pe::ImageNtHeaders;
 use object::{File, Object, ObjectSection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -753,44 +754,252 @@ impl PeLoader {
         Ok(false)
     }
 
-    pub fn find_all_functions(&self) -> Result<Vec<FunctionAnalysis>> {
-        let runtime_functions = self.find_all_functions_from_exception_directory()?;
+    /// Find functions using linear sweep through executable sections
+    /// This serves as a fallback when exception directory is not available
+    pub fn find_functions_linear_sweep(&self) -> Result<Vec<FunctionAnalysis>> {
+        let mut function_analysis = BTreeMap::new();
+        // map address range => entry point
+        let mut function_map = IntervalMap::<u64, u64>::new();
 
-        let mut visited = HashSet::new();
-        let mut all_functions = Vec::new();
-        let mut queue = VecDeque::new();
-
-        for func_range in runtime_functions {
-            if !visited.contains(&func_range.start) {
-                queue.push_back(func_range.start);
-            }
-        }
-
-        // Process functions until no more are found
-        while let Some(func_addr) = queue.pop_front() {
-            if visited.contains(&func_addr) {
+        // Process all executable sections
+        for section in self.sections() {
+            // Skip non-executable sections
+            if (section.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 {
                 continue;
             }
-            visited.insert(func_addr);
 
-            match self.analyze_function(func_addr) {
-                Ok(analysis) => {
-                    for call in &analysis.calls {
-                        if !visited.contains(&call.target) {
-                            queue.push_back(call.target);
-                        }
-                    }
-                    all_functions.push(analysis);
-                }
+            // Skip writable sections (likely data, not code)
+            if (section.characteristics & IMAGE_SCN_MEM_WRITE) != 0 {
+                continue;
+            }
+
+            let section_va = self.image_base() + section.virtual_address as u64;
+            let section_size = section.virtual_size as u64;
+
+            debug!(
+                section = section.name().unwrap_or("<invalid>"),
+                start = format!("0x{section_va:x}"),
+                size = format!("0x{section_size:x}"),
+                "Scanning executable section"
+            );
+
+            // Get section data
+            let section_data = match self.read_at_va(section_va, section_size as usize) {
+                Ok(data) => data,
                 Err(e) => {
-                    tracing::info!(
-                        address = format!("0x{func_addr:x}"),
+                    debug!(
+                        section = section.name().unwrap_or("<invalid>"),
                         error = %e,
-                        "Failed to analyze function"
+                        "Failed to read section data"
+                    );
+                    continue;
+                }
+            };
+
+            let bitness = self.bitness();
+            let mut decoder =
+                Decoder::with_ip(bitness, section_data, section_va, DecoderOptions::NONE);
+            let mut potential_functions = HashSet::new();
+
+            // First pass: identify potential function start points
+            while decoder.can_decode() {
+                let instruction = decoder.decode();
+                let ip = instruction.ip();
+
+                // Look for call targets within this section
+                if matches!(
+                    instruction.flow_control(),
+                    FlowControl::Call //| FlowControl::UnconditionalBranch
+                ) && let Some(target) = get_branch_target(&instruction)
+                {
+                    potential_functions.insert(target);
+                    trace!(
+                        caller = format!("0x{ip:x}"),
+                        target = format!("0x{target:x}"),
+                        "Call target identified as function"
                     );
                 }
             }
+
+            // Second pass: validate and size each potential function
+            for &func_start in &potential_functions {
+                if function_map.has_overlap(func_start..func_start + 1) {
+                    continue;
+                }
+
+                match self.analyze_function(func_start) {
+                    Ok(func) => {
+                        let func_end = func_start + func.size as u64;
+
+                        debug!(
+                            start = format!("0x{func_start:x}"),
+                            end = format!("0x{func_end:x}"),
+                            size = format!("0x{:x}", func.size),
+                            "Function discovered via linear sweep"
+                        );
+
+                        if function_map.has_overlap(func_start..func_end) {
+                            debug!(
+                                start = format!("0x{func_start:x}"),
+                                end = format!("0x{func_end:x}"),
+                                size = format!("0x{:x}", func.size),
+                                "Function already exists at"
+                            );
+                        } else {
+                            function_map.insert(func_start..func_end, func_start);
+                            assert_eq!(func.entry_point, func_start);
+                            function_analysis.insert(func.entry_point, func);
+                        }
+                    }
+                    Err(e) => {
+                        trace!(
+                            address = format!("0x{func_start:x}"),
+                            error = %e,
+                            "Failed to determine function size"
+                        );
+                    }
+                }
+            }
         }
+
+        // After linear sweep, check for gaps and scan them for functions
+        for section in self.sections() {
+            // Skip non-executable sections
+            if (section.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 {
+                continue;
+            }
+
+            // Skip writable sections (likely data, not code)
+            if (section.characteristics & IMAGE_SCN_MEM_WRITE) != 0 {
+                continue;
+            }
+
+            let section_va = self.image_base() + section.virtual_address as u64;
+            let section_size = section.virtual_size as u64;
+            let section_end = section_va + section_size;
+
+            debug!(
+                section = section.name().unwrap_or("<invalid>"),
+                start = format!("0x{section_va:x}"),
+                size = format!("0x{section_size:x}"),
+                "Scanning gaps in executable section"
+            );
+
+            // Find gaps in the function map within this section
+            let mut gaps = Vec::new();
+            let mut last_end = section_va;
+
+            // Collect all intervals in this section and sort them
+            let intervals_in_section = function_map.intervals(section_va..section_end);
+
+            // Find gaps between intervals
+            for interval in intervals_in_section {
+                if interval.start > last_end {
+                    gaps.push(last_end..interval.start);
+                }
+                last_end = last_end.max(interval.end);
+            }
+
+            // Add gap at the end if needed
+            if last_end < section_end {
+                gaps.push(last_end..section_end);
+            }
+
+            for gap in gaps {
+                let gap_start = gap.start;
+                let gap_size = gap.end - gap.start;
+
+                trace!(
+                    gap_start = format!("0x{gap_start:x}"),
+                    gap_end = format!("0x{:x}", gap.end),
+                    gap_size = format!("0x{gap_size:x}"),
+                    "Found gap in function map"
+                );
+
+                // Scan the gap for potential function entry points
+                let gap_data = self.read_at_va(gap_start, gap_size as usize)?;
+                let mut gap_decoder =
+                    Decoder::with_ip(self.bitness(), gap_data, gap_start, DecoderOptions::NONE);
+
+                while gap_decoder.can_decode() {
+                    let instruction = gap_decoder.decode();
+                    let ip = instruction.ip();
+
+                    let is_potential_function = instruction.mnemonic() != Mnemonic::INVALID
+                        && instruction.flow_control() != FlowControl::Interrupt;
+
+                    if is_potential_function
+                        && !function_map.has_overlap(ip..ip + 1)
+                        && let Ok(func) = self.analyze_function(ip)
+                    {
+                        let func_end = ip + func.size as u64;
+
+                        // Ensure the function doesn't extend beyond the gap or overlap existing functions
+                        if func_end <= gap.end && !function_map.has_overlap(ip..func_end) {
+                            debug!(
+                                start = format!("0x{ip:x}"),
+                                end = format!("0x{func_end:x}"),
+                                size = format!("0x{:x}", func.size),
+                                "Function discovered in gap"
+                            );
+
+                            function_map.insert(ip..func_end, ip);
+                            function_analysis.insert(func.entry_point, func);
+                        }
+                    }
+                }
+            }
+        }
+
+        let functions = function_analysis.into_values().collect::<Vec<_>>();
+
+        tracing::info!(
+            functions = functions.len(),
+            "Linear sweep function discovery complete (including gaps)"
+        );
+
+        Ok(functions)
+    }
+
+    /// Find all functions using both exception directory and linear sweep
+    /// Returns all functions found by either method (union of both)
+    pub fn find_all_functions(&self) -> Result<Vec<FunctionAnalysis>> {
+        let mut all_functions = Vec::new();
+
+        // Get functions from exception directory (if available)
+        // let exception_functions = self.find_all_functions_from_exception_directory()?;
+        // debug!(
+        //     count = exception_functions.len(),
+        //     "Functions found via exception directory"
+        // );
+        // for func in exception_functions {
+        //     all_functions.insert((func.start, func.end));
+        // }
+
+        // Get functions from linear sweep
+        let linear_sweep_functions = self.find_functions_linear_sweep()?;
+        debug!(
+            count = linear_sweep_functions.len(),
+            "Functions found via linear sweep"
+        );
+        all_functions.extend(linear_sweep_functions);
+        // for func in linear_sweep_functions {
+        //     all_functions.insert((func.start, func.end));
+        // }
+
+        // Convert back to Vec and merge overlapping ranges
+        // let mut function_ranges: Vec<FunctionRange> = all_functions
+        //     .into_iter()
+        //     .map(|(start, end)| FunctionRange { start, end })
+        //     .collect();
+
+        all_functions.sort_by_key(|f| f.entry_point);
+        // let function_ranges = self.merge_overlapping_ranges(function_ranges);
+
+        tracing::info!(
+            final_count = all_functions.len(),
+            "All functions discovery complete"
+        );
 
         Ok(all_functions)
     }
