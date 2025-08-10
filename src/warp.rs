@@ -241,7 +241,7 @@ fn get_branch_target(instruction: &Instruction) -> Option<u64> {
     }
 }
 
-fn create_basic_block_guid(
+pub fn create_basic_block_guid(
     raw_bytes: &[u8],
     base: u64,
     function_bounds: Range<u64>,

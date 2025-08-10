@@ -13,6 +13,7 @@ use crate::pe_loader::{AnalysisCache, PeLoader};
 use crate::warp::{ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints};
 
 mod db;
+mod json_analysis;
 mod mmap_source;
 mod pdb_analyzer;
 mod pdb_writer;
@@ -66,6 +67,10 @@ struct CommandAnalyze {
     /// Generate PDB file with matched function names
     #[arg(long, requires = "database")]
     generate_pdb: bool,
+
+    /// Optional JSON file path to compare function analysis results
+    #[arg(long)]
+    compare_json: Option<PathBuf>,
 }
 
 /// Dump function and constraint information from a database as JSON
@@ -325,6 +330,7 @@ fn command_analyze(
         exe: file,
         database,
         generate_pdb,
+        compare_json,
     }: CommandAnalyze,
 ) -> Result<()> {
     let pe = PeLoader::load(&file)?;
@@ -638,6 +644,19 @@ fn command_analyze(
                 "Error: Refusing to overwrite existing PDB file at: {}",
                 pdb_path.display()
             );
+        }
+    }
+
+    // Compare with JSON if provided
+    if let Some(json_path) = compare_json {
+        println!("\nComparing analysis results with JSON file...");
+        match json_analysis::load_expected_analysis(&json_path) {
+            Ok(expected) => {
+                json_analysis::compare_analysis(&expected[0], &functions, &pe, &cache);
+            }
+            Err(e) => {
+                eprintln!("Error loading JSON comparison file: {}", e);
+            }
         }
     }
 
