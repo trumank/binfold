@@ -87,6 +87,7 @@ dependencies = [
  "pdb",
  "pdb-sdk",
  "rayon",
+ "self_cell",
  "struson",
  "tracing",
  "tracing-subscriber",
@@ -673,6 +674,12 @@ name = "scroll"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04c565b551bafbef4157586fa379538366e4385d42082f255bfd96e4fe8519da"
+
+[[package]]
+name = "self_cell"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f7d95a54511e0c7be3f51e8867aa8cf35148d7b9445d44de2f943e2b206e749"
 
 [[package]]
 name = "serde"

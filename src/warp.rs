@@ -249,7 +249,8 @@ pub fn compute_warp_uuid(
             let block_end_offset = (end_addr - base) as usize;
             let block_bytes = &raw_bytes[block_start_offset..block_end_offset];
 
-            let mut decoder = Decoder::with_ip(64, block_bytes, start_addr, DecoderOptions::NONE);
+            let mut decoder =
+                Decoder::with_ip(pe.bitness(), block_bytes, start_addr, DecoderOptions::NONE);
             let mut output = String::new();
 
             while decoder.can_decode() {
@@ -317,7 +318,7 @@ fn get_instruction_bytes_for_guid(
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
 
-    let mut decoder = Decoder::new(64, raw_bytes, DecoderOptions::NONE);
+    let mut decoder = Decoder::new(pe.bitness(), raw_bytes, DecoderOptions::NONE);
     decoder.set_ip(base);
 
     debug!(

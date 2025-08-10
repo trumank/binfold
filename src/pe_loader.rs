@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
-use object::pe::{IMAGE_DIRECTORY_ENTRY_EXCEPTION, ImageNtHeaders64};
-use object::read::pe::{ImageNtHeaders, ImageOptionalHeader, PeFile};
+use object::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION;
+use object::read::pe::ImageNtHeaders;
+use object::{File, Object, ObjectSection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::File;
+use std::fs::{self};
 use std::ops::Range;
 use std::path::Path;
 use tracing::{debug, trace};
@@ -84,47 +85,56 @@ impl SectionInfo {
     }
 }
 
+self_cell::self_cell!(
+    struct FileData {
+        owner: Mmap,
+        #[covariant]
+        dependent: File,
+    }
+);
+
 pub struct PeLoader {
-    mmap: Mmap,
-    pub image_base: u64,
+    file: FileData,
 }
 
 impl PeLoader {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = File::open(path)?;
+        let file = fs::File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Parse PE headers to get image base
-        let pe_file = PeFile::<ImageNtHeaders64>::parse(&*mmap)?;
-        let image_base = pe_file.nt_headers().optional_header().image_base();
-
-        Ok(Self { mmap, image_base })
+        Ok(Self {
+            file: FileData::try_new(mmap, |mmap| object::File::parse(mmap))?,
+        })
     }
 
     pub fn image_base(&self) -> u64 {
-        self.image_base
+        self.file.borrow_dependent().relative_address_base()
+    }
+
+    /// Get the bitness of the PE file (32 or 64)
+    pub fn bitness(&self) -> u32 {
+        match self.file.borrow_dependent() {
+            object::File::Pe32(_) => 32,
+            object::File::Pe64(_) => 64,
+            _ => todo!("Unhandled File format"),
+        }
     }
 
     /// Convert RVA to file offset
     pub fn rva_to_file_offset(&self, rva: u64) -> Result<usize> {
-        let pe_file = PeFile::<ImageNtHeaders64>::parse(&*self.mmap)?;
+        let file = self.file.borrow_dependent();
 
-        // Get the raw section headers to access the VirtualAddress field directly
-        let section_table = pe_file.section_table();
-        for section_header in section_table.iter() {
-            let section_rva = section_header.virtual_address.get(object::LittleEndian) as u64;
-            let section_size = section_header
-                .virtual_size
-                .get(object::LittleEndian)
-                .max(section_header.size_of_raw_data.get(object::LittleEndian))
-                as u64;
+        for section in file.sections() {
+            let section_rva = section.address() - self.image_base();
+            let section_size = section.size();
 
             if rva >= section_rva && rva < section_rva + section_size {
                 // Found the section
                 let offset_in_section = rva - section_rva;
-                let file_offset = section_header.pointer_to_raw_data.get(object::LittleEndian)
-                    as u64
-                    + offset_in_section;
+                let file_offset = section
+                    .file_range()
+                    .map(|(offset, _)| offset + offset_in_section)
+                    .ok_or_else(|| anyhow::anyhow!("Section has no file data"))?;
                 return Ok(file_offset as usize);
             }
         }
@@ -135,15 +145,18 @@ impl PeLoader {
     /// Read bytes at a given virtual address
     pub fn read_at_va(&self, va: u64, size: usize) -> Result<&[u8]> {
         // Convert VA to RVA
-        let rva = va.saturating_sub(self.image_base);
+        let rva = va.saturating_sub(self.image_base());
         let file_offset = self.rva_to_file_offset(rva)?;
 
+        // Get file data
+        let file_data = self.file.borrow_owner();
+
         // Bounds check
-        if file_offset + size > self.mmap.len() {
+        if file_offset + size > file_data.len() {
             bail!("Read would go past end of file");
         }
 
-        Ok(&self.mmap[file_offset..file_offset + size])
+        Ok(&file_data[file_offset..file_offset + size])
     }
 
     /// Find a function at the given address and return its approximate size
@@ -163,17 +176,20 @@ impl PeLoader {
         let max_scan = 0x10000; // Maximum function size to scan (64KB)
         let tail_call_threshold = 0x50;
 
-        let start_offset = self.rva_to_file_offset(va.saturating_sub(self.image_base))?;
+        let start_offset = self.rva_to_file_offset(va.saturating_sub(self.image_base()))?;
+
+        // Get file data
+        let file_data = self.file.borrow_owner();
 
         // Adjust max_scan if it would go past end of file
-        let available = self.mmap.len().saturating_sub(start_offset);
+        let available = file_data.len().saturating_sub(start_offset);
         let scan_size = max_scan.min(available);
 
         if scan_size == 0 {
             bail!("No bytes available to scan");
         }
 
-        let bytes = &self.mmap[start_offset..start_offset + scan_size];
+        let bytes = &file_data[start_offset..start_offset + scan_size];
 
         debug!(
             target: "binfold::pe_loader::size",
@@ -184,7 +200,8 @@ impl PeLoader {
 
         // First decode all instructions in the scan range
         // let mut all_instructions = std::collections::BTreeMap::new();
-        let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
+        let bitness = self.bitness();
+        let mut decoder = Decoder::with_ip(bitness, bytes, va, DecoderOptions::NONE);
 
         // Now do recursive descent to find all reachable instructions
         let mut visited = HashSet::new();
@@ -373,35 +390,41 @@ impl PeLoader {
     }
 
     /// Get the exception directory range
-    pub fn get_exception_directory_range(&self) -> Result<Range<usize>> {
-        let pe_file = PeFile::<ImageNtHeaders64>::parse(&*self.mmap)?;
-        let exception_directory = pe_file
-            .data_directory(IMAGE_DIRECTORY_ENTRY_EXCEPTION)
-            .context("No exception directory")?;
+    pub fn get_exception_directory_range(&self) -> Result<Option<Range<usize>>> {
+        let file = self.file.borrow_dependent();
+        let Some(exception_directory) = (match file {
+            object::File::Pe32(pe_file) => pe_file.data_directory(IMAGE_DIRECTORY_ENTRY_EXCEPTION),
+            object::File::Pe64(pe_file) => pe_file.data_directory(IMAGE_DIRECTORY_ENTRY_EXCEPTION),
+            _ => bail!("Only PE32/PE64 files are supported"),
+        }) else {
+            return Ok(None);
+        };
 
         let (address, size) = exception_directory.address_range();
         let start_offset = self.rva_to_file_offset(address as u64)?;
         let end_offset = start_offset + size as usize;
 
-        Ok(start_offset..end_offset)
+        Ok(Some(start_offset..end_offset))
     }
 
     /// Read a u32 little-endian value at the given offset
     fn read_u32_le(&self, offset: usize) -> Result<u32> {
-        if offset + 4 > self.mmap.len() {
+        let file_data = self.file.borrow_owner();
+        if offset + 4 > file_data.len() {
             bail!("Read would go past end of file");
         }
         Ok(u32::from_le_bytes(
-            self.mmap[offset..offset + 4].try_into().unwrap(),
+            file_data[offset..offset + 4].try_into().unwrap(),
         ))
     }
 
     /// Read a u8 value at the given offset
     fn read_u8(&self, offset: usize) -> Result<u8> {
-        if offset >= self.mmap.len() {
+        let file_data = self.file.borrow_owner();
+        if offset >= file_data.len() {
             bail!("Read would go past end of file");
         }
-        Ok(self.mmap[offset])
+        Ok(file_data[offset])
     }
 
     /// Parse a runtime function entry from the exception directory
@@ -411,15 +434,17 @@ impl PeLoader {
         let unwind_rva = self.read_u32_le(offset + 8)?;
 
         Ok(RuntimeFunction {
-            range: (self.image_base + start_rva as u64) as usize
-                ..(self.image_base + end_rva as u64) as usize,
-            unwind: (self.image_base + unwind_rva as u64) as usize,
+            range: (self.image_base() + start_rva as u64) as usize
+                ..(self.image_base() + end_rva as u64) as usize,
+            unwind: (self.image_base() + unwind_rva as u64) as usize,
         })
     }
 
     /// Find all functions from the exception directory
     pub fn find_all_functions_from_exception_directory(&self) -> Result<Vec<FunctionRange>> {
-        let exception_range = self.get_exception_directory_range()?;
+        let Some(exception_range) = self.get_exception_directory_range()? else {
+            return Ok(vec![]);
+        };
         let entry_size = 12; // Each RUNTIME_FUNCTION entry is 12 bytes
 
         // First pass: parse all runtime functions
@@ -439,7 +464,7 @@ impl PeLoader {
         for func in runtime_functions_by_start.values() {
             // Try to parse unwind info to find chained exceptions
             if let Ok(unwind_offset) =
-                self.rva_to_file_offset((func.unwind as u64).saturating_sub(self.image_base))
+                self.rva_to_file_offset((func.unwind as u64).saturating_sub(self.image_base()))
             {
                 // Check if this has chain info (first byte's upper 5 bits == 0x4)
                 if let Ok(flags) = self.read_u8(unwind_offset) {
@@ -457,7 +482,8 @@ impl PeLoader {
                             }
 
                             // Parse chained runtime function
-                            if chain_offset + 12 <= self.mmap.len()
+                            let file_data = self.file.borrow_owner();
+                            if chain_offset + 12 <= file_data.len()
                                 && let Ok(chained) = self.parse_runtime_function(chain_offset)
                             {
                                 exception_children_cache
@@ -531,12 +557,14 @@ impl PeLoader {
 
     /// Get the timestamp from the PE header
     pub fn timestamp(&self) -> Result<u32> {
-        let pe_file = PeFile::<ImageNtHeaders64>::parse(&*self.mmap)?;
-        Ok(pe_file
-            .nt_headers()
-            .file_header()
-            .time_date_stamp
-            .get(object::LittleEndian))
+        let file = self.file.borrow_dependent();
+        Ok(match file {
+            object::File::Pe32(pe_file) => pe_file.nt_headers().file_header(),
+            object::File::Pe64(pe_file) => pe_file.nt_headers().file_header(),
+            _ => bail!("Only PE32/PE64 files are supported"),
+        }
+        .time_date_stamp
+        .get(object::LittleEndian))
     }
 
     /// Get PDB debug info from the PE file
@@ -546,8 +574,12 @@ impl PeLoader {
             IMAGE_DEBUG_TYPE_CODEVIEW, IMAGE_DIRECTORY_ENTRY_DEBUG, ImageDebugDirectory,
         };
 
-        let pe_file = PeFile::<ImageNtHeaders64>::parse(&*self.mmap)?;
-        let data_dirs = pe_file.data_directories();
+        let file = self.file.borrow_dependent();
+        let data_dirs = match file {
+            object::File::Pe32(pe_file) => pe_file.data_directories(),
+            object::File::Pe64(pe_file) => pe_file.data_directories(),
+            _ => bail!("Only PE32/PE64 files are supported"),
+        };
 
         // Get debug directory
         let debug_dir = data_dirs
@@ -559,11 +591,12 @@ impl PeLoader {
         let debug_offset = self.rva_to_file_offset(debug_rva as u64)?;
         let debug_size = debug_dir.size.get(LE) as usize;
 
-        if debug_offset + debug_size > self.mmap.len() {
+        let file_data = self.file.borrow_owner();
+        if debug_offset + debug_size > file_data.len() {
             bail!("Debug directory extends past end of file");
         }
 
-        let debug_data = &self.mmap[debug_offset..debug_offset + debug_size];
+        let debug_data = &file_data[debug_offset..debug_offset + debug_size];
 
         // Parse debug directory entries
         let num_entries =
@@ -578,11 +611,11 @@ impl PeLoader {
                 let offset = entry.pointer_to_raw_data.get(LE) as usize;
                 let size = entry.size_of_data.get(LE) as usize;
 
-                if offset + size > self.mmap.len() {
+                if offset + size > file_data.len() {
                     bail!("Invalid debug data offset");
                 }
 
-                let debug_data = &self.mmap[offset..offset + size];
+                let debug_data = &file_data[offset..offset + size];
 
                 // Parse CodeView data
                 if debug_data.len() < 24 {
@@ -608,23 +641,27 @@ impl PeLoader {
 
     /// Get an iterator over PE sections
     pub fn sections(&self) -> impl Iterator<Item = SectionInfo> + '_ {
-        let pe_file = PeFile::<ImageNtHeaders64>::parse(&*self.mmap).unwrap();
-        pe_file
-            .section_table()
-            .iter()
-            .map(move |section| SectionInfo {
-                name_bytes: section.name,
-                virtual_address: section.virtual_address.get(object::LittleEndian),
-                virtual_size: section.virtual_size.get(object::LittleEndian),
-                size_of_raw_data: section.size_of_raw_data.get(object::LittleEndian),
-                pointer_to_raw_data: section.pointer_to_raw_data.get(object::LittleEndian),
-                characteristics: section.characteristics.get(object::LittleEndian),
-            })
+        let file = self.file.borrow_dependent();
+
+        match file {
+            object::File::Pe32(pe_file) => pe_file.section_table(),
+            object::File::Pe64(pe_file) => pe_file.section_table(),
+            _ => panic!("Only PE32/PE64 files are supported"),
+        }
+        .iter()
+        .map(|section: &object::pe::ImageSectionHeader| SectionInfo {
+            name_bytes: section.name,
+            virtual_address: section.virtual_address.get(object::LittleEndian),
+            virtual_size: section.virtual_size.get(object::LittleEndian),
+            size_of_raw_data: section.size_of_raw_data.get(object::LittleEndian),
+            pointer_to_raw_data: section.pointer_to_raw_data.get(object::LittleEndian),
+            characteristics: section.characteristics.get(object::LittleEndian),
+        })
     }
 
     /// Check if a virtual address is in a writable section
     pub fn is_address_writable(&self, va: u64) -> Result<bool> {
-        let rva = va.saturating_sub(self.image_base);
+        let rva = va.saturating_sub(self.image_base());
 
         for section in self.sections() {
             let section_start = section.virtual_address as u64;

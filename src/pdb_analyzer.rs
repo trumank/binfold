@@ -116,7 +116,7 @@ impl PdbAnalyzer {
                 .iter()
                 .flatten()
                 .fold(Default::default(), |mut acc, item| {
-                    acc.entry(item.rva as u64 + self.pe_loader.image_base)
+                    acc.entry(item.rva as u64 + self.pe_loader.image_base())
                         .or_default()
                         .push(item);
                     acc
