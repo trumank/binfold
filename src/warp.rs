@@ -1,4 +1,4 @@
-use crate::pe_loader::PeLoader;
+use crate::pe_loader::{AnalysisCache, FunctionAnalysis, PeLoader};
 use anyhow::Result;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use std::ops::Range;
@@ -92,8 +92,6 @@ pub struct Function {
     pub address: u64,
     pub size: usize,
     pub constraints: Vec<Constraint>,
-    pub calls: Vec<FunctionCall>,
-    pub data_refs: Vec<DataReference>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,131 +100,80 @@ pub struct Constraint {
     pub offset: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
-pub struct FunctionCall {
-    /// function call target
-    pub target: u64,
-    /// offset from calling function entrypoint
-    pub offset: u64,
+pub fn compute_function_guid(
+    pe: &PeLoader,
+    cache: &AnalysisCache,
+    address: u64,
+) -> Result<FunctionGuid> {
+    let func = cache.get(address, pe)?;
+    debug!(size = format!("0x{:x}", func.size), "Function size");
+
+    compute_warp_uuid(&func, pe)
 }
 
-#[derive(Debug, Clone)]
-pub struct DataReference {
-    /// target address of data reference
-    pub target: u64,
-    /// offset from calling function entrypoint
-    pub offset: u64,
-    /// whether the reference is to read-only data
-    pub is_readonly: bool,
-    /// estimated size of the data being referenced (based on instruction)
-    pub estimated_size: Option<u32>,
-}
+pub fn compute_function_guid_with_contraints(
+    pe: &PeLoader,
+    cache: &AnalysisCache,
+    address: u64,
+) -> Result<Function> {
+    let func = cache.get(address, pe)?;
+    debug!(size = format!("0x{:x}", func.size), "Function size");
 
-pub fn compute_warp_uuid_from_pe(pe: &PeLoader, address: u64) -> Result<FunctionGuid> {
-    // Build CFG during size calculation
-    let mut cfg = crate::pe_loader::ControlFlowGraph::default();
-    let func_size = pe.find_function_size_with_cfg(address, Some(&mut cfg))?;
-
-    debug!(
-        target: "binfold::warp",
-        size = format!("0x{func_size:x}"),
-        "Function size"
-    );
-
-    let func_bytes = pe.read_at_va(address, func_size)?;
-
-    Ok(compute_warp_uuid(func_bytes, address, None, None, &cfg, pe))
-}
-
-pub fn compute_function_guid_with_contraints(pe: &PeLoader, address: u64) -> Result<Function> {
-    // Build CFG during size calculation
-    let mut cfg = crate::pe_loader::ControlFlowGraph::default();
-    let func_size = pe.find_function_size_with_cfg(address, Some(&mut cfg))?;
-
-    debug!(
-        target: "binfold::warp",
-        size = format!("0x{func_size:x}"),
-        "Function size"
-    );
-
-    let func_bytes = pe.read_at_va(address, func_size)?;
-
-    let mut calls = vec![];
-    let mut data_refs = vec![];
-    let guid = compute_warp_uuid(
-        func_bytes,
-        address,
-        Some(&mut calls),
-        Some(&mut data_refs),
-        &cfg,
-        pe,
-    );
+    let guid = compute_warp_uuid(&func, pe)?;
 
     // Generate constraints from calls
-    let mut constraints: Vec<Constraint> = calls
+    let mut constraints: Vec<Constraint> = func
+        .calls
         .iter()
         .map(|c| {
-            compute_warp_uuid_from_pe(pe, c.target).map(|guid| Constraint {
+            compute_function_guid(pe, cache, c.target).map(|guid| Constraint {
                 guid: ConstraintGuid::from_child_call(guid),
-                offset: Some(c.offset as i64),
+                offset: Some((c.address - func.entry_point) as i64),
             })
         })
         .collect::<Result<_>>()?;
 
     // Add data reference constraints
-    for data_ref in &data_refs {
+    for data_ref in &func.data_refs {
         if data_ref.is_readonly && data_ref.estimated_size.is_none() {
             // For read-only data with no specific size (strings), try to read and hash the content
             if let Some(data) = read_string_data(pe, data_ref.target) {
                 constraints.push(Constraint {
                     guid: ConstraintGuid::from_data_const(&data),
-                    offset: Some(data_ref.offset as i64),
+                    offset: Some((data_ref.address - func.entry_point) as i64),
                 });
             }
         }
     }
 
     Ok(Function {
-        address,
-        size: func_size,
+        address: func.entry_point,
+        size: func.size,
         guid,
         constraints,
-        calls,
-        data_refs,
     })
 }
 
-pub fn compute_warp_uuid(
-    raw_bytes: &[u8],
-    base: u64,
-    mut calls: Option<&mut Vec<FunctionCall>>,
-    mut data_refs: Option<&mut Vec<DataReference>>,
-    cfg: &crate::pe_loader::ControlFlowGraph,
-    pe: &PeLoader,
-) -> FunctionGuid {
-    debug!(
-        target: "binfold::warp",
-        blocks = cfg.basic_blocks.len(),
-        "Identified basic blocks"
-    );
+pub fn compute_warp_uuid(func: &FunctionAnalysis, pe: &PeLoader) -> Result<FunctionGuid> {
+    debug!(blocks = func.basic_blocks.len(), "Identified basic blocks");
+
+    let raw_bytes = pe.read_at_va(func.entry_point, func.size)?;
+    let base = func.entry_point;
 
     // Create UUID for each basic block
     let mut block_uuids = Vec::new();
-    for (&start_addr, &end_addr) in cfg.basic_blocks.iter() {
+    for (&start_addr, &end_addr) in func.basic_blocks.iter() {
         // println!("{:x?}", (start_addr - base, end_addr - base, base));
         let block_bytes = &raw_bytes[(start_addr - base) as usize..(end_addr - base) as usize];
         let uuid = create_basic_block_guid(
             block_bytes,
             start_addr,
             base..(base + raw_bytes.len() as u64),
-            calls.as_deref_mut(),
-            data_refs.as_deref_mut(),
             pe,
         );
         block_uuids.push((start_addr, uuid));
 
         debug!(
-            target: "binfold::warp::guid",
             block_start = format!("0x{start_addr:x}"),
             block_end = format!("0x{end_addr:x}"),
             uuid = %uuid,
@@ -236,9 +183,8 @@ pub fn compute_warp_uuid(
 
     // Print disassembly for each basic block if requested
     if tracing::enabled!(target: "binfold::warp::blocks", tracing::Level::DEBUG) {
-        for (&start_addr, &end_addr) in &cfg.basic_blocks {
+        for (&start_addr, &end_addr) in &func.basic_blocks {
             debug!(
-                target: "binfold::warp::blocks",
                 start = format!("0x{start_addr:x}"),
                 end = format!("0x{end_addr:x}"),
                 "Basic block"
@@ -283,7 +229,7 @@ pub fn compute_warp_uuid(
         "Function UUID calculated"
     );
 
-    function_uuid
+    Ok(function_uuid)
 }
 
 fn get_branch_target(instruction: &Instruction) -> Option<u64> {
@@ -299,23 +245,8 @@ fn create_basic_block_guid(
     raw_bytes: &[u8],
     base: u64,
     function_bounds: Range<u64>,
-    calls: Option<&mut Vec<FunctionCall>>,
-    data_refs: Option<&mut Vec<DataReference>>,
     pe: &PeLoader,
 ) -> BasicBlockGuid {
-    let instruction_bytes =
-        get_instruction_bytes_for_guid(raw_bytes, base, function_bounds, calls, data_refs, pe);
-    BasicBlockGuid::from_bytes(&instruction_bytes)
-}
-
-fn get_instruction_bytes_for_guid(
-    raw_bytes: &[u8],
-    base: u64,
-    function_bounds: Range<u64>,
-    mut calls: Option<&mut Vec<FunctionCall>>,
-    mut data_refs: Option<&mut Vec<DataReference>>,
-    pe: &PeLoader,
-) -> Vec<u8> {
     let mut bytes = Vec::new();
 
     let mut decoder = Decoder::new(pe.bitness(), raw_bytes, DecoderOptions::NONE);
@@ -344,13 +275,7 @@ fn get_instruction_bytes_for_guid(
         }
 
         // Get instruction bytes, zeroing out relocatable instructions
-        if is_relocatable_instruction(
-            &instruction,
-            function_bounds.clone(),
-            calls.as_deref_mut(),
-            data_refs.as_deref_mut(),
-            pe,
-        ) {
+        if is_relocatable_instruction(&instruction, function_bounds.clone()) {
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
             trace!(
@@ -373,7 +298,7 @@ fn get_instruction_bytes_for_guid(
         }
     }
 
-    bytes
+    BasicBlockGuid::from_bytes(&bytes)
 }
 
 fn is_register_to_itself_nop(instruction: &Instruction) -> bool {
@@ -423,38 +348,12 @@ fn has_implicit_extension(reg: Register) -> bool {
     )
 }
 
-fn estimate_data_size_from_instruction(instruction: &Instruction) -> Option<u32> {
-    for i in 0..instruction.op_count() {
-        if instruction.op_kind(i) == OpKind::Memory {
-            let size = instruction.memory_size().size();
-            if size == 0 {
-                return None;
-            } else {
-                return Some(size as u32);
-            }
-        }
-    }
-
-    None
-}
-
-fn is_relocatable_instruction(
-    instruction: &Instruction,
-    function_bounds: Range<u64>,
-    calls: Option<&mut Vec<FunctionCall>>,
-    mut data_refs: Option<&mut Vec<DataReference>>,
-    pe: &PeLoader,
-) -> bool {
-    let offset = instruction.ip() - function_bounds.start;
-
+fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<u64>) -> bool {
     // Check for direct calls - but only forward calls are relocatable
     if instruction.mnemonic() == Mnemonic::Call && instruction.op_count() > 0 {
         match instruction.op_kind(0) {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                 // All direct calls are relocatable
-                if let (Some(calls), Some(target)) = (calls, get_branch_target(instruction)) {
-                    calls.push(FunctionCall { target, offset });
-                }
                 return true;
             }
             _ => {}
@@ -469,44 +368,10 @@ fn is_relocatable_instruction(
                 if let Some(target) = get_branch_target(instruction)
                     && !function_bounds.contains(&target)
                 {
-                    if let Some(calls) = calls {
-                        calls.push(FunctionCall { target, offset });
-                    }
                     return true;
                 }
             }
             _ => {}
-        }
-    }
-
-    // Check for memory operands that could be data references
-    if instruction.mnemonic() != Mnemonic::Call {
-        for i in 0..instruction.op_count() {
-            if instruction.op_kind(i) == OpKind::Memory {
-                // Check if it's RIP-relative (typical for data references)
-                // Also check for displacement-only addressing (absolute addresses)
-                // BUT exclude segment-relative addressing (GS, FS, etc)
-                if instruction.memory_base() == Register::RIP
-                    || (instruction.memory_base() == Register::None
-                        && instruction.memory_index() == Register::None
-                        && instruction.memory_displacement64() != 0
-                        && instruction.segment_prefix() == Register::None)
-                {
-                    let target_address = instruction.memory_displacement64();
-
-                    // Track this as a data reference if we have the data_refs vector
-                    if let Some(data_refs) = data_refs.as_deref_mut() {
-                        // Check if the target is writable
-                        let is_readonly = !pe.is_address_writable(target_address).unwrap_or(false);
-                        data_refs.push(DataReference {
-                            target: target_address,
-                            offset,
-                            is_readonly,
-                            estimated_size: estimate_data_size_from_instruction(instruction),
-                        });
-                    }
-                }
-            }
         }
     }
 

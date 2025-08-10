@@ -1,12 +1,14 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use memmap2::Mmap;
 use object::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION;
 use object::read::pe::ImageNtHeaders;
 use object::{File, Object, ObjectSection};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self};
 use std::ops::Range;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, trace};
 
 // PE section characteristics
@@ -24,12 +26,35 @@ pub struct FunctionRange {
     pub end: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct FunctionCall {
+    /// instruction address of CALL
+    pub address: u64,
+    /// CALL target address
+    pub target: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DataReference {
+    /// instruction address
+    pub address: u64,
+    /// target address of data reference
+    pub target: u64,
+    /// whether the reference is to read-only data
+    pub is_readonly: bool,
+    /// estimated size of the data being referenced (based on instruction)
+    pub estimated_size: Option<u32>,
+}
+
 /// Control flow graph built during recursive descent
-#[derive(Debug, Default)]
-pub struct ControlFlowGraph {
+#[derive(Debug, Default, Clone)]
+pub struct FunctionAnalysis {
+    pub size: usize,
     /// Block bounds start -> end
     pub basic_blocks: BTreeMap<u64, u64>,
     pub entry_point: u64,
+    pub calls: Vec<FunctionCall>,
+    pub data_refs: Vec<DataReference>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,6 +118,36 @@ self_cell::self_cell!(
     }
 );
 
+#[derive(Default)]
+pub struct AnalysisCache {
+    cache: Arc<Mutex<HashMap<u64, Result<Arc<FunctionAnalysis>>>>>,
+}
+impl AnalysisCache {
+    pub fn new(functions: impl IntoIterator<Item = FunctionAnalysis>) -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(
+                functions
+                    .into_iter()
+                    .map(|func| (func.entry_point, Ok(Arc::new(func))))
+                    .collect(),
+            )),
+        }
+    }
+    pub fn get(&self, address: u64, pe: &PeLoader) -> Result<Arc<FunctionAnalysis>> {
+        use std::collections::hash_map::Entry;
+        let mut lock = self.cache.lock().unwrap();
+        fn map(res: &Result<Arc<FunctionAnalysis>>) -> Result<Arc<FunctionAnalysis>> {
+            res.as_ref()
+                .map(|v| v.clone())
+                .map_err(|e| anyhow!("cache: {e:?}"))
+        }
+        match lock.entry(address) {
+            Entry::Occupied(entry) => map(entry.get()),
+            Entry::Vacant(entry) => map(entry.insert(pe.analyze_function(address).map(Arc::new))),
+        }
+    }
+}
+
 pub struct PeLoader {
     file: FileData,
 }
@@ -145,7 +200,7 @@ impl PeLoader {
     /// Read bytes at a given virtual address
     pub fn read_at_va(&self, va: u64, size: usize) -> Result<&[u8]> {
         // Convert VA to RVA
-        let rva = va.saturating_sub(self.image_base());
+        let rva = va - self.image_base();
         let file_offset = self.rva_to_file_offset(rva)?;
 
         // Get file data
@@ -162,16 +217,14 @@ impl PeLoader {
     /// Find a function at the given address and return its approximate size
     /// Uses recursive descent to follow all code paths
     pub fn find_function_size(&self, va: u64) -> Result<usize> {
-        self.find_function_size_with_cfg(va, None)
+        self.analyze_function(va).map(|a| a.size)
     }
 
-    pub fn find_function_size_with_cfg(
-        &self,
-        va: u64,
-        mut cfg_builder: Option<&mut ControlFlowGraph>,
-    ) -> Result<usize> {
-        use iced_x86::{Decoder, DecoderOptions, FlowControl};
-        use std::collections::{HashSet, VecDeque};
+    pub fn analyze_function(&self, va: u64) -> Result<FunctionAnalysis> {
+        let mut analysis = FunctionAnalysis {
+            entry_point: va,
+            ..Default::default()
+        };
 
         let max_scan = 0x10000; // Maximum function size to scan (64KB)
         let tail_call_threshold = 0x50;
@@ -213,11 +266,7 @@ impl PeLoader {
 
         let mut max_address = va;
 
-        // Initialize CFG if requested
-        if let Some(cfg) = cfg_builder.as_deref_mut() {
-            cfg.entry_point = va;
-            block_intervals.insert(BlockBound::Start(va));
-        }
+        block_intervals.insert(BlockBound::Start(va));
 
         debug!(
             target: "binfold::pe_loader::size",
@@ -267,12 +316,48 @@ impl PeLoader {
                     max_address = next_ip;
                 }
 
+                if instruction.mnemonic() == Mnemonic::Call
+                    && let Some(target) = get_branch_target(&instruction)
+                {
+                    analysis.calls.push(FunctionCall {
+                        address: ip,
+                        target,
+                    });
+                }
+
+                // Check for memory operands that could be data references
+                if !matches!(instruction.mnemonic(), Mnemonic::Jmp | Mnemonic::Call) {
+                    for i in 0..instruction.op_count() {
+                        if instruction.op_kind(i) == OpKind::Memory {
+                            // Check if it's RIP-relative (typical for data references)
+                            // Also check for displacement-only addressing (absolute addresses)
+                            // BUT exclude segment-relative addressing (GS, FS, etc)
+                            if instruction.memory_base() == Register::RIP
+                                || (instruction.memory_base() == Register::None
+                                    && instruction.memory_index() == Register::None
+                                    && instruction.memory_displacement64() != 0
+                                    && instruction.segment_prefix() == Register::None)
+                            {
+                                let target_address = instruction.memory_displacement64();
+                                let is_readonly =
+                                    !self.is_address_writable(target_address).unwrap_or(false);
+                                analysis.data_refs.push(DataReference {
+                                    address: ip,
+                                    target: target_address,
+                                    is_readonly,
+                                    estimated_size: estimate_data_size_from_instruction(
+                                        &instruction,
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 match instruction.flow_control() {
                     FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {}
                     FlowControl::UnconditionalBranch => {
-                        if cfg_builder.is_some() {
-                            block_intervals.insert(BlockBound::End(next_ip));
-                        }
+                        block_intervals.insert(BlockBound::End(next_ip));
                         // Check if it's a tail call (jmp to external function)
                         if let Some(target) = get_branch_target(&instruction)
                             && target >= va
@@ -285,9 +370,7 @@ impl PeLoader {
                     }
                     FlowControl::ConditionalBranch => {
                         // Follow both paths
-                        if cfg_builder.is_some() {
-                            block_intervals.insert(BlockBound::Start(next_ip));
-                        }
+                        block_intervals.insert(BlockBound::Start(next_ip));
 
                         if let Some(target) = get_branch_target(&instruction)
                             && target >= va
@@ -295,15 +378,13 @@ impl PeLoader {
                         {
                             // Internal jump - follow it
                             queue.push_back((target, Some(ip)));
-                            if cfg_builder.is_some() {
-                                block_intervals.insert(BlockBound::Start(target));
-                            }
+                            block_intervals.insert(BlockBound::Start(target));
                         }
                     }
                     FlowControl::Return => {
                         // Return instruction - path ends here
                         // The next instruction (if any) starts a new block
-                        if cfg_builder.is_some() && next_ip < va + scan_size as u64 {
+                        if next_ip < va + scan_size as u64 {
                             block_intervals.insert(BlockBound::End(next_ip));
                         }
                         break;
@@ -318,7 +399,7 @@ impl PeLoader {
                             "Found indirect branch"
                         );
                         // The next instruction (if any) starts a new block
-                        if cfg_builder.is_some() && next_ip < va + scan_size as u64 {
+                        if next_ip < va + scan_size as u64 {
                             block_intervals.insert(BlockBound::End(next_ip));
                         }
                         // For now, we can't follow indirect jumps
@@ -341,13 +422,15 @@ impl PeLoader {
                 let target = item.0;
                 if target < max_address + tail_call_threshold {
                     // Internal jump
-                    if cfg_builder.is_some() {
-                        block_intervals.insert(BlockBound::Start(target));
-                    }
+                    block_intervals.insert(BlockBound::Start(target));
                     queue.push_back(*item);
                     false
                 } else {
                     // Tail call
+                    analysis.calls.push(FunctionCall {
+                        address: ip,
+                        target,
+                    });
                     true
                 }
             });
@@ -357,14 +440,15 @@ impl PeLoader {
         if size == 0 {
             bail!("Could not determine function size")
         }
+        analysis.size = size;
 
-        if let Some(cfg) = cfg_builder {
+        {
             let mut start = None;
             for bound in &block_intervals {
                 if let Some(addr) = start
                     && addr != bound.address()
                 {
-                    cfg.basic_blocks.insert(addr, bound.address());
+                    analysis.basic_blocks.insert(addr, bound.address());
                     start = None;
                 }
                 if let BlockBound::Start(a) = bound {
@@ -374,7 +458,7 @@ impl PeLoader {
             if let Some(start) = start
                 && start != max_address
             {
-                cfg.basic_blocks.insert(start, max_address);
+                analysis.basic_blocks.insert(start, max_address);
             }
         }
 
@@ -386,7 +470,7 @@ impl PeLoader {
             "Function size analysis complete"
         );
 
-        Ok(size)
+        Ok(analysis)
     }
 
     /// Get the exception directory range
@@ -668,11 +752,66 @@ impl PeLoader {
         // Address not found in any section
         Ok(false)
     }
+
+    pub fn find_all_functions(&self) -> Result<Vec<FunctionAnalysis>> {
+        let runtime_functions = self.find_all_functions_from_exception_directory()?;
+
+        let mut visited = HashSet::new();
+        let mut all_functions = Vec::new();
+        let mut queue = VecDeque::new();
+
+        for func_range in runtime_functions {
+            if !visited.contains(&func_range.start) {
+                queue.push_back(func_range.start);
+            }
+        }
+
+        // Process functions until no more are found
+        while let Some(func_addr) = queue.pop_front() {
+            if visited.contains(&func_addr) {
+                continue;
+            }
+            visited.insert(func_addr);
+
+            match self.analyze_function(func_addr) {
+                Ok(analysis) => {
+                    for call in &analysis.calls {
+                        if !visited.contains(&call.target) {
+                            queue.push_back(call.target);
+                        }
+                    }
+                    all_functions.push(analysis);
+                }
+                Err(e) => {
+                    tracing::info!(
+                        address = format!("0x{func_addr:x}"),
+                        error = %e,
+                        "Failed to analyze function"
+                    );
+                }
+            }
+        }
+
+        Ok(all_functions)
+    }
+}
+
+fn estimate_data_size_from_instruction(instruction: &Instruction) -> Option<u32> {
+    for i in 0..instruction.op_count() {
+        if instruction.op_kind(i) == OpKind::Memory {
+            let size = instruction.memory_size().size();
+            if size == 0 {
+                return None;
+            } else {
+                return Some(size as u32);
+            }
+        }
+    }
+
+    None
 }
 
 fn get_branch_target(instruction: &iced_x86::Instruction) -> Option<u64> {
-    use iced_x86::OpKind;
-
     match instruction.op_kind(0) {
         OpKind::NearBranch16 => Some(instruction.near_branch16() as u64),
         OpKind::NearBranch32 => Some(instruction.near_branch32() as u64),

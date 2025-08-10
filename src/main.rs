@@ -9,7 +9,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 use crate::db::{Db, DbWriter, StringRef};
-use crate::pe_loader::PeLoader;
+use crate::pe_loader::{AnalysisCache, PeLoader};
 use crate::warp::{ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints};
 
 mod db;
@@ -328,9 +328,11 @@ fn command_analyze(
     }: CommandAnalyze,
 ) -> Result<()> {
     let pe = PeLoader::load(&file)?;
-    let functions = pe.find_all_functions_from_exception_directory()?;
 
-    println!("Found {} functions in exception directory", functions.len());
+    println!("Analyzing functions");
+    let functions = pe.find_all_functions()?;
+
+    println!("Found {} functions", functions.len());
 
     let mmap = database
         .map(|path| -> Result<_> {
@@ -350,40 +352,34 @@ fn command_analyze(
             .with_message(msg)
     };
 
-    let recurse = true;
+    let analyzed: HashSet<u64> = functions.iter().map(|f| f.entry_point).collect();
+    let cache = AnalysisCache::new(functions.iter().cloned());
 
-    let mut to_analyze: HashSet<u64> = functions.iter().map(|f| f.start).collect();
-    let mut analyzed: HashSet<u64> = Default::default();
     type Res = (HashSet<FunctionGuid>, Vec<warp::Function>);
     let (mut function_guids, mut analyzed_functions): Res = Default::default();
-    while !to_analyze.is_empty() {
-        println!("Found {} functions to analyze", to_analyze.len());
-        let pb = new_pb(to_analyze.len() as u64, "Analyzing functions");
-        let results = to_analyze
-            .par_iter()
-            .copied()
-            .progress_with(pb)
-            .map(|func| (func, compute_function_guid_with_contraints(&pe, func)))
-            .collect::<Vec<(u64, Result<_>)>>();
-        analyzed.extend(std::mem::take(&mut to_analyze));
-        if recurse {
-            to_analyze.extend(
-                results
-                    .iter()
-                    .flat_map(|f| f.1.as_ref().ok())
-                    .flat_map(|f| f.calls.iter().map(|c| c.target))
-                    .filter(|t| !analyzed.contains(t)),
-            );
-        }
-        for (addr, result) in results {
-            match result {
-                Ok(f) => {
-                    function_guids.insert(f.guid);
-                    analyzed_functions.push(f);
-                }
-                Err(err) => {
-                    println!("Failed to analyze function at 0x{addr:x}: {:?}", err);
-                }
+    let pb = new_pb(analyzed.len() as u64, "Computing GUIDS");
+    let results = analyzed
+        .par_iter()
+        .copied()
+        .progress_with(pb)
+        .map(|addr| {
+            (
+                addr,
+                compute_function_guid_with_contraints(&pe, &cache, addr),
+            )
+        })
+        .collect::<Vec<(u64, Result<_>)>>();
+    for (addr, result) in results {
+        match result {
+            Ok(f) => {
+                function_guids.insert(f.guid);
+                analyzed_functions.push(f);
+            }
+            Err(err) => {
+                println!(
+                    "Failed to compute GUID of function at 0x{addr:x}: {:?}",
+                    err
+                );
             }
         }
     }
@@ -395,11 +391,11 @@ fn command_analyze(
 
     for func in &analyzed_functions {
         functions_by_addr.insert(func.address, func.guid);
-        for call in &func.calls {
+        for call in &cache.get(func.address, &pe).unwrap().calls {
             callers
                 .entry(call.target)
                 .or_default()
-                .push((func.address, call.offset));
+                .push((func.address, (call.address - func.address)));
         }
     }
 
@@ -471,7 +467,7 @@ fn command_analyze(
                 let mut constraints = func.constraints.clone();
 
                 // Check if any of our calls have been matched - add symbol constraints
-                for call in &func.calls {
+                for call in &cache.get(func.address, &pe).unwrap().calls {
                     if let Some(unique_name) = matched_functions
                         .get(&call.target)
                         .and_then(|m| m.unique_name.as_deref())
@@ -479,7 +475,7 @@ fn command_analyze(
                         let target_symbol = warp::SymbolGuid::from_symbol(unique_name);
                         constraints.push(warp::Constraint {
                             guid: warp::ConstraintGuid::from_symbol_child_call(target_symbol),
-                            offset: Some(call.offset as i64),
+                            offset: Some((call.address - func.address) as i64),
                         });
                     }
                 }

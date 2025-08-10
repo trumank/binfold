@@ -6,12 +6,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::mmap_source::MmapSource;
-use crate::pe_loader::PeLoader;
-use crate::progress_style;
+use crate::pe_loader::{FunctionCall, PeLoader};
 use crate::warp::{
-    Constraint, ConstraintGuid, FunctionCall, FunctionGuid, SymbolGuid,
-    compute_function_guid_with_contraints,
+    Constraint, ConstraintGuid, FunctionGuid, SymbolGuid, compute_function_guid_with_contraints,
 };
+use crate::{AnalysisCache, progress_style};
 
 pub struct PdbAnalyzer {
     pe_loader: PeLoader,
@@ -130,6 +129,8 @@ impl PdbAnalyzer {
             multi.insert_from_back(2, pb.clone());
         }
 
+        let cache = AnalysisCache::default();
+
         // Process procedures in parallel
         // TODO figure out how to handle multiple names for single address
         // TODO this processes each individual symbol and can do a lot of duplicate work if they share same address
@@ -140,16 +141,17 @@ impl PdbAnalyzer {
                 // TODO figure out what to do with the rest
                 let proc = procs[0];
 
-                let size = self.pe_loader.find_function_size_with_cfg(address, None)?;
+                let size = self.pe_loader.analyze_function(address)?.size;
 
-                let func = compute_function_guid_with_contraints(&self.pe_loader, address)?;
+                let func = compute_function_guid_with_contraints(&self.pe_loader, &cache, address)?;
+                let analysis = cache.get(address, &self.pe_loader).unwrap();
                 let func_info = FunctionInfo {
                     name: proc.name.clone(),
                     address,
                     size: Some(size as u32),
                     guid: func.guid,
                     constraints: func.constraints,
-                    calls: func.calls,
+                    calls: analysis.calls.clone(),
                 };
                 Ok((address, func_info))
             })
@@ -170,7 +172,7 @@ impl PdbAnalyzer {
                 callers
                     .entry(call.target)
                     .or_default()
-                    .push((*caller_address, call.offset));
+                    .push((*caller_address, (call.address - *caller_address)));
             }
         }
 
@@ -183,7 +185,7 @@ impl PdbAnalyzer {
                 // Add child call constraints (both function-based and symbol-based)
                 for call in &info.calls {
                     if let Some(target_fn) = functions.get(&call.target) {
-                        let offset = Some(call.offset as i64);
+                        let offset = Some((call.address - address) as i64);
                         // Function-based child constraint
                         // (already exists from warp analysis)
                         // constraints.push(Constraint {
