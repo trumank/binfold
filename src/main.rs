@@ -64,7 +64,7 @@ struct CommandAnalyze {
     database: Option<PathBuf>,
 
     /// Generate PDB file with matched function names
-    #[arg(long)]
+    #[arg(long, requires = "database")]
     generate_pdb: bool,
 }
 
