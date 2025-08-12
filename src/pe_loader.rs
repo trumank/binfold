@@ -47,6 +47,14 @@ pub struct DataReference {
     pub estimated_size: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct JumpTable {
+    /// start address of jump table
+    start: u64,
+    /// end address of jump table (exclusive)
+    end: u64,
+}
+
 /// Control flow graph built during recursive descent
 #[derive(Debug, Default, Clone)]
 pub struct FunctionAnalysis {
@@ -56,6 +64,7 @@ pub struct FunctionAnalysis {
     pub entry_point: u64,
     pub calls: Vec<FunctionCall>,
     pub data_refs: Vec<DataReference>,
+    pub jump_tables: Vec<JumpTable>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -246,7 +255,6 @@ impl PeLoader {
         let bytes = &file_data[start_offset..start_offset + scan_size];
 
         debug!(
-            target: "binfold::pe_loader::size",
             start = format!("0x{va:x}"),
             scan_range = format!("0x{scan_size:x}"),
             "Scanning function size"
@@ -269,15 +277,10 @@ impl PeLoader {
 
         block_intervals.insert(BlockBound::Start(va));
 
-        debug!(
-            target: "binfold::pe_loader::size",
-            start = format!("0x{va:x}"),
-            "Starting recursive descent"
-        );
+        debug!(start = format!("0x{va:x}"), "Starting recursive descent");
 
         while let Some((ip, from)) = queue.pop_front() {
             trace!(
-                target: "binfold::pe_loader::size",
                 at = format!("0x{ip:x}"),
                 from = from.map(|f| format!("0x{f:x}")),
                 "Disassembling"
@@ -303,7 +306,6 @@ impl PeLoader {
                 visited.insert(ip);
 
                 trace!(
-                    target: "binfold::pe_loader::size",
                     offset = format!("0x{:<5x}", ip - va),
                     address = format!("0x{:x}", ip),
                     instruction = %instruction,
@@ -392,24 +394,40 @@ impl PeLoader {
                     }
                     FlowControl::IndirectBranch => {
                         // Indirect jump (like jmp rax or jmp [rax])
-                        // We can't determine the target statically, but we should
-                        // at least handle known patterns
-                        trace!(
-                            target: "binfold::pe_loader::size",
-                            address = format!("0x{ip:x}"),
-                            "Found indirect branch"
-                        );
+                        // Try to detect jump table patterns
+                        if let Some((table, jump_targets)) =
+                            detect_jump_table_targets(&instruction, self)
+                        {
+                            trace!(
+                                address = format!("0x{ip:x}"),
+                                targets = jump_targets.len(),
+                                "Found jump table with targets"
+                            );
+
+                            // Add all jump table targets to the queue for analysis
+                            for &target in &jump_targets {
+                                if target >= va && target < va + scan_size as u64 {
+                                    queue.push_back((target, Some(ip)));
+                                    block_intervals.insert(BlockBound::Start(target));
+                                }
+                            }
+
+                            analysis.jump_tables.push(table);
+                        } else {
+                            trace!(
+                                address = format!("0x{ip:x}"),
+                                "Found indirect branch (no jump table detected)"
+                            );
+                        }
+
                         // The next instruction (if any) starts a new block
                         if next_ip < va + scan_size as u64 {
                             block_intervals.insert(BlockBound::End(next_ip));
                         }
-                        // For now, we can't follow indirect jumps
-                        // This is a limitation that might cause us to miss code
                         break;
                     }
                     _ => {
                         trace!(
-                            target: "binfold::pe_loader::size",
                             flow_control = ?instruction.flow_control(),
                             address = format!("0x{:x}", ip),
                             "Unhandled flow control"
@@ -464,7 +482,6 @@ impl PeLoader {
         }
 
         debug!(
-            target: "binfold::pe_loader::size",
             start = format!("0x{va:x}"),
             end = format!("0x{max_address:x}"),
             size = format!("0x{size:x}"),
@@ -779,7 +796,7 @@ impl PeLoader {
     pub fn find_functions_linear_sweep(&self) -> Result<Vec<FunctionAnalysis>> {
         let mut function_analysis = BTreeMap::new();
         // map address range => entry point
-        let mut function_map = IntervalMap::<u64, u64>::new();
+        let mut function_map = IntervalMap::<u64, Option<u64>>::new();
 
         // Process all executable sections
         for section in self.sections() {
@@ -866,7 +883,7 @@ impl PeLoader {
                                 "Function already exists at"
                             );
                         } else {
-                            function_map.insert(func_start..func_end, func_start);
+                            function_map.insert(func_start..func_end, Some(func_start));
                             assert_eq!(func.entry_point, func_start);
                             function_analysis.insert(func.entry_point, func);
                         }
@@ -963,7 +980,10 @@ impl PeLoader {
                                 "Function discovered in gap"
                             );
 
-                            function_map.insert(ip..func_end, ip);
+                            for table in &func.jump_tables {
+                                function_map.insert(table.start..table.end, None);
+                            }
+                            function_map.insert(ip..func_end, Some(ip));
                             function_analysis.insert(func.entry_point, func);
                         }
                     }
@@ -1047,4 +1067,99 @@ fn get_branch_target(instruction: &iced_x86::Instruction) -> Option<u64> {
         OpKind::NearBranch64 => Some(instruction.near_branch64()),
         _ => None,
     }
+}
+
+/// Detect and parse jump table targets from indirect jump instructions
+fn detect_jump_table_targets(
+    instruction: &Instruction,
+    pe_loader: &PeLoader,
+) -> Option<(JumpTable, Vec<u64>)> {
+    // Check if this is an indirect jump with memory operand
+    if instruction.mnemonic() != Mnemonic::Jmp || instruction.op_count() == 0 {
+        return None;
+    }
+
+    // Look for jump table pattern: jmp [index*scale+table_base]
+    if instruction.op_kind(0) == OpKind::Memory {
+        let memory_base = instruction.memory_base();
+        let memory_index = instruction.memory_index();
+        let memory_scale = instruction.memory_index_scale();
+        let memory_displacement = instruction.memory_displacement64();
+
+        // Pattern: jmp [reg*4+table_address] for PE32
+        if pe_loader.bitness() == 32
+            && memory_base == Register::None
+            && memory_index != Register::None
+            && memory_scale == 4
+            && memory_displacement != 0
+        {
+            // This looks like a jump table access
+            let table_address = memory_displacement;
+
+            // Try to read the jump table
+            if let Ok(targets) = parse_jump_table_at_address(pe_loader, table_address) {
+                trace!(
+                    instruction_address = format!("0x{:x}", instruction.ip()),
+                    table_address = format!("0x{:x}", table_address),
+                    targets_found = targets.len(),
+                    "Detected jump table"
+                );
+                return Some((
+                    JumpTable {
+                        start: table_address,
+                        end: table_address + 4 * targets.len() as u64,
+                    },
+                    targets,
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse a jump table at the given address and return target addresses
+fn parse_jump_table_at_address(pe_loader: &PeLoader, table_address: u64) -> Result<Vec<u64>> {
+    let mut targets = Vec::new();
+
+    // Check if the table address is within a valid section
+    if !pe_loader.is_address_in_section(table_address) {
+        return Ok(targets);
+    }
+
+    for i in 0.. {
+        let entry_address = table_address + i * 4;
+
+        // Try to read the table entry
+        let target = {
+            match pe_loader.read_at_va(entry_address, 4) {
+                Ok(bytes) => u32::from_le_bytes(bytes.try_into().unwrap()) as u64,
+                Err(_) => break,
+            }
+        };
+
+        // Validate the target address
+        if target == 0 || !pe_loader.is_address_in_section(target) {
+            // Likely end of table or invalid entry
+            break;
+        }
+
+        // Check if target looks like a valid code address
+        // by trying to decode an instruction there
+        match pe_loader.read_at_va(target, 16) {
+            Ok(bytes) => {
+                let mut decoder =
+                    Decoder::with_ip(pe_loader.bitness(), bytes, target, DecoderOptions::NONE);
+                let instruction = decoder.decode();
+                if instruction.mnemonic() == Mnemonic::INVALID {
+                    // Not valid code, likely end of table
+                    break;
+                }
+                targets.push(target);
+            }
+            Err(_) => break,
+        }
+    }
+
+    Ok(targets)
 }
