@@ -1,30 +1,12 @@
 use anyhow::Result;
+use binfold::db::Db;
+use binfold::progress::IndicatifProgressBar;
+use binfold::warp::FunctionGuid;
+use binfold::{BinfoldAnalyzer, DatabaseBuilder};
 use clap::{Parser, Subcommand};
-use indicatif::{ParallelProgressIterator as _, ProgressBar, ProgressIterator as _, ProgressStyle};
-use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
-
-use crate::db::{Db, DbWriter, StringRef};
-use crate::pe_loader::{AnalysisCache, PeLoader};
-use crate::warp::{ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints};
-
-mod db;
-mod mmap_source;
-mod pdb_analyzer;
-mod pdb_writer;
-mod pe_loader;
-mod warp;
-
-#[derive(Debug, Clone)]
-struct MatchInfo {
-    unique_name: Option<String>,
-    matched_constraints: usize,
-    total_constraints: usize,
-}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -123,199 +105,30 @@ fn command_gen_db(
         database,
     }: CommandGenDb,
 ) -> Result<()> {
-    use indicatif::{MultiProgress, ProgressBar};
-    use pdb_analyzer::PdbAnalyzer;
-    use std::fs;
-    use std::io::BufWriter;
+    let multi_progress = indicatif::MultiProgress::new();
+    let progress_reporter =
+        IndicatifProgressBar::new("Database generation", Some(multi_progress.clone()));
 
-    // Expand directories to find EXE files with PDB files
-    let mut expanded_exe_paths = Vec::new();
-
-    fn find_exe_files_recursive(
-        dir: &std::path::Path,
-        exe_files: &mut Vec<PathBuf>,
-    ) -> std::io::Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                // Recursively search subdirectories
-                let _ = find_exe_files_recursive(&path, exe_files);
-            } else if let Some(ext) = path.extension()
-                && ext.eq_ignore_ascii_case("exe")
-            {
-                // Check if corresponding PDB exists
-                let pdb_path = path.with_extension("pdb");
-                if pdb_path.exists() {
-                    exe_files.push(path);
-                }
-            }
-        }
-        Ok(())
-    }
+    let mut builder = DatabaseBuilder::new();
 
     for path in exe_paths {
         if path.is_dir() {
-            // Recursively find all EXE files in the directory tree
-            let _ = find_exe_files_recursive(&path, &mut expanded_exe_paths);
+            builder.add_directory(&path);
         } else {
-            // It's a file, add it directly
-            expanded_exe_paths.push(path);
+            builder.add_executable(&path);
         }
     }
 
-    if expanded_exe_paths.is_empty() {
-        anyhow::bail!("No EXE files with corresponding PDB files found");
-    }
+    let stats = builder.build_with_progress(&database, &progress_reporter)?;
 
-    // Sort for consistent output
-    expanded_exe_paths.sort();
-
-    println!(
-        "Found {} EXE files with PDB files",
-        expanded_exe_paths.len()
-    );
-    let exe_paths = expanded_exe_paths;
-
-    // Create string cache for fast lookups
-    let strings: Vec<String> = Vec::new();
-    let string_to_index: HashMap<String, u64> = HashMap::new();
-
-    // Wrap in Arc<Mutex> for thread-safe access
-    let strings = Arc::new(Mutex::new(strings));
-    let string_to_index = Arc::new(Mutex::new(string_to_index));
-
-    // Create multi-progress for parallel progress bars
-    let multi_progress = MultiProgress::new();
-
-    let pb = ProgressBar::new(exe_paths.len() as u64)
-        .with_style(progress_style())
-        .with_message("Processing executables");
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    multi_progress.add(pb.clone());
-
-    // Shared data structure for building unique constraints
-    let constraint_to_names: Arc<
-        Mutex<BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>>,
-    > = Default::default();
-
-    // Process executables sequentially to avoid OOM
-    let constraint_to_names_clone = constraint_to_names.clone();
-    let process = |exe_path: &PathBuf| -> Result<()> {
-        // Derive PDB path for this exe
-        let pdb_path_for_exe = exe_path.with_extension("pdb");
-
-        // Process this exe/pdb pair
-        let result = (|| -> Result<()> {
-            let mut analyzer = PdbAnalyzer::new(exe_path, &pdb_path_for_exe)?;
-            let function_guids =
-                analyzer.compute_function_guids_with_progress(Some(multi_progress.clone()))?;
-
-            // Helper function to get or insert string
-            let get_or_insert_string = |strings: &mut Vec<String>,
-                                        string_to_index: &mut HashMap<String, u64>,
-                                        value: &str|
-             -> u64 {
-                if let Some(&idx) = string_to_index.get(value) {
-                    return idx;
-                }
-
-                let idx = strings.len() as u64;
-                strings.push(value.to_string());
-                string_to_index.insert(value.to_string(), idx);
-                idx
-            };
-
-            {
-                let mut strings = strings.lock().unwrap();
-                let mut string_to_index = string_to_index.lock().unwrap();
-
-                function_guids.iter().for_each(|func| {
-                    let function_name_id =
-                        get_or_insert_string(&mut strings, &mut string_to_index, &func.name);
-
-                    // Insert constraints and build constraint_to_names mapping
-                    let mut constraint_map = constraint_to_names_clone.lock().unwrap();
-                    for constraint in [ConstraintGuid::nil()]
-                        .into_iter()
-                        .chain(func.constraints.iter().map(|c| c.guid))
-                    {
-                        // Update constraint_to_names for unique constraint calculation
-                        constraint_map
-                            .entry(func.guid)
-                            .or_default()
-                            .entry(constraint)
-                            .or_default()
-                            .insert(function_name_id);
-                    }
-                });
-            }
-            Ok(())
-        })();
-
-        pb.inc(1);
-
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Error processing {}: {}", exe_path.display(), e);
-            }
-        }
-
-        Ok(())
-    };
-
-    // Process executables using multiple threads
-    std::thread::scope(|scope| -> Result<()> {
-        let num_threads = 8;
-        let tasks: Vec<_> = exe_paths
-            .chunks(exe_paths.len().div_ceil(num_threads))
-            .map(|chunk| {
-                scope.spawn(move || -> Result<()> {
-                    for path in chunk {
-                        process(path)?;
-                    }
-                    Ok(())
-                })
-            })
-            .collect();
-        for task in tasks {
-            task.join().unwrap()?;
-        }
-        Ok(())
-    })?;
-
-    pb.finish();
     multi_progress.clear().unwrap();
-
-    // Process unique constraints
-    println!("\nProcessing unique constraints...");
-    let constraint_map = constraint_to_names.lock().unwrap();
-
-    let unique_constraints: usize = constraint_map
-        .values()
-        .map(|c| c.values().filter(|n| n.len() == 1).count())
-        .sum();
-
-    println!("Found {unique_constraints} unique constraints");
-
-    // Build the binary database structure
-    let strings = Arc::try_unwrap(strings).unwrap().into_inner().unwrap();
-
-    println!("Writing binary database...");
-
-    {
-        let file = fs::File::create(&database)?;
-        let mut writer = BufWriter::new(file);
-        let db_writer = DbWriter::new(&constraint_map, &strings);
-        db_writer.write(&mut writer)?;
-    }
-    println!("Successfully wrote {unique_constraints} unique constraints to binary database");
 
     println!("\nSummary:");
     println!("========");
     println!("Database: {}", database.display());
+    println!("Total functions: {}", stats.total_functions);
+    println!("Unique constraints: {}", stats.unique_constraints);
+    println!("Processed files: {}", stats.processed_files);
 
     Ok(())
 }
@@ -327,311 +140,45 @@ fn command_analyze(
         generate_pdb,
     }: CommandAnalyze,
 ) -> Result<()> {
-    let pe = PeLoader::load(&file)?;
+    use binfold::pdb_analyzer;
 
-    println!("Analyzing functions");
-    let functions = pe.find_all_functions()?;
+    let progress_reporter = IndicatifProgressBar::new("Analyzing", None);
 
-    println!("Found {} functions", functions.len());
-
-    let mmap = database
-        .map(|path| -> Result<_> {
-            let file = std::fs::File::open(path)?;
-            Ok(unsafe { memmap2::MmapOptions::new().map(&file)? })
-        })
-        .transpose()?;
-
-    struct DbContext<'a> {
-        cache_unique_constraints:
-            HashMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<StringRef<'a>>>>,
-    }
-
-    let new_pb = |len, msg| {
-        ProgressBar::new(len)
-            .with_style(progress_style())
-            .with_message(msg)
-    };
-
-    let analyzed: HashSet<u64> = functions.iter().map(|f| f.entry_point).collect();
-    let cache = AnalysisCache::new(functions.iter().cloned());
-
-    type Res = (HashSet<FunctionGuid>, Vec<warp::Function>);
-    let (mut function_guids, mut analyzed_functions): Res = Default::default();
-    let pb = new_pb(analyzed.len() as u64, "Computing GUIDS");
-    let results = analyzed
-        .par_iter()
-        .copied()
-        .progress_with(pb)
-        .map(|addr| {
-            (
-                addr,
-                compute_function_guid_with_contraints(&pe, &cache, addr),
-            )
-        })
-        .collect::<Vec<(u64, Result<_>)>>();
-    for (addr, result) in results {
-        match result {
-            Ok(f) => {
-                function_guids.insert(f.guid);
-                analyzed_functions.push(f);
-            }
-            Err(err) => {
-                println!(
-                    "Failed to compute GUID of function at 0x{addr:x}: {:?}",
-                    err
-                );
-            }
-        }
-    }
-    analyzed_functions.sort_by_key(|f| f.address);
-
-    // Build parent call constraints and keep callers map for later use
-    let mut callers: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
-    let mut functions_by_addr: HashMap<u64, FunctionGuid> = HashMap::new();
-
-    for func in &analyzed_functions {
-        functions_by_addr.insert(func.address, func.guid);
-        for call in &cache.get(func.address, &pe).unwrap().calls {
-            callers
-                .entry(call.target)
-                .or_default()
-                .push((func.address, (call.address - func.address)));
-        }
-    }
-
-    // Add parent constraints to functions
-    for func in &mut analyzed_functions {
-        if let Some(parent_calls) = callers.get(&func.address) {
-            for (parent_addr, offset) in parent_calls {
-                if let Some(parent_guid) = functions_by_addr.get(parent_addr) {
-                    func.constraints.push(warp::Constraint {
-                        guid: warp::ConstraintGuid::from_parent_call(*parent_guid),
-                        offset: Some(*offset as i64),
-                    });
-                }
-            }
-        }
-    }
-
-    println!(
-        "Found {} unique funcs and {} total funcs",
-        function_guids.len(),
-        analyzed_functions.len()
-    );
-
-    let db_context = if let Some(mmap) = &mmap {
-        let db = Db::new(mmap)?;
-
-        let pb = new_pb(function_guids.len() as u64, "Loading function GUIDs");
-        let cache_unique_constraints: HashMap<
-            FunctionGuid,
-            HashMap<ConstraintGuid, HashSet<StringRef>>,
-        > = function_guids
-            .par_iter()
-            .progress_with(pb)
-            .map(|guid| {
-                (
-                    *guid,
-                    db.iter_constraints(guid)
-                        .map(|c| (*c.guid(), c.iter_symbols().collect()))
-                        .collect(),
-                )
-            })
-            .collect();
-
-        println!("Found {} constraint guids", cache_unique_constraints.len());
-
-        Some(DbContext {
-            cache_unique_constraints,
-        })
+    let analyzer = if let Some(db_path) = database {
+        BinfoldAnalyzer::with_database(&file, &db_path)?
     } else {
-        None
+        BinfoldAnalyzer::new(&file)?
     };
 
-    // Incrementally match functions
-    let mut matched_functions: HashMap<u64, MatchInfo> = Default::default();
-    let mut unmatched_functions: HashMap<u64, &warp::Function> =
-        analyzed_functions.iter().map(|f| (f.address, f)).collect();
+    let result = analyzer.analyze_with_progress(&progress_reporter)?;
 
-    // Keep matching until no more matches are found
-    loop {
-        let mut new_matches: Vec<u64> = Default::default();
+    println!("Found {} functions", result.functions.len());
 
-        let pb = ProgressBar::new(unmatched_functions.len() as u64)
-            .with_style(progress_style())
-            .with_message("Matching functions");
+    let matched_count = result
+        .database_matches
+        .values()
+        .filter(|m| m.symbol_name.is_some())
+        .count();
 
-        unmatched_functions.iter().progress_with(pb).try_for_each(
-            |(_, func): (&u64, &&warp::Function)| -> Result<()> {
-                // Add symbol-based constraints for already matched functions
-                let mut constraints = func.constraints.clone();
-
-                // Check if any of our calls have been matched - add symbol constraints
-                for call in &cache.get(func.address, &pe).unwrap().calls {
-                    if let Some(unique_name) = matched_functions
-                        .get(&call.target)
-                        .and_then(|m| m.unique_name.as_deref())
-                    {
-                        let target_symbol = warp::SymbolGuid::from_symbol(unique_name);
-                        constraints.push(warp::Constraint {
-                            guid: warp::ConstraintGuid::from_symbol_child_call(target_symbol),
-                            offset: Some((call.address - func.address) as i64),
-                        });
-                    }
-                }
-
-                // Check if any functions that call us have been matched - add symbol parent constraints
-                if let Some(parent_calls) = callers.get(&func.address) {
-                    for (parent_addr, offset) in parent_calls {
-                        if let Some(unique_name) = matched_functions
-                            .get(parent_addr)
-                            .and_then(|m| m.unique_name.as_deref())
-                        {
-                            let parent_symbol = warp::SymbolGuid::from_symbol(unique_name);
-                            constraints.push(warp::Constraint {
-                                guid: warp::ConstraintGuid::from_symbol_parent_call(parent_symbol),
-                                offset: Some(*offset as i64),
-                            });
-                        }
-                    }
-                }
-
-                // Try to match with constraints
-                if let Some(db_context) = &db_context {
-                    let db_constraints =
-                        db_context.cache_unique_constraints.get(&func.guid).unwrap();
-
-                    let query_constraints: HashSet<ConstraintGuid> =
-                        constraints.iter().map(|c| c.guid).collect();
-
-                    let mut unique_name = [ConstraintGuid::nil()]
-                        .iter()
-                        .chain(query_constraints.iter())
-                        .find_map(|c| {
-                            if let Some(matches) = db_constraints.get(c)
-                                && matches.len() == 1
-                            {
-                                matches.iter().next().copied()
-                            } else {
-                                None
-                            }
-                        });
-
-                    // Count how many constraints matched
-                    let matched_count = query_constraints
-                        .iter()
-                        .filter(|c| db_constraints.contains_key(c))
-                        .count();
-
-                    if unique_name.is_none() {
-                        let mut sorted_constraints: Vec<_> = query_constraints
-                            .iter()
-                            .filter_map(|guid| db_constraints.get(guid))
-                            .collect();
-                        sorted_constraints.sort_by_key(|c| c.len());
-
-                        fn find_unique<'a>(
-                            first: &HashSet<StringRef<'a>>,
-                            rest: &[&HashSet<StringRef<'a>>],
-                        ) -> Option<StringRef<'a>> {
-                            let mut possible = None;
-                            for item in first {
-                                if rest.iter().all(|r| r.contains(item)) {
-                                    if possible.is_some() {
-                                        possible = None;
-                                        break;
-                                    } else {
-                                        possible = Some(*item);
-                                    }
-                                }
-                            }
-                            possible
-                        }
-
-                        if let Some((first, rest)) = sorted_constraints.split_first()
-                            && !rest.is_empty()
-                        {
-                            unique_name = find_unique(first, rest);
-                        }
-                    }
-                    if unique_name.is_some() {
-                        new_matches.push(func.address);
-                    }
-                    matched_functions.insert(
-                        func.address,
-                        MatchInfo {
-                            unique_name: unique_name
-                                .map(|n| n.as_str().map(|s| s.to_string()))
-                                .transpose()?,
-                            matched_constraints: matched_count,
-                            total_constraints: constraints.len(),
-                        },
-                    );
-                }
-                Ok(())
-            },
-        )?;
-
-        // If no new matches found, we're done
-        if new_matches.is_empty() {
-            break;
-        }
-
-        // Add new matches and remove from unmatched list
-        let new_match_count = new_matches.len();
-        for addr in &*new_matches {
-            unmatched_functions.remove(addr);
-        }
-
-        println!(
-            "Found {} new matches in this iteration (total: {})",
-            new_match_count,
-            matched_functions.len() - unmatched_functions.len()
-        );
+    if matched_count > 0 {
+        println!("Matched {} functions with database symbols", matched_count);
     }
 
-    // for (idx, func) in analyzed_functions.iter().enumerate() {
-    //     let match_info = matched_functions.get(&func.address).unwrap();
-    //     let text_match_info = format!(
-    //         " [Match: ({}/{} constraints) {}]",
-    //         match_info.matched_constraints,
-    //         match_info.total_constraints,
-    //         match_info.unique_name.as_deref().unwrap_or("none"),
-    //     );
-
-    //     println!(
-    //         "Function {} at 0x{:x}: GUID {}{}",
-    //         idx + 1,
-    //         func.address,
-    //         func.guid,
-    //         text_match_info
-    //     );
-    // }
-
-    // Generate PDB if requested
     if generate_pdb {
         let pdb_path = file.with_extension("pdb");
         if !pdb_path.exists() || pdb_analyzer::should_replace(&pdb_path).unwrap_or(false) {
-            let pdb_info = pdb_writer::extract_pdb_info(&pe)?;
+            analyzer.generate_pdb(&result, &pdb_path)?;
 
-            let mut pdb_functions = Vec::new();
-
-            for func in &analyzed_functions {
-                let match_info = matched_functions.get(&func.address).unwrap();
-                if let Some(symbol) = &match_info.unique_name {
-                    pdb_functions.push(pdb_writer::FunctionInfo {
-                        address: func.address,
-                        size: func.size as u32,
-                        name: symbol.clone(),
-                    });
-                }
-            }
+            let pdb_function_count = result
+                .database_matches
+                .values()
+                .filter(|m| m.symbol_name.is_some())
+                .count();
 
             println!("Generating PDB file at: {}", pdb_path.display());
-            pdb_writer::generate_pdb(&pe, &pdb_info, &pdb_functions, &pdb_path)?;
             println!(
                 "PDB file generated successfully with {} functions",
-                pdb_functions.len()
+                pdb_function_count
             );
         } else {
             eprintln!(
@@ -641,11 +188,6 @@ fn command_analyze(
         }
     }
 
-    // let the OS clean all this up
-    std::mem::forget(unmatched_functions);
-    std::mem::forget(matched_functions);
-    std::mem::forget(analyzed_functions);
-    std::mem::forget(db_context);
     Ok(())
 }
 
@@ -720,11 +262,4 @@ fn command_dump_db(
     json_writer.finish_document()?;
 
     Ok(())
-}
-
-fn progress_style() -> ProgressStyle {
-    ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) {msg}")
-        .unwrap()
-        .progress_chars("#>-")
 }

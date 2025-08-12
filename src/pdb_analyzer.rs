@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar};
 use pdb::{FallibleIterator, PDB, SymbolData};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -10,12 +9,11 @@ use crate::pe_loader::{FunctionCall, PeLoader};
 use crate::warp::{
     Constraint, ConstraintGuid, FunctionGuid, SymbolGuid, compute_function_guid_with_contraints,
 };
-use crate::{AnalysisCache, progress_style};
+use crate::{AnalysisCache, NoOpProgressReporter, ProgressReporter};
 
 pub struct PdbAnalyzer {
     pe_loader: PeLoader,
     pdb: PDB<'static, MmapSource>,
-    exe_name: String,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -45,22 +43,16 @@ impl PdbAnalyzer {
         let pdb = PDB::open(mmap_source)
             .with_context(|| format!("Failed to parse PDB file: {pdb_path:?}"))?;
 
-        let exe_name = exe_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        Ok(Self {
-            pe_loader,
-            pdb,
-            exe_name,
-        })
+        Ok(Self { pe_loader, pdb })
     }
 
-    pub fn compute_function_guids_with_progress(
+    pub fn compute_function_guids(&mut self) -> Result<Vec<FunctionInfo>> {
+        self.compute_function_guids_with_progress::<NoOpProgressReporter>(None)
+    }
+
+    pub fn compute_function_guids_with_progress<P: ProgressReporter>(
         &mut self,
-        progress_bar: Option<MultiProgress>,
+        progress_reporter: Option<P>,
     ) -> Result<Vec<FunctionInfo>> {
         let address_map = self.pdb.address_map()?;
 
@@ -121,22 +113,17 @@ impl PdbAnalyzer {
                     acc
                 });
 
-        // Now create/update progress bar for analysis phase
-        let pb = ProgressBar::new(binned_procs.len() as u64)
-            .with_style(progress_style())
-            .with_message(self.exe_name.clone());
-        if let Some(multi) = &progress_bar {
-            multi.insert_from_back(2, pb.clone());
-        }
-
         let cache = AnalysisCache::default();
+
+        if let Some(reporter) = &progress_reporter {
+            reporter.initialize(binned_procs.len() as u64);
+        }
 
         // Process procedures in parallel
         // TODO figure out how to handle multiple names for single address
         // TODO this processes each individual symbol and can do a lot of duplicate work if they share same address
         let mut functions: HashMap<u64, FunctionInfo> = binned_procs
             .par_iter()
-            .progress_with(pb.clone())
             .map(|(&address, procs)| -> Result<_> {
                 // TODO figure out what to do with the rest
                 let proc = procs[0];
@@ -153,13 +140,17 @@ impl PdbAnalyzer {
                     constraints: func.constraints,
                     calls: analysis.calls.clone(),
                 };
+
+                if let Some(reporter) = &progress_reporter {
+                    reporter.progress();
+                }
+
                 Ok((address, func_info))
             })
             .collect::<Result<_>>()?;
 
-        if let Some(multi) = progress_bar {
-            pb.finish_and_clear();
-            multi.remove(&pb);
+        if let Some(reporter) = progress_reporter {
+            reporter.finish();
         }
 
         // TODO analyze and calls to functions that have not already been found?
