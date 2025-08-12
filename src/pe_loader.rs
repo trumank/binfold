@@ -737,6 +737,26 @@ impl PeLoader {
         })
     }
 
+    /// Check if a virtual address falls within any section of the image
+    pub fn is_address_in_section(&self, va: u64) -> bool {
+        let image_base = self.image_base();
+        if va < image_base {
+            return false;
+        }
+
+        let rva = va - image_base;
+
+        // Check if the RVA falls within any section
+        for section in self.sections() {
+            let section_start = section.virtual_address as u64;
+            let section_end = section_start + section.virtual_size as u64;
+            if rva >= section_start && rva < section_end {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if a virtual address is in a writable section
     pub fn is_address_writable(&self, va: u64) -> Result<bool> {
         let rva = va.saturating_sub(self.image_base());

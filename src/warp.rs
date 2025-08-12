@@ -294,7 +294,7 @@ pub fn create_detailed_basic_block_analysis(
         }
 
         // Check if instruction is relocatable and should be masked
-        if is_relocatable_instruction(&instruction, function_bounds.clone()) {
+        if is_relocatable_instruction(&instruction, function_bounds.clone(), pe) {
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
             instructions.push(InstructionAnalysis {
@@ -355,7 +355,7 @@ pub fn create_basic_block_guid(
         }
 
         // Get instruction bytes, zeroing out relocatable instructions
-        if is_relocatable_instruction(&instruction, function_bounds.clone()) {
+        if is_relocatable_instruction(&instruction, function_bounds.clone(), pe) {
             // Zero out relocatable instructions
             bytes.extend(vec![0u8; instr_bytes.len()]);
             trace!(
@@ -428,7 +428,11 @@ fn has_implicit_extension(reg: Register) -> bool {
     )
 }
 
-fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<u64>) -> bool {
+fn is_relocatable_instruction(
+    instruction: &Instruction,
+    function_bounds: Range<u64>,
+    pe: &PeLoader,
+) -> bool {
     // Check for direct calls - but only forward calls are relocatable
     if instruction.mnemonic() == Mnemonic::Call && instruction.op_count() > 0 {
         match instruction.op_kind(0) {
@@ -475,6 +479,38 @@ fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<
         }
     }
 
+    // PE32-specific checks for section-relative addressing
+    if pe.bitness() == 32 && is_relocatable_instruction_pe32(instruction, pe) {
+        return true;
+    }
+
+    false
+}
+
+/// PE32-specific relocatable instruction detection
+/// Checks for memory operands and immediates that reference section addresses
+fn is_relocatable_instruction_pe32(instruction: &Instruction, pe: &PeLoader) -> bool {
+    for i in 0..instruction.op_count() {
+        match instruction.op_kind(i) {
+            OpKind::Memory => {
+                // Check displacement in any memory addressing mode
+                let displacement = instruction.memory_displacement64();
+                if displacement != 0 && instruction.segment_prefix() == Register::None {
+                    // Check if displacement looks like a section address
+                    if pe.is_address_in_section(displacement) {
+                        return true;
+                    }
+                }
+            }
+            OpKind::Immediate32 => {
+                // Check if immediate value references a section address
+                if pe.is_address_in_section(instruction.immediate32() as u64) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
     false
 }
 
