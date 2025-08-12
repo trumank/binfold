@@ -191,7 +191,7 @@ pub fn compare_analysis(
 
                 if let Ok(raw_bytes) = pe.read_at_va(actual_func.entry_point, actual_func.size) {
                     let base = actual_func.entry_point;
-                    let mut block_guid_mismatches = Vec::new();
+                    let mut block_guid_mismatches: Vec<(u64, u64, String, String, warp::DetailedBlockAnalysis)> = Vec::new();
 
                     for (&start, &end) in &actual_func.basic_blocks {
                         if let Some(expected_guid) = expected_block_guids.get(&(start, end)) {
@@ -211,11 +211,20 @@ pub fn compare_analysis(
                             if computed_guid_str == *expected_guid {
                                 total_block_guid_matches += 1;
                             } else {
+                                // Get detailed analysis for mismatched block
+                                let detailed_analysis = warp::create_detailed_basic_block_analysis(
+                                    block_bytes,
+                                    start,
+                                    actual_func.entry_point
+                                        ..(actual_func.entry_point + actual_func.size as u64),
+                                    pe,
+                                );
                                 block_guid_mismatches.push((
                                     start,
                                     end,
                                     expected_guid.clone(),
                                     computed_guid_str,
+                                    detailed_analysis,
                                 ));
                             }
                         }
@@ -223,10 +232,24 @@ pub fn compare_analysis(
 
                     if !block_guid_mismatches.is_empty() {
                         println!("  Block GUID mismatches ({}):", block_guid_mismatches.len());
-                        for (start, end, expected, computed) in &block_guid_mismatches {
+                        for (start, end, expected, computed, detailed_analysis) in &block_guid_mismatches {
                             println!("    0x{:x}-0x{:x}:", start, end);
                             println!("      Expected: {}", expected);
                             println!("      Computed: {}", computed);
+                            println!("      Disassembly:");
+                            for instruction in &detailed_analysis.instructions {
+                                let mask_info = if instruction.was_masked {
+                                    format!(" [MASKED: {}]", instruction.mask_reason.as_ref().unwrap_or(&"unknown".to_string()))
+                                } else {
+                                    " [KEPT]".to_string()
+                                };
+                                println!("        0x{:08x}: {:02x?} {}{}", 
+                                    instruction.address, 
+                                    instruction.bytes, 
+                                    instruction.disassembly,
+                                    mask_info
+                                );
+                            }
                         }
                     }
                 }

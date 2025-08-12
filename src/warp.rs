@@ -48,6 +48,21 @@ impl BasicBlockGuid {
     }
 }
 
+#[derive(Debug)]
+pub struct InstructionAnalysis {
+    pub address: u64,
+    pub bytes: Vec<u8>,
+    pub disassembly: String,
+    pub was_masked: bool,
+    pub mask_reason: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct DetailedBlockAnalysis {
+    pub guid: BasicBlockGuid,
+    pub instructions: Vec<InstructionAnalysis>,
+}
+
 impl ConstraintGuid {
     /// constraint on call to target function
     pub fn from_child_call(target: FunctionGuid) -> Self {
@@ -239,6 +254,71 @@ fn get_branch_target(instruction: &Instruction) -> Option<u64> {
         OpKind::NearBranch64 => Some(instruction.near_branch64()),
         _ => None,
     }
+}
+
+pub fn create_detailed_basic_block_analysis(
+    raw_bytes: &[u8],
+    base: u64,
+    function_bounds: Range<u64>,
+    pe: &PeLoader,
+) -> DetailedBlockAnalysis {
+    let mut bytes = Vec::new();
+    let mut instructions = Vec::new();
+
+    let mut decoder = Decoder::new(pe.bitness(), raw_bytes, DecoderOptions::NONE);
+    decoder.set_ip(base);
+
+    debug!(
+        target: "binfold::warp::guid",
+        "Starting detailed instruction processing for block analysis"
+    );
+
+    while decoder.can_decode() {
+        let start = (decoder.ip() - base) as usize;
+        let instruction = decoder.decode();
+        let end = (decoder.ip() - base) as usize;
+        let instr_bytes = &raw_bytes[start..end];
+        let address = instruction.ip();
+        let disassembly = instruction.to_string();
+
+        // Check if instruction should be skipped
+        if is_register_to_itself_nop(&instruction) {
+            instructions.push(InstructionAnalysis {
+                address,
+                bytes: instr_bytes.to_vec(),
+                disassembly,
+                was_masked: true,
+                mask_reason: Some("register-to-itself NOP".to_string()),
+            });
+            continue;
+        }
+
+        // Check if instruction is relocatable and should be masked
+        if is_relocatable_instruction(&instruction, function_bounds.clone()) {
+            // Zero out relocatable instructions
+            bytes.extend(vec![0u8; instr_bytes.len()]);
+            instructions.push(InstructionAnalysis {
+                address,
+                bytes: instr_bytes.to_vec(),
+                disassembly,
+                was_masked: true,
+                mask_reason: Some("relocatable instruction".to_string()),
+            });
+        } else {
+            // Use actual instruction bytes
+            bytes.extend_from_slice(instr_bytes);
+            instructions.push(InstructionAnalysis {
+                address,
+                bytes: instr_bytes.to_vec(),
+                disassembly,
+                was_masked: false,
+                mask_reason: None,
+            });
+        }
+    }
+
+    let guid = BasicBlockGuid::from_bytes(&bytes);
+    DetailedBlockAnalysis { guid, instructions }
 }
 
 pub fn create_basic_block_guid(
