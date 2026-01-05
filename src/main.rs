@@ -165,7 +165,17 @@ fn command_analyze(
     }
 
     if generate_pdb {
-        let pdb_path = file.with_extension("pdb");
+        // Get PDB filename from embedded debug info, falling back to exe name with .pdb extension
+        let pdb_path = analyzer
+            .pe_loader()
+            .pdb_info()
+            .map(|info| {
+                file.parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(&info.pdb_path)
+            })
+            .unwrap_or_else(|_| file.with_extension("pdb"));
+
         if !pdb_path.exists() || pdb_analyzer::should_replace(&pdb_path).unwrap_or(false) {
             analyzer.generate_pdb(&result, &pdb_path)?;
 

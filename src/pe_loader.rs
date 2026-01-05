@@ -91,6 +91,7 @@ impl std::cmp::PartialOrd for BlockBound {
 pub struct PdbDebugInfo {
     pub guid: [u8; 16],
     pub age: u32,
+    pub pdb_path: String,
 }
 
 #[derive(Debug)]
@@ -710,7 +711,20 @@ impl PeLoader {
                 guid.copy_from_slice(&debug_data[4..20]);
                 let age = u32::from_le_bytes(debug_data[20..24].try_into()?);
 
-                return Ok(PdbDebugInfo { guid, age });
+                // Parse PDB path (null-terminated string starting at offset 24)
+                let pdb_path_bytes = &debug_data[24..];
+                let pdb_path_end = pdb_path_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(pdb_path_bytes.len());
+                let pdb_path =
+                    String::from_utf8_lossy(&pdb_path_bytes[..pdb_path_end]).into_owned();
+
+                return Ok(PdbDebugInfo {
+                    guid,
+                    age,
+                    pdb_path,
+                });
             }
         }
 
