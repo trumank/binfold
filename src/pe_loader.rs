@@ -4,6 +4,7 @@ use memmap2::Mmap;
 use object::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION;
 use object::read::pe::ImageNtHeaders;
 use object::{File, Object, ObjectSection};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self};
 use std::ops::Range;
@@ -778,43 +779,50 @@ impl PeLoader {
     pub fn find_all_functions(&self) -> Result<Vec<FunctionAnalysis>> {
         let runtime_functions = self.find_all_functions_from_exception_directory()?;
 
-        let mut visited = HashSet::new();
-        let mut all_functions = Vec::new();
-        let mut queue = VecDeque::new();
+        let mut visited: HashSet<u64> = Default::default();
+        let mut result = vec![];
 
-        for func_range in runtime_functions {
-            if !visited.contains(&func_range.start) {
-                queue.push_back(func_range.start);
-            }
-        }
+        let mut current_batch: Vec<u64> = {
+            runtime_functions
+                .into_iter()
+                .map(|f| f.start)
+                .filter(|addr| visited.insert(*addr))
+                .collect()
+        };
 
-        // Process functions until no more are found
-        while let Some(func_addr) = queue.pop_front() {
-            if visited.contains(&func_addr) {
-                continue;
-            }
-            visited.insert(func_addr);
-
-            match self.analyze_function(func_addr) {
-                Ok(analysis) => {
-                    for call in &analysis.calls {
-                        if !visited.contains(&call.target) {
-                            queue.push_back(call.target);
-                        }
+        while !current_batch.is_empty() {
+            let batch_output: Vec<_> = current_batch
+                .par_iter()
+                .filter_map(|&addr| match self.analyze_function(addr) {
+                    Ok(analysis) => {
+                        let targets: Vec<u64> = analysis.calls.iter().map(|c| c.target).collect();
+                        Some((analysis, targets))
                     }
-                    all_functions.push(analysis);
-                }
-                Err(e) => {
-                    tracing::info!(
-                        address = format!("0x{func_addr:x}"),
-                        error = %e,
-                        "Failed to analyze function"
-                    );
+                    Err(e) => {
+                        tracing::info!(
+                            address = format!("0x{addr:x}"),
+                            error = %e,
+                            "Failed to analyze function"
+                        );
+                        None
+                    }
+                })
+                .collect();
+
+            let mut next_batch = Vec::new();
+            for (analysis, targets) in batch_output {
+                result.push(analysis);
+                for target in targets {
+                    if visited.insert(target) {
+                        next_batch.push(target);
+                    }
                 }
             }
+
+            current_batch = next_batch;
         }
 
-        Ok(all_functions)
+        Ok(result)
     }
 }
 
