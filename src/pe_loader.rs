@@ -548,8 +548,15 @@ impl PeLoader {
         // Second pass: build parent-child relationships based on unwind info
         for func in runtime_functions_by_start.values() {
             // Try to parse unwind info to find chained exceptions
-            let unwind_offset =
-                self.rva_to_file_offset((func.unwind as u64).saturating_sub(self.image_base()))?;
+            let unwind_offset = match self
+                .rva_to_file_offset((func.unwind as u64).saturating_sub(self.image_base()))
+            {
+                Ok(unwind_offset) => unwind_offset,
+                Err(e) => {
+                    eprintln!("{e}: {func:x?}");
+                    continue;
+                }
+            };
             // Check if this has chain info (first byte's upper 5 bits == 0x4)
             let flags = self.read_u8(unwind_offset)?;
             let has_chain_info = (flags >> 3) == 0x4;
