@@ -84,8 +84,27 @@ impl<'a> Hash for StringRef<'a> {
     }
 }
 
-pub struct Db<'a> {
+struct DataView<'a> {
     data: &'a [u8],
+}
+
+impl<'a> DataView<'a> {
+    fn slice_at(&self, offset: usize, len: usize) -> &'a [u8] {
+        &self.data[offset..offset + len]
+    }
+    fn uuid_at(&self, offset: usize) -> Uuid {
+        Uuid::from_bytes(self.slice_at(offset, 16).try_into().unwrap())
+    }
+    fn u32_at(&self, offset: usize) -> u32 {
+        u32::from_le_bytes(self.slice_at(offset, 4).try_into().unwrap())
+    }
+    fn u64_at(&self, offset: usize) -> u64 {
+        u64::from_le_bytes(self.slice_at(offset, 8).try_into().unwrap())
+    }
+}
+
+pub struct Db<'a> {
+    view: DataView<'a>,
     header: Header,
 }
 
@@ -103,7 +122,8 @@ impl<'a> Db<'a> {
         if data.len() < 32 {
             bail!("File too small");
         }
-        if &data[0..7] != MAGIC {
+        let view = DataView { data };
+        if view.slice_at(0, 7) != MAGIC {
             bail!("Invalid magic");
         }
         let version = data[7];
@@ -115,29 +135,48 @@ impl<'a> Db<'a> {
         }
 
         let header = Header {
-            strings_offset: u64::from_le_bytes(data[8..16].try_into().unwrap()),
-            constraints_offset: u64::from_le_bytes(data[16..24].try_into().unwrap()),
-            constraint_strings_offset: u64::from_le_bytes(data[24..32].try_into().unwrap()),
-            function_constraints_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
-            functions_offset: u64::from_le_bytes(data[40..48].try_into().unwrap()),
+            strings_offset: view.u64_at(8),
+            constraints_offset: view.u64_at(16),
+            constraint_strings_offset: view.u64_at(24),
+            function_constraints_offset: view.u64_at(32),
+            functions_offset: view.u64_at(40),
         };
 
-        Ok(Db { data, header })
-    }
-
-    fn slice_at(&self, offset: usize, len: usize) -> &'a [u8] {
-        &self.data[offset..offset + len]
-    }
-    fn uuid_at(&self, offset: usize) -> Uuid {
-        Uuid::from_bytes(self.slice_at(offset, 16).try_into().unwrap())
-    }
-    fn u32_at(&self, offset: usize) -> u32 {
-        u32::from_le_bytes(self.slice_at(offset, 4).try_into().unwrap())
+        Ok(Db { view, header })
     }
 
     pub fn function_count(&self) -> usize {
         let functions_start = self.header.functions_offset as usize;
-        self.u32_at(functions_start) as usize
+        self.view.u32_at(functions_start) as usize
+    }
+
+    pub fn strings_count(&self) -> usize {
+        let strings_start = self.header.strings_offset as usize;
+        self.view.u32_at(strings_start) as usize
+    }
+
+    pub fn constraints_count(&self) -> usize {
+        let constraints_start = self.header.constraints_offset as usize;
+        self.view.u32_at(constraints_start) as usize
+    }
+
+    /// Total number of symbol references across all constraints (not unique strings)
+    pub fn symbol_references_count(&self) -> usize {
+        let constraint_strings_start = self.header.constraint_strings_offset as usize;
+        self.view.u32_at(constraint_strings_start) as usize
+    }
+
+    pub fn function_constraints_count(&self) -> usize {
+        let function_constraints_start = self.header.function_constraints_offset as usize;
+        self.view.u32_at(function_constraints_start) as usize
+    }
+
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    pub fn data_len(&self) -> usize {
+        self.view.data.len()
     }
 
     pub fn iter_functions<'db>(&'db self) -> FunctionIterator<'db, 'a> {
@@ -154,7 +193,7 @@ impl<'a> Db<'a> {
     ) -> ConstraintIterator<'db, 'a> {
         // Find the function in the functions section using binary search
         let functions_start = self.header.functions_offset as usize;
-        let num_functions = self.u32_at(functions_start) as usize;
+        let num_functions = self.view.u32_at(functions_start) as usize;
 
         // Binary search for the function
         let mut left = 0;
@@ -164,14 +203,14 @@ impl<'a> Db<'a> {
             let mid = left + (right - left) / 2;
             let function_offset = functions_start + 4 + (mid * FUNCTION_SIZE);
 
-            let current_guid = FunctionGuid(self.uuid_at(function_offset));
+            let current_guid = FunctionGuid(self.view.uuid_at(function_offset));
 
             match current_guid.cmp(function_guid) {
                 std::cmp::Ordering::Less => left = mid + 1,
                 std::cmp::Ordering::Greater => right = mid,
                 std::cmp::Ordering::Equal => {
-                    let constraint_index = self.u32_at(function_offset + 16) as usize;
-                    let num_constraints = self.u32_at(function_offset + 20) as usize;
+                    let constraint_index = self.view.u32_at(function_offset + 16) as usize;
+                    let num_constraints = self.view.u32_at(function_offset + 20) as usize;
 
                     return ConstraintIterator {
                         db: self,
@@ -214,17 +253,11 @@ impl<'a> Db<'a> {
             .collect()
     }
 
-    fn read_string_at_offset(&self, offset: u32) -> Result<&'a str> {
-        let file_offset = self.header.strings_offset as usize + offset as usize;
-        let len = self.u32_at(file_offset) as usize;
-        Ok(str::from_utf8(self.slice_at(file_offset + 4, len))?)
-    }
-
     fn string_ref_at_offset(&self, offset: u32) -> StringRef<'a> {
         let file_offset = self.header.strings_offset as usize + offset as usize;
-        let len = self.u32_at(file_offset) as usize;
+        let len = self.view.u32_at(file_offset) as usize;
         StringRef {
-            data: self.slice_at(file_offset + 4, len),
+            data: self.view.slice_at(file_offset + 4, len),
         }
     }
 }
@@ -388,13 +421,14 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
         let offset = constraints_start
             + ((self.constraint_index + self.current) * FUNCTION_CONSTRAINTS_SIZE);
 
-        let constraint_index = self.db.u32_at(offset) as usize;
+        let constraint_index = self.db.view.u32_at(offset) as usize;
         let constraint_guid = ConstraintGuid(
             self.db
+                .view
                 .uuid_at(self.db.header.constraints_offset as usize + 4 + constraint_index * 16),
         );
-        let string_count = self.db.u32_at(offset + 4) as usize;
-        let string_index = self.db.u32_at(offset + 8) as usize;
+        let string_count = self.db.view.u32_at(offset + 4) as usize;
+        let string_index = self.db.view.u32_at(offset + 8) as usize;
 
         self.current += 1;
 
@@ -430,7 +464,7 @@ impl<'db, 'a> Iterator for SymbolIterator<'db, 'a> {
         let constraint_strings_start = self.db.header.constraint_strings_offset as usize + 4;
         let offset =
             constraint_strings_start + (self.string_index + self.current) * CONSTRAINT_STRINGS_SIZE;
-        let string_offset = self.db.u32_at(offset);
+        let string_offset = self.db.view.u32_at(offset);
 
         self.current += 1;
         Some(self.db.string_ref_at_offset(string_offset))
@@ -459,7 +493,7 @@ impl<'db, 'a> Iterator for FunctionIterator<'db, 'a> {
         let functions_start = self.db.header.functions_offset as usize;
         let function_offset = functions_start + 4 + (self.current * FUNCTION_SIZE);
 
-        let func_guid = FunctionGuid(self.db.uuid_at(function_offset));
+        let func_guid = FunctionGuid(self.db.view.uuid_at(function_offset));
         self.current += 1;
 
         Some(func_guid)

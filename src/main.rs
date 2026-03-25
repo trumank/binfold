@@ -20,6 +20,7 @@ enum Commands {
     GenDb(CommandGenDb),
     Analyze(CommandAnalyze),
     DumpDb(CommandDumpDb),
+    DbInfo(CommandDbInfo),
 }
 
 /// Create a database of function GUIDs/constraint GUIDs and their mappings to symbol names
@@ -66,6 +67,14 @@ struct CommandDumpDb {
     function: Option<Uuid>,
 }
 
+/// Show database statistics and section information
+#[derive(Parser)]
+struct CommandDbInfo {
+    /// Path to database file
+    #[arg(short, long)]
+    database: PathBuf,
+}
+
 fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16)
@@ -96,6 +105,7 @@ fn main() -> Result<()> {
         Commands::GenDb(cmd) => command_gen_db(cmd),
         Commands::Analyze(cmd) => command_analyze(cmd),
         Commands::DumpDb(cmd) => command_dump_db(cmd),
+        Commands::DbInfo(cmd) => command_db_info(cmd),
     }
 }
 
@@ -270,6 +280,94 @@ fn command_dump_db(
     // Close JSON array and finish
     json_writer.end_array()?;
     json_writer.finish_document()?;
+
+    Ok(())
+}
+
+fn command_db_info(CommandDbInfo { database }: CommandDbInfo) -> Result<()> {
+    use std::fs;
+
+    let file = fs::File::open(&database)?;
+    let metadata = file.metadata()?;
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+    let db = Db::new(&mmap)?;
+
+    let header = db.header();
+
+    // Calculate section sizes
+    let header_size = header.strings_offset;
+    let strings_size = header.constraints_offset - header.strings_offset;
+    let constraints_size = header.constraint_strings_offset - header.constraints_offset;
+    let symbol_refs_size = header.function_constraints_offset - header.constraint_strings_offset;
+    let func_constraints_size = header.functions_offset - header.function_constraints_offset;
+    let functions_size = db.data_len() as u64 - header.functions_offset;
+
+    fn format_size(bytes: u64) -> String {
+        if bytes >= 1024 * 1024 {
+            format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+        } else if bytes >= 1024 {
+            format!("{:.2} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
+    println!("Database: {}", database.display());
+    println!("Total size: {}", format_size(metadata.len()));
+    println!();
+    println!("{:<22} {:>12} {:>12}  {:<14} Type", "Section", "Count", "Size", "Offset");
+    println!("{}", "-".repeat(78));
+
+    let sections: &[(&str, Option<usize>, u64, u64, &str)] = &[
+        ("Header", None, header_size, 0, "magic[7] + u8 + u64[5]"),
+        (
+            "Strings",
+            Some(db.strings_count()),
+            strings_size,
+            header.strings_offset,
+            "u32 + (u32 + u8[])[]",
+        ),
+        (
+            "Constraints",
+            Some(db.constraints_count()),
+            constraints_size,
+            header.constraints_offset,
+            "u32 + uuid[]",
+        ),
+        (
+            "Symbol references",
+            Some(db.symbol_references_count()),
+            symbol_refs_size,
+            header.constraint_strings_offset,
+            "u32 + u32[]",
+        ),
+        (
+            "Function constraints",
+            Some(db.function_constraints_count()),
+            func_constraints_size,
+            header.function_constraints_offset,
+            "u32 + (u32 + u32 + u32)[]",
+        ),
+        (
+            "Functions",
+            Some(db.function_count()),
+            functions_size,
+            header.functions_offset,
+            "u32 + (uuid + u32 + u32)[]",
+        ),
+    ];
+
+    for (name, count, size, offset, typ) in sections {
+        let count_str = count.map_or("-".to_string(), |c| c.to_string());
+        println!(
+            "{:<22} {:>12} {:>12}  0x{:08x}     {}",
+            name,
+            count_str,
+            format_size(*size),
+            offset,
+            typ
+        );
+    }
 
     Ok(())
 }
