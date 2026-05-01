@@ -1,7 +1,6 @@
 use anyhow::Result;
-use binfold::db::Db;
+use binfold::db::{Db, FunctionGuid};
 use binfold::progress::IndicatifProgressBar;
-use binfold::warp::FunctionGuid;
 use binfold::{BinfoldAnalyzer, DatabaseBuilder};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -236,7 +235,7 @@ fn command_dump_db(
     json_writer.begin_array()?;
 
     let functions: Box<dyn Iterator<Item = FunctionGuid>> = if let Some(function) = function {
-        Box::new(std::iter::once(FunctionGuid(function)))
+        Box::new(std::iter::once(FunctionGuid::from_digest(function)))
     } else {
         Box::new(db.iter_functions())
     };
@@ -315,7 +314,10 @@ fn command_db_info(CommandDbInfo { database }: CommandDbInfo) -> Result<()> {
     println!("Database: {}", database.display());
     println!("Total size: {}", format_size(metadata.len()));
     println!();
-    println!("{:<22} {:>12} {:>12}  {:<14} Type", "Section", "Count", "Size", "Offset");
+    println!(
+        "{:<22} {:>12} {:>12}  {:<14} Type",
+        "Section", "Count", "Size", "Offset"
+    );
     println!("{}", "-".repeat(78));
 
     let sections: &[(&str, Option<usize>, u64, u64, &str)] = &[

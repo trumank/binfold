@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 mod mmap_source;
 
 pub mod db;
+pub mod hash;
 pub mod pdb_analyzer;
 pub mod pdb_writer;
 pub mod pe_loader;
@@ -25,13 +26,11 @@ pub use uuid::Uuid;
 // Re-export progress types
 pub use progress::{NoOpProgressReporter, ProgressReporter, default_progress_style};
 
-use crate::db::{Db, DbWriter, StringRef};
+use crate::db::{ConstraintGuid, Db, DbHash, DbWriter, FunctionGuid, StringRef, SymbolGuid};
 use crate::pdb_analyzer::PdbAnalyzer;
 use crate::pdb_writer::{extract_pdb_info, generate_pdb};
 use crate::pe_loader::{AnalysisCache, PeLoader};
-use crate::warp::{
-    Constraint, ConstraintGuid, FunctionGuid, compute_function_guid_with_contraints,
-};
+use crate::warp::{Constraint, compute_function_guid_with_contraints};
 
 /// High-level analyzer for binary function analysis
 pub struct BinfoldAnalyzer {
@@ -74,7 +73,7 @@ pub struct AnalyzedFunction {
     pub address: u64,
     pub size: u64,
     pub guid: FunctionGuid,
-    pub constraints: Vec<Constraint>,
+    pub constraints: Vec<Constraint<DbHash>>,
 }
 
 /// Information about database matching
@@ -127,7 +126,7 @@ impl BinfoldAnalyzer {
             .map(|addr| {
                 let result = (
                     addr,
-                    compute_function_guid_with_contraints(&self.pe, &cache, addr),
+                    compute_function_guid_with_contraints::<DbHash>(&self.pe, &cache, addr),
                 );
                 guid_progress.progress();
                 result
@@ -304,7 +303,7 @@ impl BinfoldAnalyzer {
                         .get(&call.target)
                         .and_then(|m| m.symbol_name.as_deref())
                     {
-                        let target_symbol = crate::warp::SymbolGuid::from_symbol(unique_name);
+                        let target_symbol = SymbolGuid::from_symbol(unique_name);
                         constraints.push(Constraint {
                             guid: ConstraintGuid::from_symbol_child_call(target_symbol),
                             offset: Some((call.address - func.address) as i64),
@@ -319,7 +318,7 @@ impl BinfoldAnalyzer {
                             .get(parent_addr)
                             .and_then(|m| m.symbol_name.as_deref())
                         {
-                            let parent_symbol = crate::warp::SymbolGuid::from_symbol(unique_name);
+                            let parent_symbol = SymbolGuid::from_symbol(unique_name);
                             constraints.push(Constraint {
                                 guid: ConstraintGuid::from_symbol_parent_call(parent_symbol),
                                 offset: Some(*offset as i64),

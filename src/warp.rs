@@ -3,131 +3,66 @@ use anyhow::Result;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use std::ops::Range;
 use tracing::{debug, trace};
-use uuid::{Uuid, uuid};
 
-const NAMESPACE_FUNCTION: Uuid = uuid!("0192a179-61ac-7cef-88ed-012296e9492f");
-const NAMESPACE_BASIC_BLOCK: Uuid = uuid!("0192a178-7a5f-7936-8653-3cbaa7d6afe7");
-const NAMESPACE_SYMBOL: Uuid = uuid!("6d5ace5a-0050-4e71-815e-5536e9e61484");
-const NAMESPACE_CHILD_CALL: Uuid = uuid!("7e3d0b40-56dd-4b77-a825-9c75b0b607c5");
-const NAMESPACE_PARENT_CALL: Uuid = uuid!("dc0e3d9d-72ea-46df-81fc-ebe4295f0977");
-const NAMESPACE_SYMBOL_CHILD_CALL: Uuid = uuid!("18811911-ca5d-4d97-a1c3-dd526ae818a5");
-const NAMESPACE_SYMBOL_PARENT_CALL: Uuid = uuid!("e4b07ff0-e798-4427-b533-174aebda4858");
-const NAMESPACE_DATA_CONST: Uuid = uuid!("db056d71-7d64-4660-a937-aeb6e8136af2");
+pub use crate::hash::{
+    BasicBlockGuid, BasicBlockTag, ChildCallTag, ConstraintGuid, ConstraintTag, DataConstTag,
+    DomainTag, FunctionGuid, FunctionTag, Guid, HashAlgo, ParentCallTag, SymbolChildCallTag,
+    SymbolGuid, SymbolParentCallTag, SymbolTag, UuidV5,
+};
 
-macro_rules! new_guid {
-    ($name:ident) => {
-        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(pub Uuid);
-        impl $name {
-            pub fn nil() -> Self {
-                Self(Uuid::nil())
-            }
-        }
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.0.fmt(f)
-            }
-        }
-    };
-}
-
-new_guid!(FunctionGuid);
-new_guid!(BasicBlockGuid);
-new_guid!(SymbolGuid);
-new_guid!(ConstraintGuid);
-
-impl FunctionGuid {
-    fn from_bytes(bytes: &[u8]) -> Self {
-        Self(Uuid::new_v5(&NAMESPACE_FUNCTION, bytes))
-    }
-}
-
-impl BasicBlockGuid {
-    fn from_bytes(bytes: &[u8]) -> Self {
-        Self(Uuid::new_v5(&NAMESPACE_BASIC_BLOCK, bytes))
-    }
-}
-
-impl ConstraintGuid {
-    /// constraint on call to target function
-    pub fn from_child_call(target: FunctionGuid) -> Self {
-        Self(Uuid::new_v5(&NAMESPACE_CHILD_CALL, target.0.as_bytes()))
-    }
-    /// constraint on target calling this function
-    pub fn from_parent_call(target: FunctionGuid) -> Self {
-        Self(Uuid::new_v5(&NAMESPACE_PARENT_CALL, target.0.as_bytes()))
-    }
-    /// constraint on call to target function
-    pub fn from_symbol_child_call(target: SymbolGuid) -> Self {
-        Self(Uuid::new_v5(
-            &NAMESPACE_SYMBOL_CHILD_CALL,
-            target.0.as_bytes(),
-        ))
-    }
-    /// constraint on target calling this function
-    pub fn from_symbol_parent_call(target: SymbolGuid) -> Self {
-        Self(Uuid::new_v5(
-            &NAMESPACE_SYMBOL_PARENT_CALL,
-            target.0.as_bytes(),
-        ))
-    }
-    /// constraint on reference to read-only data
-    pub fn from_data_const(data: &[u8]) -> Self {
-        Self(Uuid::new_v5(&NAMESPACE_DATA_CONST, data))
-    }
-}
-
-impl SymbolGuid {
-    pub fn from_symbol(symbol_name: impl AsRef<str>) -> SymbolGuid {
-        Self(Uuid::new_v5(
-            &NAMESPACE_SYMBOL,
-            symbol_name.as_ref().as_bytes(),
-        ))
-    }
-}
-
-#[derive(Default, Debug, Clone)]
-pub struct Function {
-    pub guid: FunctionGuid,
+#[derive(Debug, Clone)]
+pub struct Function<H: HashAlgo> {
+    pub guid: FunctionGuid<H>,
     pub address: u64,
     pub size: usize,
-    pub constraints: Vec<Constraint>,
+    pub constraints: Vec<Constraint<H>>,
+}
+
+impl<H: HashAlgo> Default for Function<H> {
+    fn default() -> Self {
+        Self {
+            guid: FunctionGuid::default(),
+            address: 0,
+            size: 0,
+            constraints: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct Constraint {
-    pub guid: ConstraintGuid,
+pub struct Constraint<H: HashAlgo> {
+    pub guid: ConstraintGuid<H>,
     pub offset: Option<i64>,
 }
 
-pub fn compute_function_guid(
+pub fn compute_function_guid<H: HashAlgo>(
     pe: &PeLoader,
     cache: &AnalysisCache,
     address: u64,
-) -> Result<FunctionGuid> {
+) -> Result<FunctionGuid<H>> {
     let func = cache.get(address, pe)?;
     debug!(size = format!("0x{:x}", func.size), "Function size");
 
-    compute_warp_uuid(&func, pe)
+    compute_warp_uuid::<H>(&func, pe)
 }
 
-pub fn compute_function_guid_with_contraints(
+pub fn compute_function_guid_with_contraints<H: HashAlgo>(
     pe: &PeLoader,
     cache: &AnalysisCache,
     address: u64,
-) -> Result<Function> {
+) -> Result<Function<H>> {
     let func = cache.get(address, pe)?;
     debug!(size = format!("0x{:x}", func.size), "Function size");
 
-    let guid = compute_warp_uuid(&func, pe)?;
+    let guid = compute_warp_uuid::<H>(&func, pe)?;
 
     // Generate constraints from calls
-    let mut constraints: Vec<Constraint> = func
+    let mut constraints: Vec<Constraint<H>> = func
         .calls
         .iter()
         .map(|c| {
-            compute_function_guid(pe, cache, c.target).map(|guid| Constraint {
-                guid: ConstraintGuid::from_child_call(guid),
+            compute_function_guid::<H>(pe, cache, c.target).map(|guid| Constraint {
+                guid: ConstraintGuid::<H>::from_child_call(guid),
                 offset: Some((c.address - func.entry_point) as i64),
             })
         })
@@ -139,7 +74,7 @@ pub fn compute_function_guid_with_contraints(
             // For read-only data with no specific size (strings), try to read and hash the content
             if let Some(data) = read_string_data(pe, data_ref.target) {
                 constraints.push(Constraint {
-                    guid: ConstraintGuid::from_data_const(&data),
+                    guid: ConstraintGuid::<H>::from_data_const(&data),
                     offset: Some((data_ref.address - func.entry_point) as i64),
                 });
             }
@@ -154,7 +89,10 @@ pub fn compute_function_guid_with_contraints(
     })
 }
 
-pub fn compute_warp_uuid(func: &FunctionAnalysis, pe: &PeLoader) -> Result<FunctionGuid> {
+pub fn compute_warp_uuid<H: HashAlgo>(
+    func: &FunctionAnalysis,
+    pe: &PeLoader,
+) -> Result<FunctionGuid<H>> {
     debug!(blocks = func.basic_blocks.len(), "Identified basic blocks");
 
     let raw_bytes = pe.read_at_va(func.entry_point, func.size)?;
@@ -165,7 +103,7 @@ pub fn compute_warp_uuid(func: &FunctionAnalysis, pe: &PeLoader) -> Result<Funct
     for (&start_addr, &end_addr) in func.basic_blocks.iter() {
         // println!("{:x?}", (start_addr - base, end_addr - base, base));
         let block_bytes = &raw_bytes[(start_addr - base) as usize..(end_addr - base) as usize];
-        let uuid = create_basic_block_guid(
+        let uuid = create_basic_block_guid::<H>(
             block_bytes,
             start_addr,
             base..(base + raw_bytes.len() as u64),
@@ -217,10 +155,10 @@ pub fn compute_warp_uuid(func: &FunctionAnalysis, pe: &PeLoader) -> Result<Funct
     // actually combines them in low-to-high address order
     let mut combined_bytes = Vec::new();
     for (_, uuid) in block_uuids.iter() {
-        combined_bytes.extend_from_slice(uuid.0.as_bytes());
+        combined_bytes.extend_from_slice(H::digest_bytes(&uuid.digest).as_ref());
     }
 
-    let function_uuid = FunctionGuid::from_bytes(&combined_bytes);
+    let function_uuid = FunctionGuid::<H>::from_bytes(&combined_bytes);
 
     debug!(
         target: "binfold::warp::guid",
@@ -241,12 +179,12 @@ fn get_branch_target(instruction: &Instruction) -> Option<u64> {
     }
 }
 
-fn create_basic_block_guid(
+fn create_basic_block_guid<H: HashAlgo>(
     raw_bytes: &[u8],
     base: u64,
     function_bounds: Range<u64>,
     pe: &PeLoader,
-) -> BasicBlockGuid {
+) -> BasicBlockGuid<H> {
     let mut bytes = Vec::new();
 
     let mut decoder = Decoder::new(pe.bitness(), raw_bytes, DecoderOptions::NONE);

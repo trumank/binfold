@@ -4,11 +4,10 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::db::{ConstraintGuid, DbHash, FunctionGuid, SymbolGuid};
 use crate::mmap_source::MmapSource;
 use crate::pe_loader::{FunctionCall, PeLoader};
-use crate::warp::{
-    Constraint, ConstraintGuid, FunctionGuid, SymbolGuid, compute_function_guid_with_contraints,
-};
+use crate::warp::{Constraint, compute_function_guid_with_contraints};
 use crate::{AnalysisCache, NoOpProgressReporter, ProgressReporter};
 
 pub struct PdbAnalyzer {
@@ -22,7 +21,7 @@ pub struct FunctionInfo {
     pub address: u64,
     pub size: Option<u32>,
     pub guid: FunctionGuid,
-    pub constraints: Vec<Constraint>,
+    pub constraints: Vec<Constraint<DbHash>>,
     pub calls: Vec<FunctionCall>,
 }
 
@@ -130,7 +129,11 @@ impl PdbAnalyzer {
 
                 let size = self.pe_loader.analyze_function(address)?.size;
 
-                let func = compute_function_guid_with_contraints(&self.pe_loader, &cache, address)?;
+                let func = compute_function_guid_with_contraints::<DbHash>(
+                    &self.pe_loader,
+                    &cache,
+                    address,
+                )?;
                 let analysis = cache.get(address, &self.pe_loader).unwrap();
                 let func_info = FunctionInfo {
                     name: proc.name.clone(),
