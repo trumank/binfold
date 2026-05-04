@@ -185,12 +185,12 @@ fn command_analyze(
         let pdb_path = analyzer
             .pe_loader()
             .pdb_info()
-            .map(|info| {
-                file.parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join(&info.pdb_path)
+            .ok()
+            .and_then(|info| {
+                let name = info.pdb_path.rsplit(['\\', '/']).next().unwrap();
+                (!name.is_empty()).then(|| file.with_file_name(name))
             })
-            .unwrap_or_else(|_| file.with_extension("pdb"));
+            .unwrap_or_else(|| file.with_extension("pdb"));
 
         if !pdb_path.exists() || pdb_analyzer::should_replace(&pdb_path).unwrap_or(false) {
             analyzer.generate_pdb(&result, &pdb_path)?;
