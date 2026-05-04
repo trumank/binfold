@@ -54,33 +54,41 @@ impl PdbAnalyzer {
         progress_reporter: Option<P>,
     ) -> Result<Vec<FunctionInfo>> {
         let address_map = self.pdb.address_map()?;
+        let image_base = self.pe_loader.image_base();
 
-        enum SymbolsProducer<'a> {
-            Global(pdb::SymbolTable<'a>),
-            Module(pdb::ModuleInfo<'a>),
-        }
-        impl<'a> SymbolsProducer<'a> {
-            fn symbols(&self) -> Result<pdb::SymbolIter<'_>, pdb::Error> {
-                match self {
-                    SymbolsProducer::Global(s) => Ok(s.iter()),
-                    SymbolsProducer::Module(s) => s.symbols(),
+        // Pass 1: walk the global symbol stream once to collect public function
+        // symbols. The public stream carries the canonical mangled name (with
+        // full type signature), which we prefer over the bare textual proc name
+        // from the module stream when both exist.
+        let mut publics: HashMap<u64, String> = HashMap::new();
+        {
+            let global_symbols = self.pdb.global_symbols()?;
+            let mut iter = global_symbols.iter();
+            while let Ok(Some(symbol)) = iter.next() {
+                if let Ok(SymbolData::Public(p)) = symbol.parse()
+                    && p.function
+                    && let Some(rva) = p.offset.to_rva(&address_map)
+                {
+                    // First-wins on collisions (ICF/COMDAT can fold multiple
+                    // publics to the same RVA).
+                    publics
+                        .entry(image_base + rva.0 as u64)
+                        .or_insert_with(|| p.name.to_string().into_owned());
                 }
             }
         }
 
-        // Collect global symbols
-        let mut symbol_producers = vec![SymbolsProducer::Global(self.pdb.global_symbols()?)];
-
-        // Collect modules
+        // Pass 2: collect module procedures (textual qualified names + len).
         let dbi = self.pdb.debug_information()?;
         let mut modules = dbi.modules()?;
+        let mut module_infos = Vec::new();
         while let Some(module) = modules.next()? {
             if let Ok(Some(module_info)) = self.pdb.module_info(&module) {
-                symbol_producers.push(SymbolsProducer::Module(module_info));
+                module_infos.push(module_info);
             }
         }
 
-        let procedures: Vec<_> = symbol_producers
+        let procedures: Vec<_> = module_infos
             .iter()
             .map(|module_info| {
                 let mut module_procs = Vec::new();
@@ -106,7 +114,7 @@ impl PdbAnalyzer {
                 .iter()
                 .flatten()
                 .fold(Default::default(), |mut acc, item| {
-                    acc.entry(item.rva as u64 + self.pe_loader.image_base())
+                    acc.entry(item.rva as u64 + image_base)
                         .or_default()
                         .push(item);
                     acc
@@ -135,8 +143,15 @@ impl PdbAnalyzer {
                     address,
                 )?;
                 let analysis = cache.get(address, &self.pe_loader).unwrap();
+                // Prefer the public mangled name when available (carries full
+                // type signature). Fall back to the bare textual proc name for
+                // file-static / synthetic functions that have no public.
+                let name = publics
+                    .get(&address)
+                    .cloned()
+                    .unwrap_or_else(|| proc.name.clone());
                 let func_info = FunctionInfo {
-                    name: proc.name.clone(),
+                    name,
                     address,
                     size: Some(size as u32),
                     guid: func.guid,
