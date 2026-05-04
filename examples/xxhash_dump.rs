@@ -16,6 +16,8 @@ impl HashAlgo for XxHash64 {
     type Digest = u64;
     type Key = u64;
 
+    const DIGEST_SIZE: usize = 8;
+
     fn oneshot(seed: u64, bytes: &[u8]) -> u64 {
         twox_hash::XxHash64::oneshot(seed, bytes)
     }
@@ -27,6 +29,9 @@ impl HashAlgo for XxHash64 {
     }
     fn digest_bytes(d: &u64) -> impl AsRef<[u8]> {
         d.to_le_bytes()
+    }
+    fn digest_from_bytes(bytes: &[u8]) -> u64 {
+        u64::from_le_bytes(bytes.try_into().unwrap())
     }
     fn fmt_digest(d: &u64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:016x}", d)

@@ -5,7 +5,6 @@ use binfold::{BinfoldAnalyzer, DatabaseBuilder};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -61,9 +60,9 @@ struct CommandDumpDb {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Only dump a specific function by its GUID
-    #[arg(short, long)]
-    function: Option<Uuid>,
+    /// Only dump a specific function by its GUID (hex u64)
+    #[arg(short, long, value_parser = parse_hex)]
+    function: Option<u64>,
 }
 
 /// Show database statistics and section information

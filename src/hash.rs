@@ -22,6 +22,11 @@ pub trait HashAlgo: 'static {
     /// Per-domain salt produced by [`HashAlgo::key_from_name`].
     type Key: Copy;
 
+    /// On-disk / on-wire byte width of [`Self::Digest`]. The DB layout uses this to
+    /// compute fixed-record offsets, so it must match the length of the slice
+    /// returned by [`Self::digest_bytes`] and consumed by [`Self::digest_from_bytes`].
+    const DIGEST_SIZE: usize;
+
     fn oneshot(key: Self::Key, bytes: &[u8]) -> Self::Digest;
     fn key_from_name(name: &str) -> Self::Key;
 
@@ -29,6 +34,9 @@ pub trait HashAlgo: 'static {
 
     /// Stable byte view used when chaining one digest into another's input.
     fn digest_bytes(d: &Self::Digest) -> impl AsRef<[u8]>;
+
+    /// Inverse of [`Self::digest_bytes`]. `bytes.len()` must equal [`Self::DIGEST_SIZE`].
+    fn digest_from_bytes(bytes: &[u8]) -> Self::Digest;
 
     fn fmt_digest(d: &Self::Digest, f: &mut fmt::Formatter<'_>) -> fmt::Result;
 }
@@ -194,6 +202,41 @@ impl<H: HashAlgo> ConstraintGuid<H> {
     }
 }
 
+/// xxHash-64 implementation. Per-domain keys are the xxhash-64 of the domain name.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct XxHash64;
+
+impl HashAlgo for XxHash64 {
+    type Digest = u64;
+    type Key = u64;
+
+    const DIGEST_SIZE: usize = 8;
+
+    fn oneshot(key: u64, bytes: &[u8]) -> u64 {
+        twox_hash::XxHash64::oneshot(key, bytes)
+    }
+
+    fn key_from_name(name: &str) -> u64 {
+        twox_hash::XxHash64::oneshot(0, name.as_bytes())
+    }
+
+    fn nil() -> u64 {
+        0
+    }
+
+    fn digest_bytes(d: &u64) -> impl AsRef<[u8]> {
+        d.to_le_bytes()
+    }
+
+    fn digest_from_bytes(bytes: &[u8]) -> u64 {
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    }
+
+    fn fmt_digest(d: &u64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", d)
+    }
+}
+
 /// UUID v5 implementation. All per-domain namespaces are derived from a single root
 /// namespace via `Uuid::new_v5(&ROOT, name.as_bytes())`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -204,6 +247,8 @@ const UUIDV5_ROOT: Uuid = uuid!("c1a7f83a-38a2-4bed-b6a3-babc0df6860f");
 impl HashAlgo for UuidV5 {
     type Digest = Uuid;
     type Key = Uuid;
+
+    const DIGEST_SIZE: usize = 16;
 
     fn oneshot(key: Uuid, bytes: &[u8]) -> Uuid {
         Uuid::new_v5(&key, bytes)
@@ -219,6 +264,10 @@ impl HashAlgo for UuidV5 {
 
     fn digest_bytes(d: &Uuid) -> impl AsRef<[u8]> {
         *d.as_bytes()
+    }
+
+    fn digest_from_bytes(bytes: &[u8]) -> Uuid {
+        Uuid::from_bytes(bytes.try_into().unwrap())
     }
 
     fn fmt_digest(d: &Uuid, f: &mut fmt::Formatter<'_>) -> fmt::Result {

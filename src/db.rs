@@ -1,13 +1,12 @@
-use crate::hash::UuidV5;
+use crate::hash::{HashAlgo, XxHash64};
 use anyhow::{Result, bail};
 use byteorder::{LE, WriteBytesExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Seek, SeekFrom, Write};
-use uuid::Uuid;
 
 /// Hash algorithm pinned for the on-disk DB format.
-pub type DbHash = UuidV5;
+pub type DbHash = XxHash64;
 pub type FunctionGuid = crate::hash::FunctionGuid<DbHash>;
 pub type BasicBlockGuid = crate::hash::BasicBlockGuid<DbHash>;
 pub type SymbolGuid = crate::hash::SymbolGuid<DbHash>;
@@ -30,7 +29,7 @@ pub type ConstraintGuid = crate::hash::ConstraintGuid<DbHash>;
 // constraints section
 // [4 bytes] count
 // for each:
-//   [16 bytes] ConstraintGUID
+//   [8 bytes] ConstraintGUID
 //
 // constraint strings section
 // [4 bytes] count
@@ -47,17 +46,18 @@ pub type ConstraintGuid = crate::hash::ConstraintGuid<DbHash>;
 // functions section
 // [4 bytes] count
 // for each:
-//   [16 bytes] FunctionGUID
+//   [8 bytes] FunctionGUID
 //   [4 bytes] index of constraints
 //   [4 bytes] number of constraints
 
 const MAGIC: &[u8; 7] = b"BINFOLD";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
-const CONSTRAINTS_SIZE: usize = 16;
+const DIGEST_SIZE: usize = <DbHash as HashAlgo>::DIGEST_SIZE;
+const CONSTRAINTS_SIZE: usize = DIGEST_SIZE;
 const CONSTRAINT_STRINGS_SIZE: usize = 4;
 const FUNCTION_CONSTRAINTS_SIZE: usize = 4 + 4 + 4;
-const FUNCTION_SIZE: usize = 16 + 4 + 4;
+const FUNCTION_SIZE: usize = DIGEST_SIZE + 4 + 4;
 
 /// A reference to a string in the database that can be compared without loading the actual string
 #[derive(Clone, Copy)]
@@ -99,14 +99,14 @@ impl<'a> DataView<'a> {
     fn slice_at(&self, offset: usize, len: usize) -> &'a [u8] {
         &self.data[offset..offset + len]
     }
-    fn uuid_at(&self, offset: usize) -> Uuid {
-        Uuid::from_bytes(self.slice_at(offset, 16).try_into().unwrap())
-    }
     fn u32_at(&self, offset: usize) -> u32 {
         u32::from_le_bytes(self.slice_at(offset, 4).try_into().unwrap())
     }
     fn u64_at(&self, offset: usize) -> u64 {
         u64::from_le_bytes(self.slice_at(offset, 8).try_into().unwrap())
+    }
+    fn digest_at<H: HashAlgo>(&self, offset: usize) -> H::Digest {
+        H::digest_from_bytes(self.slice_at(offset, H::DIGEST_SIZE))
     }
 }
 
@@ -210,14 +210,16 @@ impl<'a> Db<'a> {
             let mid = left + (right - left) / 2;
             let function_offset = functions_start + 4 + (mid * FUNCTION_SIZE);
 
-            let current_guid = FunctionGuid::from_digest(self.view.uuid_at(function_offset));
+            let current_guid =
+                FunctionGuid::from_digest(self.view.digest_at::<DbHash>(function_offset));
 
             match current_guid.cmp(function_guid) {
                 std::cmp::Ordering::Less => left = mid + 1,
                 std::cmp::Ordering::Greater => right = mid,
                 std::cmp::Ordering::Equal => {
-                    let constraint_index = self.view.u32_at(function_offset + 16) as usize;
-                    let num_constraints = self.view.u32_at(function_offset + 20) as usize;
+                    let constraint_index = self.view.u32_at(function_offset + DIGEST_SIZE) as usize;
+                    let num_constraints =
+                        self.view.u32_at(function_offset + DIGEST_SIZE + 4) as usize;
 
                     return ConstraintIterator {
                         db: self,
@@ -319,7 +321,7 @@ impl<'a> DbWriter<'a> {
         }
         writer.write_u32::<LE>(constraints_vec.len().try_into().unwrap())?;
         for guid in constraints_vec {
-            writer.write_all(guid.digest.as_bytes())?;
+            writer.write_all(DbHash::digest_bytes(&guid.digest).as_ref())?;
         }
 
         // Write constraint strings section
@@ -361,7 +363,7 @@ impl<'a> DbWriter<'a> {
         writer.write_u32::<LE>(self.functions.len().try_into().unwrap())?;
         let mut constraint_index = 0;
         for (func_guid, constraints) in self.functions {
-            writer.write_all(func_guid.digest.as_bytes())?;
+            writer.write_all(DbHash::digest_bytes(&func_guid.digest).as_ref())?;
             writer.write_u32::<LE>(constraint_index)?;
             writer.write_u32::<LE>(constraints.len().try_into().unwrap())?;
             constraint_index += constraints.len() as u32;
@@ -429,11 +431,9 @@ impl<'db, 'a> Iterator for ConstraintIterator<'db, 'a> {
             + ((self.constraint_index + self.current) * FUNCTION_CONSTRAINTS_SIZE);
 
         let constraint_index = self.db.view.u32_at(offset) as usize;
-        let constraint_guid = ConstraintGuid::from_digest(
-            self.db
-                .view
-                .uuid_at(self.db.header.constraints_offset as usize + 4 + constraint_index * 16),
-        );
+        let constraint_guid = ConstraintGuid::from_digest(self.db.view.digest_at::<DbHash>(
+            self.db.header.constraints_offset as usize + 4 + constraint_index * DIGEST_SIZE,
+        ));
         let string_count = self.db.view.u32_at(offset + 4) as usize;
         let string_index = self.db.view.u32_at(offset + 8) as usize;
 
@@ -500,7 +500,8 @@ impl<'db, 'a> Iterator for FunctionIterator<'db, 'a> {
         let functions_start = self.db.header.functions_offset as usize;
         let function_offset = functions_start + 4 + (self.current * FUNCTION_SIZE);
 
-        let func_guid = FunctionGuid::from_digest(self.db.view.uuid_at(function_offset));
+        let func_guid =
+            FunctionGuid::from_digest(self.db.view.digest_at::<DbHash>(function_offset));
         self.current += 1;
 
         Some(func_guid)
@@ -512,9 +513,9 @@ mod tests {
     use super::*;
 
     fn test_db() -> Vec<u8> {
-        let func_guid = FunctionGuid::from_digest(Uuid::from_bytes([b'A'; 16]));
-        let constraint1 = ConstraintGuid::from_digest(Uuid::from_bytes([b'B'; 16]));
-        let constraint2 = ConstraintGuid::from_digest(Uuid::from_bytes([b'C'; 16]));
+        let func_guid = FunctionGuid::from_digest(0x4141_4141_4141_4141);
+        let constraint1 = ConstraintGuid::from_digest(0x4242_4242_4242_4242);
+        let constraint2 = ConstraintGuid::from_digest(0x4343_4343_4343_4343);
 
         let strings = vec![
             "test_value_1".to_string(),
@@ -540,9 +541,9 @@ mod tests {
 
     #[test]
     fn test_write_and_read() {
-        let func_guid = FunctionGuid::from_digest(Uuid::from_bytes([b'A'; 16]));
-        let constraint1 = ConstraintGuid::from_digest(Uuid::from_bytes([b'B'; 16]));
-        let constraint2 = ConstraintGuid::from_digest(Uuid::from_bytes([b'C'; 16]));
+        let func_guid = FunctionGuid::from_digest(0x4141_4141_4141_4141);
+        let constraint1 = ConstraintGuid::from_digest(0x4242_4242_4242_4242);
+        let constraint2 = ConstraintGuid::from_digest(0x4343_4343_4343_4343);
 
         let buffer = test_db();
 
@@ -564,8 +565,8 @@ mod tests {
 
     #[test]
     fn test_direct_constraint_iterator() {
-        let func_guid1 = FunctionGuid::from_digest(Uuid::from_bytes([b'A'; 16]));
-        let func_guid2 = FunctionGuid::from_digest(Uuid::from_bytes([b'D'; 16]));
+        let func_guid1 = FunctionGuid::from_digest(0x4141_4141_4141_4141);
+        let func_guid2 = FunctionGuid::from_digest(0x4444_4444_4444_4444);
 
         let buffer = test_db();
 
