@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use dashmap::DashMap;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use memmap2::Mmap;
 use object::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION;
@@ -9,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tracing::{debug, trace};
 
 // PE section characteristics
@@ -122,31 +123,34 @@ self_cell::self_cell!(
 
 #[derive(Default)]
 pub struct AnalysisCache {
-    cache: Arc<Mutex<HashMap<u64, Result<Arc<FunctionAnalysis>>>>>,
+    cache: DashMap<u64, Result<Arc<FunctionAnalysis>>>,
 }
 impl AnalysisCache {
     pub fn new(functions: impl IntoIterator<Item = FunctionAnalysis>) -> Self {
         Self {
-            cache: Arc::new(Mutex::new(
-                functions
-                    .into_iter()
-                    .map(|func| (func.entry_point, Ok(Arc::new(func))))
-                    .collect(),
-            )),
+            cache: functions
+                .into_iter()
+                .map(|func| (func.entry_point, Ok(Arc::new(func))))
+                .collect(),
         }
     }
     pub fn get(&self, address: u64, pe: &PeLoader) -> Result<Arc<FunctionAnalysis>> {
-        use std::collections::hash_map::Entry;
-        let mut lock = self.cache.lock().unwrap();
         fn map(res: &Result<Arc<FunctionAnalysis>>) -> Result<Arc<FunctionAnalysis>> {
             res.as_ref()
                 .map(|v| v.clone())
                 .map_err(|e| anyhow!("cache: {e:?}"))
         }
-        match lock.entry(address) {
-            Entry::Occupied(entry) => map(entry.get()),
-            Entry::Vacant(entry) => map(entry.insert(pe.analyze_function(address).map(Arc::new))),
+
+        if let Some(res) = self.cache.get(&address) {
+            return map(res.value());
         }
+
+        // Compute outside any shard lock so other threads aren't blocked on
+        // analyze_function. Concurrent first-callers may duplicate the work,
+        // but the result is the same and the dup is rare on a hot cache.
+        let result = pe.analyze_function(address).map(Arc::new);
+
+        map(self.cache.entry(address).or_insert(result).value())
     }
 }
 
