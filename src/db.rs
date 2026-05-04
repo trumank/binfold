@@ -1,7 +1,7 @@
 use crate::hash::{HashAlgo, XxHash64};
 use anyhow::{Result, bail};
 use byteorder::{LE, WriteBytesExt};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Seek, SeekFrom, Write};
 
@@ -271,19 +271,23 @@ impl<'a> Db<'a> {
     }
 }
 
+/// Flat triple-based writer.
+///
+/// Caller-provided invariants:
+/// - `function_guids` is sorted ascending by GUID (binary search at read time).
+/// - `triples` is sorted by `(func_id, constraint_id, symbol_id)`. Each tuple's
+///   `func_id` indexes into `function_guids`, `constraint_id` into
+///   `constraint_guids`, and `symbol_id` into `strings`.
+/// - Triples are deduplicated.
+/// - Every function in `function_guids` appears in at least one triple.
 pub struct DbWriter<'a> {
-    functions: &'a BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>,
-    strings: &'a Vec<String>,
+    pub strings: &'a [String],
+    pub constraint_guids: &'a [ConstraintGuid],
+    pub function_guids: &'a [FunctionGuid],
+    pub triples: &'a [(u32, u32, u32)],
 }
 
 impl<'a> DbWriter<'a> {
-    pub fn new(
-        functions: &'a BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>,
-        strings: &'a Vec<String>,
-    ) -> Self {
-        DbWriter { functions, strings }
-    }
-
     pub fn write<W: Write + Seek>(&self, writer: &mut W) -> io::Result<()> {
         // Write header with placeholder offsets
         writer.write_all(MAGIC)?;
@@ -294,82 +298,87 @@ impl<'a> DbWriter<'a> {
         writer.write_u64::<LE>(0)?; // function_constraints_offset placeholder
         writer.write_u64::<LE>(0)?; // functions_offset placeholder
 
-        // Write strings section and record offsets as we go
+        // Strings section
         let strings_offset = writer.stream_position()?;
         writer.write_u32::<LE>(self.strings.len().try_into().unwrap())?;
 
-        let mut string_offsets = Vec::with_capacity(self.strings.len());
-        let mut offset = 4;
+        let mut string_byte_offsets = Vec::with_capacity(self.strings.len());
+        let mut offset: u32 = 4;
         for string in self.strings {
-            string_offsets.push(offset);
+            string_byte_offsets.push(offset);
             writer.write_u32::<LE>(string.len().try_into().unwrap())?;
             writer.write_all(string.as_bytes())?;
             offset += 4 + string.len() as u32;
         }
 
-        // Write constraints section
+        // Constraints section: interner order, on-disk constraint_id == array index.
         let constraints_offset = writer.stream_position()?;
-        let mut constraints_map: HashMap<&ConstraintGuid, u32> = Default::default();
-        let mut constraints_vec: Vec<&ConstraintGuid> = Default::default();
-        for f in self.functions.values() {
-            for guid in f.keys() {
-                constraints_map.entry(guid).or_insert_with(|| {
-                    constraints_vec.push(guid);
-                    (constraints_vec.len() - 1).try_into().unwrap()
-                });
-            }
-        }
-        writer.write_u32::<LE>(constraints_vec.len().try_into().unwrap())?;
-        for guid in constraints_vec {
+        writer.write_u32::<LE>(self.constraint_guids.len().try_into().unwrap())?;
+        for guid in self.constraint_guids {
             writer.write_all(DbHash::digest_bytes(&guid.digest).as_ref())?;
         }
 
-        // Write constraint strings section
+        // Symbol references section: one u32 byte-offset per triple.
         let constraint_strings_offset = writer.stream_position()?;
-        let all_constraint_strings: usize = self
-            .functions
-            .values()
-            .map(|c| c.values().map(|s| s.len()).sum::<usize>())
-            .sum();
-        writer.write_u32::<LE>(all_constraint_strings.try_into().unwrap())?;
-        let mut constraint_string_indexes = vec![];
-        let mut index = 0;
-        for f in self.functions.values() {
-            for strings in f.values() {
-                constraint_string_indexes.push(index);
-                for string_idx in strings {
-                    writer.write_u32::<LE>(string_offsets[*string_idx as usize])?;
-                    index += 1;
+        writer.write_u32::<LE>(self.triples.len().try_into().unwrap())?;
+        for &(_f, _c, s) in self.triples {
+            writer.write_u32::<LE>(string_byte_offsets[s as usize])?;
+        }
+
+        // Function constraints section: one entry per distinct (func_id, constraint_id) run.
+        // Also accumulate per-function fc counts for the functions section.
+        let function_constraints_offset = writer.stream_position()?;
+        let mut fc_per_func: Vec<u32> = vec![0; self.function_guids.len()];
+        let fc_total_pos = writer.stream_position()?;
+        writer.write_u32::<LE>(0)?; // patched after we know the count
+
+        let mut fc_count: u32 = 0;
+        let mut group_start = 0usize;
+        let mut prev: Option<(u32, u32)> = None;
+        for (i, &(f, c, _)) in self.triples.iter().enumerate() {
+            match prev {
+                Some(p) if p == (f, c) => {}
+                Some((pf, pc)) => {
+                    let count = (i - group_start) as u32;
+                    writer.write_u32::<LE>(pc)?;
+                    writer.write_u32::<LE>(count)?;
+                    writer.write_u32::<LE>(group_start as u32)?;
+                    fc_per_func[pf as usize] += 1;
+                    fc_count += 1;
+                    group_start = i;
+                    prev = Some((f, c));
+                }
+                None => {
+                    group_start = i;
+                    prev = Some((f, c));
                 }
             }
         }
-
-        // Write function constraints section
-        let function_constraints_offset = writer.stream_position()?;
-        let all_constraints: usize = self.functions.values().map(|c| c.len()).sum();
-        writer.write_u32::<LE>(all_constraints.try_into().unwrap())?;
-        let mut constraint_index = 0;
-        for f in self.functions.values() {
-            for (guid, strings) in f {
-                writer.write_u32::<LE>(constraints_map[guid])?;
-                writer.write_u32::<LE>(strings.len().try_into().unwrap())?;
-                writer.write_u32::<LE>(constraint_string_indexes[constraint_index])?;
-                constraint_index += 1;
-            }
+        if let Some((pf, pc)) = prev {
+            let count = (self.triples.len() - group_start) as u32;
+            writer.write_u32::<LE>(pc)?;
+            writer.write_u32::<LE>(count)?;
+            writer.write_u32::<LE>(group_start as u32)?;
+            fc_per_func[pf as usize] += 1;
+            fc_count += 1;
         }
 
-        // Write functions section
+        // Functions section: sorted by GUID (caller responsibility).
         let functions_offset = writer.stream_position()?;
-        writer.write_u32::<LE>(self.functions.len().try_into().unwrap())?;
-        let mut constraint_index = 0;
-        for (func_guid, constraints) in self.functions {
-            writer.write_all(DbHash::digest_bytes(&func_guid.digest).as_ref())?;
-            writer.write_u32::<LE>(constraint_index)?;
-            writer.write_u32::<LE>(constraints.len().try_into().unwrap())?;
-            constraint_index += constraints.len() as u32;
+        writer.write_u32::<LE>(self.function_guids.len().try_into().unwrap())?;
+        let mut fc_idx: u32 = 0;
+        for (i, fg) in self.function_guids.iter().enumerate() {
+            writer.write_all(DbHash::digest_bytes(&fg.digest).as_ref())?;
+            writer.write_u32::<LE>(fc_idx)?;
+            writer.write_u32::<LE>(fc_per_func[i])?;
+            fc_idx += fc_per_func[i];
         }
 
-        // Go back and write the actual offsets
+        // Patch fc_count into function_constraints section header
+        writer.seek(SeekFrom::Start(fc_total_pos))?;
+        writer.write_u32::<LE>(fc_count)?;
+
+        // Patch header offsets
         writer.seek(SeekFrom::Start(8))?;
         writer.write_u64::<LE>(strings_offset)?;
         writer.write_u64::<LE>(constraints_offset)?;
@@ -522,15 +531,22 @@ mod tests {
             "test_value_2".to_string(),
             "test_value_3".to_string(),
         ];
+        let constraint_guids = vec![constraint1, constraint2];
+        let function_guids = vec![func_guid];
+        // (func_id, constraint_id, symbol_id) - sorted
+        let triples = vec![
+            (0, 0, 0), // constraint1 -> "test_value_1"
+            (0, 0, 2), // constraint1 -> "test_value_3"
+            (0, 1, 0), // constraint2 -> "test_value_1"
+            (0, 1, 1), // constraint2 -> "test_value_2"
+        ];
 
-        let mut constraints = HashMap::new();
-        constraints.insert(constraint1, HashSet::from([0, 2]));
-        constraints.insert(constraint2, HashSet::from([0, 1]));
-
-        let mut functions = BTreeMap::new();
-        functions.insert(func_guid, constraints);
-
-        let writer = DbWriter::new(&functions, &strings);
+        let writer = DbWriter {
+            strings: &strings,
+            constraint_guids: &constraint_guids,
+            function_guids: &function_guids,
+            triples: &triples,
+        };
 
         let mut buffer = vec![];
         writer

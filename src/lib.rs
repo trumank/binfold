@@ -4,11 +4,13 @@
 //! for function identification and database-driven symbol matching.
 
 use anyhow::Result;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use rustc_hash::FxBuildHasher;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 mod mmap_source;
 
@@ -501,27 +503,39 @@ impl DatabaseBuilder {
         let op = progress_reporter.sub_progress("Processing executables".into());
         op.initialize(self.exe_paths.len() as u64);
 
-        // Concurrent merge state. Producers merge directly - no channel, no
-        // dedicated merger thread. The DashMap shards by FunctionGuid so two
-        // producers only contend if they touch the same shard at the same time.
-        // String interning is one combined mutex (set + vec stay in lockstep).
+        // Concurrent merge state. Everything is a flat (func_id, constraint_id,
+        // symbol_id) triple in a single DashSet - incremental dedup with no
+        // per-(func, constraint) HashSet allocations. Func and constraint GUID
+        // interners assign u32 IDs via DashMap + AtomicU32. The string interner
+        // stays under one Mutex so the (vec, map) pair stays in lockstep.
         struct Interner {
             strings: Vec<String>,
-            string_to_index: HashMap<String, u64>,
+            string_to_index: HashMap<String, u32>,
         }
         let interner: Mutex<Interner> = Mutex::new(Interner {
             strings: Vec::new(),
             string_to_index: HashMap::new(),
         });
-        let constraint_to_names: DashMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>> =
-            DashMap::new();
+        let func_ids: DashMap<FunctionGuid, u32, FxBuildHasher> =
+            DashMap::with_hasher(FxBuildHasher);
+        let constraint_ids: DashMap<ConstraintGuid, u32, FxBuildHasher> =
+            DashMap::with_hasher(FxBuildHasher);
+        let func_counter = AtomicU32::new(0);
+        let constraint_counter = AtomicU32::new(0);
+        let triples: DashSet<(u32, u32, u32), FxBuildHasher> = DashSet::with_hasher(FxBuildHasher);
 
-        let intern = |name: String| -> u64 {
+        // Pre-intern the nil constraint so we can reference its ID without an
+        // extra atomic on the hot path.
+        let nil_constraint_id = *constraint_ids
+            .entry(ConstraintGuid::nil())
+            .or_insert_with(|| constraint_counter.fetch_add(1, Ordering::Relaxed));
+
+        let intern_string = |name: String| -> u32 {
             let mut i = interner.lock().unwrap();
             if let Some(&idx) = i.string_to_index.get(&name) {
                 return idx;
             }
-            let idx = i.strings.len() as u64;
+            let idx: u32 = i.strings.len().try_into().expect("symbol count > u32");
             i.string_to_index.insert(name.clone(), idx);
             i.strings.push(name);
             idx
@@ -529,15 +543,17 @@ impl DatabaseBuilder {
 
         let merge_func =
             |guid: FunctionGuid,
-             name_id: u64,
+             name_id: u32,
              constraint_guids: &mut dyn Iterator<Item = ConstraintGuid>| {
-                let mut entry = constraint_to_names.entry(guid).or_default();
-                let map = entry.value_mut();
-                map.entry(ConstraintGuid::nil())
-                    .or_default()
-                    .insert(name_id);
+                let func_id = *func_ids
+                    .entry(guid)
+                    .or_insert_with(|| func_counter.fetch_add(1, Ordering::Relaxed));
+                triples.insert((func_id, nil_constraint_id, name_id));
                 for cg in constraint_guids {
-                    map.entry(cg).or_default().insert(name_id);
+                    let c_id = *constraint_ids
+                        .entry(cg)
+                        .or_insert_with(|| constraint_counter.fetch_add(1, Ordering::Relaxed));
+                    triples.insert((func_id, c_id, name_id));
                 }
             };
 
@@ -562,7 +578,7 @@ impl DatabaseBuilder {
                 analyzer.process_function_guids_with_progress(
                     Some(sub_progress),
                     |f: pdb_analyzer::FunctionInfo| {
-                        let name_id = intern(f.name);
+                        let name_id = intern_string(f.name);
                         merge_func(
                             f.guid,
                             name_id,
@@ -597,23 +613,72 @@ impl DatabaseBuilder {
         op.finish();
 
         let strings = interner.into_inner().unwrap().strings;
-        let constraint_map: BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>> =
-            constraint_to_names.into_iter().collect();
 
-        let unique_constraints: usize = constraint_map
-            .values()
-            .map(|c| c.values().filter(|n| n.len() == 1).count())
-            .sum();
+        // Build constraint_guids[]: indexed by interner-assigned ID.
+        let constraint_count = constraint_counter.load(Ordering::Relaxed) as usize;
+        let mut constraint_guids = vec![ConstraintGuid::nil(); constraint_count];
+        for entry in constraint_ids.iter() {
+            constraint_guids[*entry.value() as usize] = *entry.key();
+        }
+        drop(constraint_ids);
+
+        // Build function_guids[] sorted by GUID, plus a remap table from
+        // interner ID -> sorted index.
+        let func_count = func_counter.load(Ordering::Relaxed) as usize;
+        let mut func_pairs: Vec<(FunctionGuid, u32)> =
+            func_ids.iter().map(|e| (*e.key(), *e.value())).collect();
+        drop(func_ids);
+        func_pairs.sort_unstable_by_key(|&(g, _)| g);
+        let mut func_remap = vec![0u32; func_count];
+        for (new_id, &(_, old_id)) in func_pairs.iter().enumerate() {
+            func_remap[old_id as usize] = new_id as u32;
+        }
+        let function_guids: Vec<FunctionGuid> = func_pairs.into_iter().map(|(g, _)| g).collect();
+
+        // Drain triples into a flat Vec, remap func_ids, and sort.
+        let mut triples_vec: Vec<(u32, u32, u32)> = triples.into_iter().collect();
+        for t in &mut triples_vec {
+            t.0 = func_remap[t.0 as usize];
+        }
+        drop(func_remap);
+        triples_vec.par_sort_unstable();
+
+        // Count (func, constraint) pairs whose symbol set is exactly one - a
+        // group of identical (f, c) prefix-tuples of length 1 in the sorted
+        // triples.
+        let unique_constraints: usize = {
+            let mut count = 0usize;
+            let mut i = 0;
+            while i < triples_vec.len() {
+                let (f, c, _) = triples_vec[i];
+                let mut j = i + 1;
+                while j < triples_vec.len() && triples_vec[j].0 == f && triples_vec[j].1 == c {
+                    j += 1;
+                }
+                if j - i == 1 {
+                    count += 1;
+                }
+                i = j;
+            }
+            count
+        };
+
+        let total_functions = function_guids.len();
 
         {
             let file = fs::File::create(output_path.as_ref())?;
             let mut writer = BufWriter::new(file);
-            let db_writer = DbWriter::new(&constraint_map, &strings);
+            let db_writer = DbWriter {
+                strings: &strings,
+                constraint_guids: &constraint_guids,
+                function_guids: &function_guids,
+                triples: &triples_vec,
+            };
             db_writer.write(&mut writer)?;
         }
 
         Ok(DatabaseStats {
-            total_functions: constraint_map.len(),
+            total_functions,
             unique_constraints,
             processed_files: self.exe_paths.len(),
         })
