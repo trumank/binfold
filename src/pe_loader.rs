@@ -2,9 +2,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use dashmap::DashMap;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use memmap2::Mmap;
-use object::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION;
-use object::read::pe::ImageNtHeaders;
-use object::{File, Object, ObjectSection};
+use object::pe::{IMAGE_DIRECTORY_ENTRY_EXCEPTION, ImageNtHeaders64};
+use object::read::pe::{ImageNtHeaders, Import, PeFile64};
+use object::{File, LittleEndian as LE, Object, ObjectSection};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self};
@@ -827,6 +827,190 @@ impl PeLoader {
         }
 
         Ok(result)
+    }
+
+    /// Parse the PE import table into `iat_slot_va -> api_name`. The VA
+    /// points at the *runtime* IAT slot (FirstThunk), which is what a
+    /// `call [rip+X]` or `jmp [rip+X]` through that import resolves to.
+    ///
+    /// Only supports PE64 today; PE32 returns an empty map.
+    pub fn iat(&self) -> Result<HashMap<u64, String>> {
+        let mut iat: HashMap<u64, String> = HashMap::new();
+
+        let file_data = self.file.borrow_owner();
+        let Ok(pe) = PeFile64::parse(&file_data[..]) else {
+            return Ok(iat);
+        };
+        let Some(table) = pe.import_table()? else {
+            return Ok(iat);
+        };
+
+        let image_base = self.image_base();
+        // PE64 thunk entries are 8 bytes (IMAGE_THUNK_DATA64 is a u64).
+        const THUNK_SIZE: u32 = 8;
+
+        let mut descs = table.descriptors()?;
+        while let Some(desc) = descs.next()? {
+            // Prefer OriginalFirstThunk (the name-table, never patched at
+            // runtime); fall back to FirstThunk when OFT isn't set.
+            let oft = desc.original_first_thunk.get(LE);
+            let ft = desc.first_thunk.get(LE);
+            let name_rva = if oft != 0 { oft } else { ft };
+
+            let mut thunks = table.thunks(name_rva)?;
+            let mut slot_rva = ft;
+            while let Some(thunk) = thunks.next::<ImageNtHeaders64>()? {
+                let name = match table.import::<ImageNtHeaders64>(thunk)? {
+                    Import::Ordinal(n) => format!("ord_{}", n),
+                    Import::Name(_hint, bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                };
+                iat.insert(image_base + slot_rva as u64, name);
+                slot_rva += THUNK_SIZE;
+            }
+        }
+        Ok(iat)
+    }
+
+    /// If the function at `va` is a 6-byte import thunk of the shape
+    /// `jmp [rip+disp32]` whose target is a slot in `iat`, return the
+    /// imported API name.
+    pub fn thunk_import(&self, va: u64, iat: &HashMap<u64, String>) -> Option<String> {
+        let bytes = self.read_at_va(va, 6).ok()?;
+        // Opcode FF 25 is `jmp qword ptr [rip+disp32]`.
+        if bytes[0] != 0xff || bytes[1] != 0x25 {
+            return None;
+        }
+        let disp = i32::from_le_bytes(bytes[2..6].try_into().ok()?) as i64;
+        let target = va.wrapping_add(6).wrapping_add(disp as u64);
+        iat.get(&target).cloned()
+    }
+}
+
+/// A directed CFG edge between two basic-block start addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CfgEdge {
+    pub from: u64,
+    pub to: u64,
+    pub kind: EdgeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EdgeKind {
+    /// Fall-through to the instruction after a non-branch / conditional-branch / call terminator.
+    Fallthrough,
+    /// Taken edge of a conditional or unconditional branch.
+    Taken,
+}
+
+impl FunctionAnalysis {
+    /// Decode each basic block's terminator and enumerate CFG edges to
+    /// other blocks in the same function. Indirect branches contribute no
+    /// edges (target unknown); returns land with no edges either.
+    pub fn cfg_edges(&self, pe: &PeLoader) -> Result<Vec<CfgEdge>> {
+        let base = self.entry_point;
+        let bytes = pe.read_at_va(base, self.size)?;
+
+        let mut edges = Vec::new();
+        for (&start, &end) in &self.basic_blocks {
+            let off = (start - base) as usize;
+            let end_off = (end - base) as usize;
+            if end_off > bytes.len() {
+                continue;
+            }
+            let slice = &bytes[off..end_off];
+            let mut decoder = Decoder::with_ip(pe.bitness(), slice, start, DecoderOptions::NONE);
+            let mut last: Option<Instruction> = None;
+            while decoder.can_decode() {
+                last = Some(decoder.decode());
+            }
+            let Some(insn) = last else { continue };
+            let fall = end;
+            let taken = get_branch_target(&insn);
+
+            match insn.flow_control() {
+                FlowControl::UnconditionalBranch => {
+                    if let Some(t) = taken
+                        && self.basic_blocks.contains_key(&t)
+                    {
+                        edges.push(CfgEdge {
+                            from: start,
+                            to: t,
+                            kind: EdgeKind::Taken,
+                        });
+                    }
+                }
+                FlowControl::ConditionalBranch => {
+                    if let Some(t) = taken
+                        && self.basic_blocks.contains_key(&t)
+                    {
+                        edges.push(CfgEdge {
+                            from: start,
+                            to: t,
+                            kind: EdgeKind::Taken,
+                        });
+                    }
+                    if self.basic_blocks.contains_key(&fall) {
+                        edges.push(CfgEdge {
+                            from: start,
+                            to: fall,
+                            kind: EdgeKind::Fallthrough,
+                        });
+                    }
+                }
+                // Return / IndirectBranch / Exception (int3, ud2, ...) don't
+                // fall through; their successors are unreachable from this
+                // block and contribute no edges.
+                FlowControl::Return | FlowControl::IndirectBranch | FlowControl::Exception => {}
+                // Next / Call / IndirectCall / XbeginXabortXend: control reaches
+                // the next instruction in the block (calls return; xbegin
+                // continues into the transactional region).
+                _ => {
+                    if self.basic_blocks.contains_key(&fall) {
+                        edges.push(CfgEdge {
+                            from: start,
+                            to: fall,
+                            kind: EdgeKind::Fallthrough,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(edges)
+    }
+
+    /// Count back-edges (edge `(u, v)` where `v` is an ancestor of `u` in
+    /// the DFS tree rooted at the function's entry point). This is the
+    /// standard "loops in the CFG" metric.
+    pub fn count_back_edges(&self, edges: &[CfgEdge]) -> usize {
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        for e in edges {
+            adj.entry(e.from).or_default().push(e.to);
+        }
+        let mut back = 0usize;
+        let mut color: HashMap<u64, u8> = HashMap::new(); // 0 white 1 gray 2 black
+        let mut stack: Vec<(u64, usize)> = vec![(self.entry_point, 0)];
+        color.insert(self.entry_point, 1);
+        while let Some(&(node, idx)) = stack.last() {
+            let next = adj.get(&node).and_then(|v| v.get(idx)).copied();
+            match next {
+                Some(child) => {
+                    stack.last_mut().unwrap().1 += 1;
+                    match color.get(&child).copied().unwrap_or(0) {
+                        0 => {
+                            color.insert(child, 1);
+                            stack.push((child, 0));
+                        }
+                        1 => back += 1,
+                        _ => {}
+                    }
+                }
+                None => {
+                    color.insert(node, 2);
+                    stack.pop();
+                }
+            }
+        }
+        back
     }
 }
 
