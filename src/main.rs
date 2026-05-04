@@ -31,6 +31,10 @@ struct CommandGenDb {
     /// Output path for database
     #[arg(short = 'd', long = "database", required = true)]
     database: PathBuf,
+
+    /// Cap on binaries loaded into memory simultaneously.
+    #[arg(long)]
+    parallel: Option<usize>,
 }
 
 /// Analyze an exe and optionally create a PDB
@@ -111,6 +115,7 @@ fn command_gen_db(
     CommandGenDb {
         exe: exe_paths,
         database,
+        parallel,
     }: CommandGenDb,
 ) -> Result<()> {
     let multi_progress = indicatif::MultiProgress::new();
@@ -118,6 +123,9 @@ fn command_gen_db(
         IndicatifProgressBar::new("Database generation", Some(multi_progress.clone()));
 
     let mut builder = DatabaseBuilder::new();
+    if let Some(p) = parallel {
+        builder.parallel(p);
+    }
 
     for path in exe_paths {
         if path.is_dir() {

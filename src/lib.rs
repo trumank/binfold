@@ -423,13 +423,27 @@ impl BinfoldAnalyzer {
 /// Builder for creating function databases
 pub struct DatabaseBuilder {
     exe_paths: Vec<PathBuf>,
+    parallel: usize,
 }
 
 impl DatabaseBuilder {
     pub fn new() -> Self {
         Self {
             exe_paths: Vec::new(),
+            parallel: std::thread::available_parallelism()
+                .map(|n| n.get() / 2)
+                .unwrap_or(1)
+                .max(1),
         }
+    }
+
+    /// Cap on the number of executables loaded into memory simultaneously
+    /// during gen-db. Each in-flight producer holds an mmap'd exe + PDB plus a
+    /// working `HashMap<u64, FunctionInfo>`, so this is the main knob for peak
+    /// memory.
+    pub fn parallel(&mut self, n: usize) -> &mut Self {
+        self.parallel = n.max(1);
+        self
     }
 
     pub fn add_executable<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
@@ -527,7 +541,11 @@ impl DatabaseBuilder {
                 }
             };
 
-        let process = |exe_path: &PathBuf| -> Result<()> {
+        let exe_paths = &self.exe_paths;
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let op_ref = &op;
+
+        let process = |exe_path: &PathBuf| {
             let pdb_path_for_exe = exe_path.with_extension("pdb");
 
             let result = (|| -> Result<()> {
@@ -536,7 +554,7 @@ impl DatabaseBuilder {
                     .file_name()
                     .map(|n| n.to_string_lossy())
                     .unwrap_or_else(|| "<unknown>".into());
-                let sub_progress = op.sub_progress(format!("Processing {}", exe_name).into());
+                let sub_progress = op_ref.sub_progress(format!("Processing {}", exe_name).into());
 
                 // Stream each FunctionInfo straight into the merge - never
                 // materializes a full Vec, so producer peak is just the
@@ -559,13 +577,23 @@ impl DatabaseBuilder {
                 eprintln!("Error processing {}: {}", exe_path.display(), e);
             }
 
-            op.progress();
-            Ok(())
+            op_ref.progress();
         };
 
-        // Process executables using parallel processing like main.rs
-        self.exe_paths.par_iter().try_for_each(process)?;
-
+        let parallel = self.parallel.min(exe_paths.len());
+        rayon::scope(|s| {
+            for _ in 0..parallel {
+                s.spawn(|_| {
+                    loop {
+                        let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= exe_paths.len() {
+                            break;
+                        }
+                        process(&exe_paths[i]);
+                    }
+                });
+            }
+        });
         op.finish();
 
         let strings = interner.into_inner().unwrap().strings;
