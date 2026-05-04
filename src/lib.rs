@@ -4,10 +4,11 @@
 //! for function identification and database-driven symbol matching.
 
 use anyhow::Result;
+use dashmap::DashMap;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 mod mmap_source;
 
@@ -483,81 +484,79 @@ impl DatabaseBuilder {
             anyhow::bail!("No EXE files specified");
         }
 
-        // Create string cache for fast lookups
-        let strings: Vec<String> = Vec::new();
-        let string_to_index: HashMap<String, u64> = HashMap::new();
-
-        // Wrap in Arc<Mutex> for thread-safe access
-        let strings = Arc::new(Mutex::new(strings));
-        let string_to_index = Arc::new(Mutex::new(string_to_index));
-
-        // Shared data structure for building unique constraints
-        let constraint_to_names: Arc<
-            Mutex<BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>>>,
-        > = Default::default();
-
-        let constraint_to_names_clone = constraint_to_names.clone();
         let op = progress_reporter.sub_progress("Processing executables".into());
         op.initialize(self.exe_paths.len() as u64);
+
+        // Concurrent merge state. Producers merge directly - no channel, no
+        // dedicated merger thread. The DashMap shards by FunctionGuid so two
+        // producers only contend if they touch the same shard at the same time.
+        // String interning is one combined mutex (set + vec stay in lockstep).
+        struct Interner {
+            strings: Vec<String>,
+            string_to_index: HashMap<String, u64>,
+        }
+        let interner: Mutex<Interner> = Mutex::new(Interner {
+            strings: Vec::new(),
+            string_to_index: HashMap::new(),
+        });
+        let constraint_to_names: DashMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>> =
+            DashMap::new();
+
+        let intern = |name: String| -> u64 {
+            let mut i = interner.lock().unwrap();
+            if let Some(&idx) = i.string_to_index.get(&name) {
+                return idx;
+            }
+            let idx = i.strings.len() as u64;
+            i.string_to_index.insert(name.clone(), idx);
+            i.strings.push(name);
+            idx
+        };
+
+        let merge_func =
+            |guid: FunctionGuid,
+             name_id: u64,
+             constraint_guids: &mut dyn Iterator<Item = ConstraintGuid>| {
+                let mut entry = constraint_to_names.entry(guid).or_default();
+                let map = entry.value_mut();
+                map.entry(ConstraintGuid::nil())
+                    .or_default()
+                    .insert(name_id);
+                for cg in constraint_guids {
+                    map.entry(cg).or_default().insert(name_id);
+                }
+            };
 
         let process = |exe_path: &PathBuf| -> Result<()> {
             let pdb_path_for_exe = exe_path.with_extension("pdb");
 
             let result = (|| -> Result<()> {
                 let mut analyzer = PdbAnalyzer::new(exe_path, &pdb_path_for_exe)?;
-                // Create a sub-operation for this specific executable
                 let exe_name = exe_path
                     .file_name()
                     .map(|n| n.to_string_lossy())
                     .unwrap_or_else(|| "<unknown>".into());
                 let sub_progress = op.sub_progress(format!("Processing {}", exe_name).into());
-                let function_guids =
-                    analyzer.compute_function_guids_with_progress(Some(sub_progress))?;
 
-                let get_or_insert_string = |strings: &mut Vec<String>,
-                                            string_to_index: &mut HashMap<String, u64>,
-                                            value: &str|
-                 -> u64 {
-                    if let Some(&idx) = string_to_index.get(value) {
-                        return idx;
-                    }
-
-                    let idx = strings.len() as u64;
-                    strings.push(value.to_string());
-                    string_to_index.insert(value.to_string(), idx);
-                    idx
-                };
-
-                {
-                    let mut strings = strings.lock().unwrap();
-                    let mut string_to_index = string_to_index.lock().unwrap();
-
-                    function_guids.iter().for_each(|func| {
-                        let function_name_id =
-                            get_or_insert_string(&mut strings, &mut string_to_index, &func.name);
-
-                        let mut constraint_map = constraint_to_names_clone.lock().unwrap();
-                        for constraint in [ConstraintGuid::nil()]
-                            .into_iter()
-                            .chain(func.constraints.iter().map(|c| c.guid))
-                        {
-                            constraint_map
-                                .entry(func.guid)
-                                .or_default()
-                                .entry(constraint)
-                                .or_default()
-                                .insert(function_name_id);
-                        }
-                    });
-                }
+                // Stream each FunctionInfo straight into the merge - never
+                // materializes a full Vec, so producer peak is just the
+                // analyzer's working HashMap.
+                analyzer.process_function_guids_with_progress(
+                    Some(sub_progress),
+                    |f: pdb_analyzer::FunctionInfo| {
+                        let name_id = intern(f.name);
+                        merge_func(
+                            f.guid,
+                            name_id,
+                            &mut f.constraints.into_iter().map(|c| c.guid),
+                        );
+                    },
+                )?;
                 Ok(())
             })();
 
-            match result {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("Error processing {}: {}", exe_path.display(), e);
-                }
+            if let Err(e) = result {
+                eprintln!("Error processing {}: {}", exe_path.display(), e);
             }
 
             op.progress();
@@ -569,16 +568,14 @@ impl DatabaseBuilder {
 
         op.finish();
 
-        // Process unique constraints
-        let constraint_map = constraint_to_names.lock().unwrap();
+        let strings = interner.into_inner().unwrap().strings;
+        let constraint_map: BTreeMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<u64>>> =
+            constraint_to_names.into_iter().collect();
 
         let unique_constraints: usize = constraint_map
             .values()
             .map(|c| c.values().filter(|n| n.len() == 1).count())
             .sum();
-
-        // Build the binary database structure
-        let strings = Arc::try_unwrap(strings).unwrap().into_inner().unwrap();
 
         {
             let file = fs::File::create(output_path.as_ref())?;

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::db::{ConstraintGuid, DbHash, FunctionGuid, SymbolGuid};
 use crate::mmap_source::MmapSource;
-use crate::pe_loader::{FunctionCall, PeLoader};
+use crate::pe_loader::PeLoader;
 use crate::warp::{Constraint, compute_function_guid_with_contraints};
 use crate::{AnalysisCache, NoOpProgressReporter, ProgressReporter};
 
@@ -22,7 +22,6 @@ pub struct FunctionInfo {
     pub size: Option<u32>,
     pub guid: FunctionGuid,
     pub constraints: Vec<Constraint<DbHash>>,
-    pub calls: Vec<FunctionCall>,
 }
 
 #[derive(Clone)]
@@ -46,13 +45,35 @@ impl PdbAnalyzer {
     }
 
     pub fn compute_function_guids(&mut self) -> Result<Vec<FunctionInfo>> {
-        self.compute_function_guids_with_progress::<NoOpProgressReporter>(None)
+        let mut out = Vec::new();
+        self.process_function_guids_with_progress::<NoOpProgressReporter, _>(None, |f| {
+            out.push(f)
+        })?;
+        Ok(out)
     }
 
     pub fn compute_function_guids_with_progress<P: ProgressReporter>(
         &mut self,
         progress_reporter: Option<P>,
     ) -> Result<Vec<FunctionInfo>> {
+        let mut out = Vec::new();
+        self.process_function_guids_with_progress(progress_reporter, |f| out.push(f))?;
+        Ok(out)
+    }
+
+    /// Run the full GUID + constraint pipeline and stream each FunctionInfo to
+    /// `emit` as it's finalized. Avoids holding both the working HashMap and a
+    /// returned Vec at peak - caller-side merging happens in lockstep so each
+    /// FunctionInfo is dropped right after it's consumed.
+    pub fn process_function_guids_with_progress<P, F>(
+        &mut self,
+        progress_reporter: Option<P>,
+        mut emit: F,
+    ) -> Result<()>
+    where
+        P: ProgressReporter,
+        F: FnMut(FunctionInfo),
+    {
         let address_map = self.pdb.address_map()?;
         let image_base = self.pe_loader.image_base();
 
@@ -126,7 +147,10 @@ impl PdbAnalyzer {
             reporter.initialize(binned_procs.len() as u64);
         }
 
-        // Process procedures in parallel
+        // Process procedures in parallel.
+        // FunctionInfo no longer carries `calls` - the constraint pass below
+        // reads them straight from the AnalysisCache, avoiding a per-function
+        // clone of the call list (which was a large chunk of producer heap).
         // TODO figure out how to handle multiple names for single address
         // TODO this processes each individual symbol and can do a lot of duplicate work if they share same address
         let mut functions: HashMap<u64, FunctionInfo> = binned_procs
@@ -134,8 +158,6 @@ impl PdbAnalyzer {
             .map(|(&address, procs)| -> Result<_> {
                 // TODO figure out what to do with the rest
                 let proc = procs[0];
-
-                let size = self.pe_loader.analyze_function(address)?.size;
 
                 let func = compute_function_guid_with_contraints::<DbHash>(
                     &self.pe_loader,
@@ -153,10 +175,9 @@ impl PdbAnalyzer {
                 let func_info = FunctionInfo {
                     name,
                     address,
-                    size: Some(size as u32),
+                    size: Some(analysis.size as u32),
                     guid: func.guid,
                     constraints: func.constraints,
-                    calls: analysis.calls.clone(),
                 };
 
                 if let Some(reporter) = &progress_reporter {
@@ -174,35 +195,29 @@ impl PdbAnalyzer {
         // TODO analyze and calls to functions that have not already been found?
         // FIXME actually omitting calls leaves room for false positives so really should be fixed
 
-        // Build a map of who calls whom for parent constraints
+        // Build a map of who calls whom for parent constraints (via cache).
         let mut callers: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
-        for (caller_address, info) in &functions {
-            for call in &info.calls {
+        for &caller_address in functions.keys() {
+            let analysis = cache.get(caller_address, &self.pe_loader).unwrap();
+            for call in &analysis.calls {
                 callers
                     .entry(call.target)
                     .or_default()
-                    .push((*caller_address, (call.address - *caller_address)));
+                    .push((caller_address, call.address - caller_address));
             }
         }
 
-        // TODO figure out if/why hashing is so slow (sha1_smol crate?) and cache/optimize
         let constraints: Vec<_> = functions
             .par_iter()
-            .map(|(address, info)| {
+            .map(|(address, _info)| {
                 let mut constraints = Vec::new();
+                let analysis = cache.get(*address, &self.pe_loader).unwrap();
 
-                // Add child call constraints (both function-based and symbol-based)
-                for call in &info.calls {
+                // Add child call constraints (symbol-based)
+                for call in &analysis.calls {
                     if let Some(target_fn) = functions.get(&call.target) {
                         let offset = Some((call.address - address) as i64);
-                        // Function-based child constraint
-                        // (already exists from warp analysis)
-                        // constraints.push(Constraint {
-                        //     guid: ConstraintGuid::from_child_call(target_fn.guid),
-                        //     offset,
-                        // });
-
-                        // Symbol-based child constraint
+                        // Function-based child constraint already exists from warp analysis.
                         let target_symbol = SymbolGuid::from_symbol(&target_fn.name);
                         constraints.push(Constraint {
                             guid: ConstraintGuid::from_symbol_child_call(target_symbol),
@@ -211,18 +226,15 @@ impl PdbAnalyzer {
                     }
                 }
 
-                // Add parent call constraints (both function-based and symbol-based)
+                // Add parent call constraints (function-based and symbol-based)
                 if let Some(parent_calls) = callers.get(address) {
                     for (parent_addr, offset) in parent_calls {
                         if let Some(parent_fn) = functions.get(parent_addr) {
                             let offset = Some(*offset as i64);
-                            // Function-based parent constraint
                             constraints.push(Constraint {
                                 guid: ConstraintGuid::from_parent_call(parent_fn.guid),
                                 offset,
                             });
-
-                            // Symbol-based parent constraint
                             let parent_symbol = SymbolGuid::from_symbol(&parent_fn.name);
                             constraints.push(Constraint {
                                 guid: ConstraintGuid::from_symbol_parent_call(parent_symbol),
@@ -234,15 +246,23 @@ impl PdbAnalyzer {
                 (*address, constraints)
             })
             .collect();
-        for (address, constraints) in constraints {
-            functions
-                .get_mut(&address)
-                .unwrap()
-                .constraints
-                .extend(constraints);
+
+        // Cache + callers map are no longer needed; drop before the emit phase
+        // so their heap (and the cache's Arc<FunctionAnalysis>s) is freed.
+        drop(cache);
+        drop(callers);
+
+        for (address, c) in constraints {
+            functions.get_mut(&address).unwrap().constraints.extend(c);
         }
 
-        Ok(functions.into_values().collect())
+        // Stream each FunctionInfo out so the caller can merge and drop it
+        // before the next entry is produced. Avoids the duplicate Vec peak.
+        for (_, info) in functions {
+            emit(info);
+        }
+
+        Ok(())
     }
 }
 
