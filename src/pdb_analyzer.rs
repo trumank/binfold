@@ -33,8 +33,10 @@ struct ProcedureData {
 
 impl PdbAnalyzer {
     pub fn new(exe_path: &Path, pdb_path: &Path) -> Result<Self> {
-        let pe_loader = PeLoader::load(exe_path)?;
+        Self::from_pe_loader(PeLoader::load(exe_path)?, pdb_path)
+    }
 
+    pub fn from_pe_loader(pe_loader: PeLoader, pdb_path: &Path) -> Result<Self> {
         let mmap_source = MmapSource::new(pdb_path)
             .with_context(|| format!("Failed to memory-map PDB file: {pdb_path:?}"))?;
 

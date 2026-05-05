@@ -29,7 +29,9 @@ pub use uuid::Uuid;
 // Re-export progress types
 pub use progress::{NoOpProgressReporter, ProgressReporter, default_progress_style};
 
-use crate::db::{ConstraintGuid, Db, DbHash, DbWriter, FunctionGuid, StringRef, SymbolGuid};
+use crate::db::{
+    BinaryGuid, ConstraintGuid, Db, DbHash, FunctionGuid, Layer, StringRef, SymbolGuid,
+};
 use crate::pdb_analyzer::PdbAnalyzer;
 use crate::pdb_writer::{extract_pdb_info, generate_pdb};
 use crate::pe_loader::{AnalysisCache, PeLoader};
@@ -259,14 +261,15 @@ impl BinfoldAnalyzer {
         > = function_guids
             .par_iter()
             .map(|guid| {
-                let result = (
-                    *guid,
-                    db.iter_constraints(guid)
-                        .map(|c| (*c.guid(), c.iter_symbols().collect()))
-                        .collect(),
-                );
+                let mut by_constraint: HashMap<ConstraintGuid, HashSet<StringRef>> = HashMap::new();
+                for c in db.iter_constraints(guid) {
+                    by_constraint
+                        .entry(*c.guid())
+                        .or_default()
+                        .extend(c.iter_symbols());
+                }
                 load_progress.progress();
-                result
+                (*guid, by_constraint)
             })
             .collect();
         load_progress.finish();
@@ -489,6 +492,19 @@ impl DatabaseBuilder {
             anyhow::bail!("No EXE files specified");
         }
 
+        // Append a new layer if a database already exists at the output path;
+        // otherwise create a fresh one. Snapshot the existing DB's known
+        // binary hashes so workers can skip anything already present.
+        let (append, known_binaries): (bool, HashSet<BinaryGuid>) =
+            match fs::File::open(output_path.as_ref()) {
+                Ok(existing_file) => {
+                    let mmap = unsafe { memmap2::MmapOptions::new().map(&existing_file)? };
+                    (true, Db::new(&mmap)?.all_binaries())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, HashSet::new()),
+                Err(e) => return Err(e.into()),
+            };
+
         let op = progress_reporter.sub_progress("Processing executables".into());
         op.initialize(self.exe_paths.len() as u64);
 
@@ -547,14 +563,24 @@ impl DatabaseBuilder {
             };
 
         let exe_paths = &self.exe_paths;
+        let known_binaries_ref = &known_binaries;
         let cursor = std::sync::atomic::AtomicUsize::new(0);
         let op_ref = &op;
+        let processed_binaries: Mutex<Vec<BinaryGuid>> = Mutex::new(Vec::new());
+        let processed_binaries_ref = &processed_binaries;
 
         let process = |exe_path: &PathBuf| {
             let pdb_path_for_exe = exe_path.with_extension("pdb");
 
-            let result = (|| -> Result<()> {
-                let mut analyzer = PdbAnalyzer::new(exe_path, &pdb_path_for_exe)?;
+            let result = (|| -> Result<Option<BinaryGuid>> {
+                // Hash from the same mmap PdbAnalyzer will use - both the hash
+                // and PE parse share one disk read.
+                let pe = PeLoader::load(exe_path)?;
+                let guid = BinaryGuid::from_bytes(pe.raw_bytes());
+                if known_binaries_ref.contains(&guid) {
+                    return Ok(None);
+                }
+                let mut analyzer = PdbAnalyzer::from_pe_loader(pe, &pdb_path_for_exe)?;
                 let exe_name = exe_path
                     .file_name()
                     .map(|n| n.to_string_lossy())
@@ -575,11 +601,13 @@ impl DatabaseBuilder {
                         );
                     },
                 )?;
-                Ok(())
+                Ok(Some(guid))
             })();
 
-            if let Err(e) = result {
-                eprintln!("Error processing {}: {}", exe_path.display(), e);
+            match result {
+                Ok(Some(guid)) => processed_binaries_ref.lock().unwrap().push(guid),
+                Ok(None) => {}
+                Err(e) => eprintln!("Error processing {}: {}", exe_path.display(), e),
             }
 
             op_ref.progress();
@@ -600,6 +628,8 @@ impl DatabaseBuilder {
             }
         });
         op.finish();
+        let mut processed_binaries = processed_binaries.into_inner().unwrap();
+        processed_binaries.sort_unstable();
 
         let strings = interner.into_inner().unwrap().strings;
 
@@ -655,21 +685,30 @@ impl DatabaseBuilder {
         let total_functions = function_guids.len();
 
         {
-            let file = fs::File::create(output_path.as_ref())?;
-            let mut writer = BufWriter::new(file);
-            let db_writer = DbWriter {
+            let layer = Layer {
                 strings: &strings,
                 constraint_guids: &constraint_guids,
                 function_guids: &function_guids,
                 triples: &triples_vec,
+                binaries: &processed_binaries,
             };
-            db_writer.write(&mut writer)?;
+            if append {
+                let mut file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(output_path.as_ref())?;
+                db::append_layer(&mut file, &layer)?;
+            } else {
+                let file = fs::File::create(output_path.as_ref())?;
+                let mut writer = BufWriter::new(file);
+                db::write_database(&[&layer], &mut writer)?;
+            }
         }
 
         Ok(DatabaseStats {
             total_functions,
             unique_constraints,
-            processed_files: self.exe_paths.len(),
+            processed_files: processed_binaries.len(),
         })
     }
 }

@@ -244,7 +244,9 @@ fn command_dump_db(
     let functions: Box<dyn Iterator<Item = FunctionGuid>> = if let Some(function) = function {
         Box::new(std::iter::once(FunctionGuid::from_digest(function)))
     } else {
-        Box::new(db.iter_functions())
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<FunctionGuid> = db.iter_functions().filter(|g| seen.insert(*g)).collect();
+        Box::new(unique.into_iter())
     };
 
     // Stream functions one at a time
@@ -298,16 +300,6 @@ fn command_db_info(CommandDbInfo { database }: CommandDbInfo) -> Result<()> {
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
     let db = Db::new(&mmap)?;
 
-    let header = db.header();
-
-    // Calculate section sizes
-    let header_size = header.strings_offset;
-    let strings_size = header.constraints_offset - header.strings_offset;
-    let constraints_size = header.constraint_strings_offset - header.constraints_offset;
-    let symbol_refs_size = header.function_constraints_offset - header.constraint_strings_offset;
-    let func_constraints_size = header.functions_offset - header.function_constraints_offset;
-    let functions_size = db.data_len() as u64 - header.functions_offset;
-
     fn format_size(bytes: u64) -> String {
         if bytes >= 1024 * 1024 {
             format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
@@ -320,62 +312,85 @@ fn command_db_info(CommandDbInfo { database }: CommandDbInfo) -> Result<()> {
 
     println!("Database: {}", database.display());
     println!("Total size: {}", format_size(metadata.len()));
-    println!();
-    println!(
-        "{:<22} {:>12} {:>12}  {:<14} Type",
-        "Section", "Count", "Size", "Offset"
-    );
-    println!("{}", "-".repeat(78));
+    println!("Layers: {}", db.layers().len());
 
-    let sections: &[(&str, Option<usize>, u64, u64, &str)] = &[
-        ("Header", None, header_size, 0, "magic[7] + u8 + u64[5]"),
-        (
-            "Strings",
-            Some(db.strings_count()),
-            strings_size,
-            header.strings_offset,
-            "u32 + (u32 + u8[])[]",
-        ),
-        (
-            "Constraints",
-            Some(db.constraints_count()),
-            constraints_size,
-            header.constraints_offset,
-            "u32 + uuid[]",
-        ),
-        (
-            "Symbol references",
-            Some(db.symbol_references_count()),
-            symbol_refs_size,
-            header.constraint_strings_offset,
-            "u32 + u32[]",
-        ),
-        (
-            "Function constraints",
-            Some(db.function_constraints_count()),
-            func_constraints_size,
-            header.function_constraints_offset,
-            "u32 + (u32 + u32 + u32)[]",
-        ),
-        (
-            "Functions",
-            Some(db.function_count()),
-            functions_size,
-            header.functions_offset,
-            "u32 + (uuid + u32 + u32)[]",
-        ),
-    ];
+    for (i, layer) in db.layers().iter().enumerate() {
+        let s = layer.sections();
+        let layer_size = layer.data_len() as u64;
 
-    for (name, count, size, offset, typ) in sections {
-        let count_str = count.map_or("-".to_string(), |c| c.to_string());
+        let header_size = s.strings_offset;
+        let strings_size = s.constraints_offset - s.strings_offset;
+        let constraints_size = s.constraint_strings_offset - s.constraints_offset;
+        let symbol_refs_size = s.function_constraints_offset - s.constraint_strings_offset;
+        let func_constraints_size = s.functions_offset - s.function_constraints_offset;
+        let functions_size = s.binaries_offset - s.functions_offset;
+        let binaries_size = layer_size - s.binaries_offset;
+
+        println!();
+        println!("Layer {} ({})", i, format_size(layer_size));
         println!(
-            "{:<22} {:>12} {:>12}  0x{:08x}     {}",
-            name,
-            count_str,
-            format_size(*size),
-            offset,
-            typ
+            "  {:<22} {:>12} {:>12}  {:<14} Type",
+            "Section", "Count", "Size", "Offset"
         );
+        println!("  {}", "-".repeat(78));
+
+        let sections: &[(&str, Option<usize>, u64, u64, &str)] = &[
+            ("Header", None, header_size, 0, "u64[6]"),
+            (
+                "Strings",
+                Some(layer.strings_count()),
+                strings_size,
+                s.strings_offset,
+                "u32 + (u32 + u8[])[]",
+            ),
+            (
+                "Constraints",
+                Some(layer.constraints_count()),
+                constraints_size,
+                s.constraints_offset,
+                "u32 + uuid[]",
+            ),
+            (
+                "Symbol references",
+                Some(layer.symbol_references_count()),
+                symbol_refs_size,
+                s.constraint_strings_offset,
+                "u32 + u32[]",
+            ),
+            (
+                "Function constraints",
+                Some(layer.function_constraints_count()),
+                func_constraints_size,
+                s.function_constraints_offset,
+                "u32 + (u32 + u32 + u32)[]",
+            ),
+            (
+                "Functions",
+                Some(layer.function_count()),
+                functions_size,
+                s.functions_offset,
+                "u32 + (uuid + u32 + u32)[]",
+            ),
+            (
+                "Binaries",
+                Some(layer.binary_count()),
+                binaries_size,
+                s.binaries_offset,
+                "u32 + uuid[]",
+            ),
+        ];
+
+        for (name, count, size, offset, typ) in sections {
+            let count_str = count.map_or("-".to_string(), |c| c.to_string());
+            println!(
+                "  {:<22} {:>12} {:>12}  0x{:08x}     {}",
+                name,
+                count_str,
+                format_size(*size),
+                offset,
+                typ
+            );
+        }
     }
 
     Ok(())

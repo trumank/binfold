@@ -87,6 +87,11 @@ impl DomainTag for DataConstTag {
     const NAME: &'static str = "data_const";
 }
 
+pub enum BinaryTag {}
+impl DomainTag for BinaryTag {
+    const NAME: &'static str = "binary";
+}
+
 /// Marker tag for constraint GUIDs. Constraint guids are always derived through one
 /// of the sub-domain tags above, so this tag deliberately does *not* implement
 /// [`DomainTag`].
@@ -165,6 +170,7 @@ pub type FunctionGuid<H> = Guid<FunctionTag, H>;
 pub type BasicBlockGuid<H> = Guid<BasicBlockTag, H>;
 pub type SymbolGuid<H> = Guid<SymbolTag, H>;
 pub type ConstraintGuid<H> = Guid<ConstraintTag, H>;
+pub type BinaryGuid<H> = Guid<BinaryTag, H>;
 
 impl<H: HashAlgo> SymbolGuid<H> {
     pub fn from_symbol(symbol_name: impl AsRef<str>) -> Self {

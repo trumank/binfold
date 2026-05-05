@@ -168,6 +168,11 @@ impl PeLoader {
         })
     }
 
+    /// The raw bytes of the loaded PE file as mapped from disk.
+    pub fn raw_bytes(&self) -> &[u8] {
+        self.file.borrow_owner()
+    }
+
     pub fn image_base(&self) -> u64 {
         self.file.borrow_dependent().relative_address_base()
     }
