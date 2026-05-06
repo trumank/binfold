@@ -3,7 +3,7 @@
 //! This library provides programmatic access to the WARP algorithm
 //! for function identification and database-driven symbol matching.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dashmap::{DashMap, DashSet};
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
@@ -40,7 +40,7 @@ use crate::warp::{Constraint, compute_function_guid_with_contraints};
 /// High-level analyzer for binary function analysis
 pub struct BinfoldAnalyzer {
     pe: PeLoader,
-    db_mmap: Option<memmap2::Mmap>,
+    db_mmaps: Vec<memmap2::Mmap>,
 }
 
 /// Options for analysis
@@ -93,19 +93,34 @@ impl BinfoldAnalyzer {
     /// Create analyzer for the given executable
     pub fn new<P: AsRef<Path>>(exe_path: P) -> Result<Self> {
         let pe = PeLoader::load(exe_path.as_ref())?;
-        Ok(Self { pe, db_mmap: None })
+        Ok(Self {
+            pe,
+            db_mmaps: Vec::new(),
+        })
     }
 
-    /// Create analyzer with database for symbol matching
-    pub fn with_database<P1, P2>(exe_path: P1, db_path: P2) -> Result<Self>
+    /// Create analyzer with one or more databases for symbol matching. All
+    /// layers across all databases are queried as a single combined dataset.
+    /// Each database is validated up front so version/format mismatches are
+    /// reported (with their file path) before any analysis runs.
+    pub fn with_databases<P1, I, P2>(exe_path: P1, db_paths: I) -> Result<Self>
     where
         P1: AsRef<Path>,
         P2: AsRef<Path>,
+        I: IntoIterator<Item = P2>,
     {
         let pe = PeLoader::load(exe_path.as_ref())?;
-        let file = std::fs::File::open(db_path.as_ref())?;
-        let db_mmap = Some(unsafe { memmap2::MmapOptions::new().map(&file)? });
-        Ok(Self { pe, db_mmap })
+        let mut db_mmaps = Vec::new();
+        for path in db_paths {
+            let path = path.as_ref();
+            let file = std::fs::File::open(path)
+                .with_context(|| format!("opening database {}", path.display()))?;
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+                .with_context(|| format!("mapping database {}", path.display()))?;
+            Db::new(&mmap).with_context(|| format!("loading database {}", path.display()))?;
+            db_mmaps.push(mmap);
+        }
+        Ok(Self { pe, db_mmaps })
     }
 
     /// Analyze all functions in the binary with progress reporting
@@ -184,12 +199,12 @@ impl BinfoldAnalyzer {
         }
 
         // Database matching if available
-        let database_matches = if let Some(mmap) = &self.db_mmap {
+        let database_matches = if !self.db_mmaps.is_empty() {
             self.match_with_database(
                 &analyzed_functions,
                 &function_guids,
                 &cache,
-                mmap,
+                &self.db_mmaps,
                 progress_reporter,
             )?
         } else {
@@ -246,10 +261,11 @@ impl BinfoldAnalyzer {
         analyzed_functions: &[AnalyzedFunction],
         function_guids: &HashSet<FunctionGuid>,
         cache: &AnalysisCache,
-        mmap: &memmap2::Mmap,
+        mmaps: &[memmap2::Mmap],
         progress_reporter: &P,
     ) -> Result<HashMap<u64, MatchInfo>> {
-        let db = Db::new(mmap)?;
+        let buffers: Vec<&[u8]> = mmaps.iter().map(|m| m.as_ref()).collect();
+        let db = Db::from_buffers(&buffers)?;
 
         // Build cache of unique constraints with parallel processing
         let load_progress = progress_reporter.sub_progress("Loading database constraints".into());

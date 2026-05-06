@@ -282,6 +282,21 @@ pub struct Db<'a> {
 
 impl<'a> Db<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self> {
+        Self::from_buffers(&[data])
+    }
+
+    /// Build a Db whose layers are the concatenation of all layers from each
+    /// input buffer, in the given order. Lookups iterate every layer, so two
+    /// files contributing the same function GUID merge naturally.
+    pub fn from_buffers(buffers: &[&'a [u8]]) -> Result<Self> {
+        let mut layers = Vec::new();
+        for data in buffers {
+            Self::extend_layers(data, &mut layers)?;
+        }
+        Ok(Db { layers })
+    }
+
+    fn extend_layers(data: &'a [u8], layers: &mut Vec<LayerView<'a>>) -> Result<()> {
         if (data.len() as u64) < FILE_HEADER_SIZE {
             bail!("File too small");
         }
@@ -304,7 +319,7 @@ impl<'a> Db<'a> {
             bail!("Layer directory out of bounds");
         }
 
-        let mut layers = Vec::with_capacity(layer_count);
+        layers.reserve(layer_count);
         for i in 0..layer_count {
             let entry = entries_start + i * 16;
             let body_off = view.u64_at(entry) as usize;
@@ -314,8 +329,7 @@ impl<'a> Db<'a> {
             }
             layers.push(LayerView::new(&data[body_off..body_off + body_size])?);
         }
-
-        Ok(Db { layers })
+        Ok(())
     }
 
     pub fn layers(&self) -> &[LayerView<'a>] {

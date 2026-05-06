@@ -44,9 +44,10 @@ struct CommandAnalyze {
     #[arg(short, long)]
     exe: PathBuf,
 
-    /// Optional database path for GUID lookups and symbol names
+    /// Database path(s) for GUID lookups and symbol names. Repeat the flag to
+    /// query multiple databases as one combined dataset.
     #[arg(long)]
-    database: Option<PathBuf>,
+    database: Vec<PathBuf>,
 
     /// Generate PDB file with matched function names
     #[arg(long, requires = "database")]
@@ -160,10 +161,10 @@ fn command_analyze(
 
     let progress_reporter = IndicatifProgressBar::new("Analyzing", None);
 
-    let analyzer = if let Some(db_path) = database {
-        BinfoldAnalyzer::with_database(&file, &db_path)?
-    } else {
+    let analyzer = if database.is_empty() {
         BinfoldAnalyzer::new(&file)?
+    } else {
+        BinfoldAnalyzer::with_databases(&file, &database)?
     };
 
     let result = analyzer.analyze_with_progress(&progress_reporter)?;
