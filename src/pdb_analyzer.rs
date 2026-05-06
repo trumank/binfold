@@ -28,7 +28,6 @@ pub struct FunctionInfo {
 struct ProcedureData {
     name: String,
     rva: u32,
-    len: u32,
 }
 
 impl PdbAnalyzer {
@@ -123,7 +122,6 @@ impl PdbAnalyzer {
                             module_procs.push(ProcedureData {
                                 name: proc.name.to_string().to_string(),
                                 rva: rva.0,
-                                len: proc.len,
                             });
                         }
                     }
