@@ -536,7 +536,10 @@ impl PeLoader {
     }
 
     /// Find all functions from the exception directory
-    pub fn find_all_functions_from_exception_directory(&self) -> Result<Vec<FunctionRange>> {
+    pub fn find_all_functions_from_exception_directory(
+        &self,
+        on_warning: &dyn Fn(&str),
+    ) -> Result<Vec<FunctionRange>> {
         let Some(exception_range) = self.get_exception_directory_range()? else {
             return Ok(vec![]);
         };
@@ -563,7 +566,7 @@ impl PeLoader {
             {
                 Ok(unwind_offset) => unwind_offset,
                 Err(e) => {
-                    eprintln!("{e}: {func:x?}");
+                    on_warning(&format!("{e}: {func:x?}"));
                     continue;
                 }
             };
@@ -785,8 +788,8 @@ impl PeLoader {
         Ok(false)
     }
 
-    pub fn find_all_functions(&self) -> Result<Vec<FunctionAnalysis>> {
-        let runtime_functions = self.find_all_functions_from_exception_directory()?;
+    pub fn find_all_functions(&self, on_warning: &dyn Fn(&str)) -> Result<Vec<FunctionAnalysis>> {
+        let runtime_functions = self.find_all_functions_from_exception_directory(on_warning)?;
 
         let mut visited: HashSet<u64> = Default::default();
         let mut result = vec![];

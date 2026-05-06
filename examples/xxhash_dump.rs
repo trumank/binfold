@@ -44,7 +44,7 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("usage: xxhash_dump <exe>"))?;
 
     let pe = PeLoader::load(&path)?;
-    let functions = pe.find_all_functions()?;
+    let functions = pe.find_all_functions(&|msg| eprintln!("{msg}"))?;
     let cache = AnalysisCache::new(functions.iter().cloned());
 
     let mut hashes: Vec<(u64, FunctionGuid<XxHash64>)> = functions

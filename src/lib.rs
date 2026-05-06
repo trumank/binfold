@@ -71,6 +71,7 @@ impl<P: ProgressReporter> AnalysisOptions<P> {
 pub struct AnalysisResult {
     pub functions: Vec<AnalyzedFunction>,
     pub database_matches: HashMap<u64, MatchInfo>,
+    pub warnings: Vec<String>,
 }
 
 /// Analyzed function with computed GUID and constraints
@@ -128,7 +129,10 @@ impl BinfoldAnalyzer {
         &self,
         progress_reporter: &P,
     ) -> Result<AnalysisResult> {
-        let functions = self.pe.find_all_functions()?;
+        let pe_warnings: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let functions = self
+            .pe
+            .find_all_functions(&|msg| pe_warnings.lock().unwrap().push(msg.to_string()))?;
         let cache = AnalysisCache::new(functions.iter().cloned());
 
         let analyzed: HashSet<u64> = functions.iter().map(|f| f.entry_point).collect();
@@ -214,6 +218,7 @@ impl BinfoldAnalyzer {
         Ok(AnalysisResult {
             functions: analyzed_functions,
             database_matches,
+            warnings: pe_warnings.into_inner().unwrap(),
         })
     }
 
@@ -584,6 +589,8 @@ impl DatabaseBuilder {
         let op_ref = &op;
         let processed_binaries: Mutex<Vec<BinaryGuid>> = Mutex::new(Vec::new());
         let processed_binaries_ref = &processed_binaries;
+        let worker_errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let worker_errors_ref = &worker_errors;
 
         let process = |exe_path: &PathBuf| {
             let pdb_path_for_exe = exe_path.with_extension("pdb");
@@ -623,7 +630,11 @@ impl DatabaseBuilder {
             match result {
                 Ok(Some(guid)) => processed_binaries_ref.lock().unwrap().push(guid),
                 Ok(None) => {}
-                Err(e) => eprintln!("Error processing {}: {}", exe_path.display(), e),
+                Err(e) => worker_errors_ref.lock().unwrap().push(format!(
+                    "Error processing {}: {}",
+                    exe_path.display(),
+                    e
+                )),
             }
 
             op_ref.progress();
@@ -644,6 +655,7 @@ impl DatabaseBuilder {
             }
         });
         op.finish();
+        let errors = worker_errors.into_inner().unwrap();
         let mut processed_binaries = processed_binaries.into_inner().unwrap();
         processed_binaries.sort_unstable();
 
@@ -725,6 +737,7 @@ impl DatabaseBuilder {
             total_functions,
             unique_constraints,
             processed_files: processed_binaries.len(),
+            errors,
         })
     }
 }
@@ -740,4 +753,5 @@ pub struct DatabaseStats {
     pub total_functions: usize,
     pub unique_constraints: usize,
     pub processed_files: usize,
+    pub errors: Vec<String>,
 }

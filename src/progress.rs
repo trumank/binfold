@@ -1,4 +1,4 @@
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use std::{borrow::Cow, sync::Arc};
 
 /// Unified progress reporting trait that supports deferred initialization and sub-operations
@@ -82,10 +82,7 @@ impl ProgressReporter for IndicatifProgressBar {
 impl Drop for IndicatifProgressBar {
     fn drop(&mut self) {
         if let Some(pb) = self.progress_bar.lock().unwrap().take() {
-            pb.finish_and_clear();
-            if let Some(multi) = &self.multi_progress {
-                multi.remove(&pb);
-            }
+            pb.abandon();
         }
     }
 }
@@ -135,7 +132,13 @@ impl<W: std::io::Write + Send + Sync + 'static> Drop for TextProgressBar<W> {
 
 pub fn default_progress_style() -> ProgressStyle {
     ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta}) {msg}")
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {count:>19}  {msg}")
         .unwrap()
+        .with_key(
+            "count",
+            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let _ = write!(w, "{}/{}", state.pos(), state.len().unwrap_or(0),);
+            },
+        )
         .progress_chars("#>-")
 }

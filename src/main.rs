@@ -138,11 +138,13 @@ fn command_gen_db(
 
     let stats = builder.build_with_progress(&database, &progress_reporter)?;
 
-    multi_progress.clear().unwrap();
+    eprintln!(); // new line after progress bar
 
-    println!("\nSummary:");
-    println!("========");
-    println!("Database: {}", database.display());
+    for e in &stats.errors {
+        eprintln!("{e}");
+    }
+
+    println!("Database written to: {}", database.display());
     println!("Total functions: {}", stats.total_functions);
     println!("Unique constraints: {}", stats.unique_constraints);
     println!("Processed files: {}", stats.processed_files);
@@ -168,6 +170,10 @@ fn command_analyze(
     };
 
     let result = analyzer.analyze_with_progress(&progress_reporter)?;
+
+    for w in &result.warnings {
+        eprintln!("{w}");
+    }
 
     println!("Found {} functions", result.functions.len());
 
