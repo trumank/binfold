@@ -454,33 +454,22 @@ impl DatabaseBuilder {
     }
 
     pub fn add_directory<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
-        use std::fs;
-
-        fn find_exe_files_recursive(
-            dir: &Path,
-            exe_files: &mut Vec<PathBuf>,
-        ) -> std::io::Result<()> {
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
-                let path = entry.path();
-
-                if path.is_dir() {
-                    let _ = find_exe_files_recursive(&path, exe_files);
-                } else if let Some(ext) = path.extension()
-                    && ext.eq_ignore_ascii_case("exe")
-                {
-                    let pdb_path = path.with_extension("pdb");
-                    if pdb_path.exists() {
-                        exe_files.push(path);
-                    }
+        for entry in walkdir::WalkDir::new(path)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if entry.file_type().is_file()
+                && let Some(ext) = path.extension()
+                && ext.eq_ignore_ascii_case("exe")
+            {
+                let pdb_path = path.with_extension("pdb");
+                if pdb_path.exists() {
+                    self.exe_paths.push(path.to_path_buf());
                 }
             }
-            Ok(())
         }
-
-        let mut found_exe_paths = Vec::new();
-        let _ = find_exe_files_recursive(path.as_ref(), &mut found_exe_paths);
-        self.exe_paths.extend(found_exe_paths);
         self
     }
 
