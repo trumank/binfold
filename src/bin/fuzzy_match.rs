@@ -73,6 +73,32 @@ struct Args {
     /// "callers" walks upward (where F is used). "both" walks both.
     #[arg(long, default_value = "callees", value_parser = ["callees", "callers", "both"])]
     bundle: String,
+
+    /// Restrict which feature categories get propagated through bundling.
+    /// Comma-separated subset of: bigram, import, string, const, blkcount,
+    /// callcount. If unset, all categories propagate (current default).
+    /// Useful for "asymmetric bundling": e.g. `--bundle-features
+    /// import,string,const` carries the cross-compiler-stable signal through
+    /// the neighborhood while keeping bigrams local to each node.
+    #[arg(long, value_delimiter = ',')]
+    bundle_features: Option<Vec<String>>,
+
+    /// After --validate, sample N "should-match" pairs (same name in both
+    /// binaries) and dump their feature decomposition side-by-side. Splits
+    /// into a TP cohort (algorithm matched correctly) and an FN cohort
+    /// (algorithm missed or matched wrong). 0 = disabled.
+    #[arg(long, default_value_t = 0)]
+    inspect_samples: usize,
+
+    /// Show feature comparison + callee list for any name containing this
+    /// substring. Repeat for multiple patterns. Useful for digging into
+    /// specific UE subsystems (e.g. --inspect-pattern FName).
+    #[arg(long = "inspect-pattern")]
+    inspect_patterns: Vec<String>,
+
+    /// Cap on how many name matches per pattern to inspect.
+    #[arg(long, default_value_t = 5)]
+    inspect_pattern_limit: usize,
 }
 
 /// All features are pre-hashed to u64 for cheap hashing in the inner MinHash
@@ -104,15 +130,17 @@ enum Feat {
 impl Feature for Feat {
     fn weight(&self) -> u32 {
         match self {
-            // Own features carry the function's actual identity. Weight them
-            // higher than neighbor features so a function with even a handful
-            // of own features can't be drowned out by a noisy neighborhood.
-            Feat::Bigram(_)
-            | Feat::Import(_)
-            | Feat::StringLit(_)
-            | Feat::Const(_)
-            | Feat::BlockCountBucket(_)
-            | Feat::CallCountBucket(_) => 4,
+            // Compiler-coupled identity signal. There are many bigrams per
+            // function (median 25-100), so even at weight=1 they dominate by
+            // count when no other features exist. Higher weight would let
+            // them outvote stable cross-compiler signal.
+            Feat::Bigram(_) => 1,
+            // Compiler-stable identity. Few per function (often 0-3), so
+            // weight them up so a single matching string/import/constant
+            // can anchor a function whose bigrams have diverged.
+            Feat::Import(_) | Feat::StringLit(_) | Feat::Const(_) => 8,
+            // Coarse shape — always present, weakly distinctive. Mid-weight.
+            Feat::BlockCountBucket(_) | Feat::CallCountBucket(_) => 4,
             // Neighborhood features decay with depth: 1-hop is more
             // informative than 3-hop. Both are still topology hints, not
             // identity.
@@ -232,6 +260,7 @@ fn build_graph(
     hops: usize,
     hub_degree: usize,
     bundle_dir: &str,
+    bundle_filter: Option<&FxHashSet<&'static str>>,
 ) -> Result<Graph<u64>> {
     use rayon::prelude::*;
     let iat = pe.iat()?;
@@ -291,9 +320,15 @@ fn build_graph(
             queue.push_back((start, 0));
             while let Some((node, depth)) = queue.pop_front() {
                 if depth > 0 {
-                    // Neighbor: wrap each of its features in Feat::Nbr.
+                    // Neighbor: wrap each of its features in Feat::Nbr,
+                    // optionally filtering by category.
                     if let Some(nf) = own.get(&node) {
                         for nbr_feat in nf {
+                            if let Some(allowed) = bundle_filter
+                                && !allowed.contains(feat_category(nbr_feat))
+                            {
+                                continue;
+                            }
                             feats.insert(Feat::Nbr {
                                 depth: depth as u8,
                                 hash: fxhash(nbr_feat),
@@ -422,6 +457,434 @@ fn analyze(path: &PathBuf) -> Result<(PeLoader, Vec<FunctionAnalysis>)> {
     Ok((pe, funcs))
 }
 
+/// Categorize a feature for per-bucket reporting.
+fn feat_category(f: &Feat) -> &'static str {
+    match f {
+        Feat::Bigram(_) => "bigram",
+        Feat::Import(_) => "import",
+        Feat::StringLit(_) => "string",
+        Feat::Const(_) => "const",
+        Feat::BlockCountBucket(_) => "blkcount",
+        Feat::CallCountBucket(_) => "callcount",
+        Feat::Nbr { .. } => "nbr",
+    }
+}
+
+/// Resolve each call target to a human label. Imports get their API name;
+/// internal calls get the first PDB name at that address; unresolved get a
+/// raw address.
+fn callee_labels(
+    func: &FunctionAnalysis,
+    pe: &PeLoader,
+    iat: &HashMap<u64, String>,
+    names: &HashMap<u64, Vec<String>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for call in &func.calls {
+        let label = if let Some(n) = iat.get(&call.target) {
+            format!("import:{}", n)
+        } else if let Some(n) = pe.thunk_import(call.target, iat) {
+            format!("import:{}", n)
+        } else if let Some(ns) = names.get(&call.target).and_then(|v| v.first()) {
+            let trimmed = if ns.len() > 60 {
+                &ns[..60]
+            } else {
+                ns.as_str()
+            };
+            format!("{}", trimmed)
+        } else {
+            format!("?{:#x}", call.target)
+        };
+        out.push(label);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_pair(
+    name: &str,
+    addr_a: u64,
+    addr_b: u64,
+    func_a: &FunctionAnalysis,
+    func_b: &FunctionAnalysis,
+    feats_a: &FxHashSet<Feat>,
+    feats_b: &FxHashSet<Feat>,
+    alg_match: &FxHashMap<u64, u64>,
+    names_a: &HashMap<u64, Vec<String>>,
+    names_b: &HashMap<u64, Vec<String>>,
+    iat_a: &HashMap<u64, String>,
+    iat_b: &HashMap<u64, String>,
+    pe1: &PeLoader,
+    pe2: &PeLoader,
+) {
+    let name_short = if name.len() > 78 {
+        format!("{}…", &name[..78])
+    } else {
+        name.to_string()
+    };
+
+    let alg_b = alg_match.get(&addr_a).copied();
+    let alg_str = match alg_b {
+        None => "<no algorithm match>".to_string(),
+        Some(b) if b == addr_b => "<correct>".to_string(),
+        Some(b) => {
+            let alg_names = names_b
+                .get(&b)
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_default();
+            let trim = if alg_names.len() > 64 {
+                format!("{}…", &alg_names[..64])
+            } else {
+                alg_names
+            };
+            format!("{:#x} ({})", b, trim)
+        }
+    };
+
+    println!();
+    println!("# {}", name_short);
+    println!(
+        "#   base   {:#x} ({} bytes, {} blocks, {} calls)",
+        addr_a,
+        func_a.size,
+        func_a.basic_blocks.len(),
+        func_a.calls.len()
+    );
+    println!(
+        "#   target {:#x} ({} bytes, {} blocks, {} calls)",
+        addr_b,
+        func_b.size,
+        func_b.basic_blocks.len(),
+        func_b.calls.len()
+    );
+    println!("#   algorithm: base → {}", alg_str);
+
+    // Callee lists side-by-side — directly visualizes inlining differences.
+    let calls_a = callee_labels(func_a, pe1, iat_a, names_a);
+    let calls_b = callee_labels(func_b, pe2, iat_b, names_b);
+    let max = calls_a.len().max(calls_b.len());
+    if max > 0 {
+        println!("#   callees:");
+        for i in 0..max {
+            let ca = calls_a.get(i).map(String::as_str).unwrap_or("");
+            let cb = calls_b.get(i).map(String::as_str).unwrap_or("");
+            let ca = if ca.len() > 50 { &ca[..50] } else { ca };
+            let cb = if cb.len() > 50 { &cb[..50] } else { cb };
+            println!("#     {:<52} | {}", ca, cb);
+        }
+    }
+
+    // Per-category counts and intersection.
+    let mut cats: std::collections::BTreeMap<&'static str, (FxHashSet<Feat>, FxHashSet<Feat>)> =
+        Default::default();
+    for f in feats_a {
+        cats.entry(feat_category(f)).or_default().0.insert(*f);
+    }
+    for f in feats_b {
+        cats.entry(feat_category(f)).or_default().1.insert(*f);
+    }
+    for (c, (sa, sb)) in &cats {
+        let inter = sa.intersection(sb).count();
+        let union = sa.union(sb).count();
+        let jac = if union > 0 {
+            inter as f64 / union as f64
+        } else {
+            0.0
+        };
+        println!(
+            "#     {:>9}: a={:>5} b={:>5} ∩={:>5} ∪={:>5}  J={:.3}",
+            c,
+            sa.len(),
+            sb.len(),
+            inter,
+            union,
+            jac
+        );
+    }
+    let inter_all = feats_a.intersection(feats_b).count();
+    let union_all = feats_a.union(feats_b).count();
+    let jac_all = if union_all > 0 {
+        inter_all as f64 / union_all as f64
+    } else {
+        0.0
+    };
+    println!(
+        "#     {:>9}: a={:>5} b={:>5} ∩={:>5} ∪={:>5}  J={:.3}",
+        "TOTAL",
+        feats_a.len(),
+        feats_b.len(),
+        inter_all,
+        union_all,
+        jac_all
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_patterns(
+    patterns: &[String],
+    limit: usize,
+    sorted: &[(u64, u64)],
+    names_a: &HashMap<u64, Vec<String>>,
+    names_b: &HashMap<u64, Vec<String>>,
+    funcs1: &[FunctionAnalysis],
+    funcs2: &[FunctionAnalysis],
+    pe1: &PeLoader,
+    pe2: &PeLoader,
+    use_bigrams: bool,
+) -> Result<()> {
+    let mut by_name_a: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
+    for (addr, ns) in names_a {
+        for s in ns {
+            by_name_a.entry(s.as_str()).or_default().push(*addr);
+        }
+    }
+    let mut by_name_b: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
+    for (addr, ns) in names_b {
+        for s in ns {
+            by_name_b.entry(s.as_str()).or_default().push(*addr);
+        }
+    }
+    let alg_match: FxHashMap<u64, u64> = sorted.iter().copied().collect();
+    let funcs1_by_ep: FxHashMap<u64, &FunctionAnalysis> =
+        funcs1.iter().map(|f| (f.entry_point, f)).collect();
+    let funcs2_by_ep: FxHashMap<u64, &FunctionAnalysis> =
+        funcs2.iter().map(|f| (f.entry_point, f)).collect();
+    let iat_a = pe1.iat()?;
+    let iat_b = pe2.iat()?;
+
+    // Universe of names present in both binaries.
+    for pat in patterns {
+        // Find shared names containing this substring.
+        let mut hits: Vec<&str> = by_name_a
+            .keys()
+            .copied()
+            .filter(|n| n.contains(pat.as_str()) && by_name_b.contains_key(*n))
+            .collect();
+        hits.sort();
+        hits.dedup();
+
+        println!();
+        println!(
+            "# ============== pattern '{}' — {} matching shared names ==============",
+            pat,
+            hits.len()
+        );
+        for name in hits.iter().take(limit) {
+            let addr_a = by_name_a[name][0];
+            let addr_b = by_name_b[name][0];
+            let (Some(&fa), Some(&fb)) = (funcs1_by_ep.get(&addr_a), funcs2_by_ep.get(&addr_b))
+            else {
+                continue;
+            };
+            let feats_a = extract_features(pe1, fa, &iat_a, use_bigrams);
+            let feats_b = extract_features(pe2, fb, &iat_b, use_bigrams);
+            report_pair(
+                name, addr_a, addr_b, fa, fb, &feats_a, &feats_b, &alg_match, names_a, names_b,
+                &iat_a, &iat_b, pe1, pe2,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_samples(
+    n: usize,
+    sorted: &[(u64, u64)],
+    names_a: &HashMap<u64, Vec<String>>,
+    names_b: &HashMap<u64, Vec<String>>,
+    names_in_a: &FxHashSet<&str>,
+    names_in_b: &FxHashSet<&str>,
+    funcs1: &[FunctionAnalysis],
+    funcs2: &[FunctionAnalysis],
+    pe1: &PeLoader,
+    pe2: &PeLoader,
+    use_bigrams: bool,
+) -> Result<()> {
+    // Build name → addrs maps.
+    let mut by_name_a: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
+    for (addr, ns) in names_a {
+        for s in ns {
+            by_name_a.entry(s.as_str()).or_default().push(*addr);
+        }
+    }
+    let mut by_name_b: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
+    for (addr, ns) in names_b {
+        for s in ns {
+            by_name_b.entry(s.as_str()).or_default().push(*addr);
+        }
+    }
+
+    let alg_match: FxHashMap<u64, u64> = sorted.iter().copied().collect();
+
+    let funcs1_by_ep: FxHashMap<u64, &FunctionAnalysis> =
+        funcs1.iter().map(|f| (f.entry_point, f)).collect();
+    let funcs2_by_ep: FxHashMap<u64, &FunctionAnalysis> =
+        funcs2.iter().map(|f| (f.entry_point, f)).collect();
+
+    let iat_a = pe1.iat()?;
+    let iat_b = pe2.iat()?;
+
+    // Walk shared names; for each, take the canonical (first-addr, first-addr)
+    // pair and bucket into TP / FN cohorts.
+    let mut tp_pool: Vec<(&str, u64, u64)> = Vec::new();
+    let mut fn_pool: Vec<(&str, u64, u64)> = Vec::new();
+
+    for &name in names_in_a.iter() {
+        if !names_in_b.contains(name) {
+            continue;
+        }
+        let Some(a_addrs) = by_name_a.get(name) else {
+            continue;
+        };
+        let Some(b_addrs) = by_name_b.get(name) else {
+            continue;
+        };
+        let addr_a = a_addrs[0];
+        let addr_b = b_addrs[0];
+        if !funcs1_by_ep.contains_key(&addr_a) || !funcs2_by_ep.contains_key(&addr_b) {
+            continue;
+        }
+        if alg_match.get(&addr_a).copied() == Some(addr_b) {
+            tp_pool.push((name, addr_a, addr_b));
+        } else {
+            fn_pool.push((name, addr_a, addr_b));
+        }
+    }
+
+    // Stable sort to get deterministic samples across runs.
+    tp_pool.sort_by_key(|&(_, a, _)| a);
+    fn_pool.sort_by_key(|&(_, a, _)| a);
+
+    let stride_pick = |pool: &[(&str, u64, u64)], k: usize| -> Vec<(String, u64, u64)> {
+        if pool.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let k = k.min(pool.len());
+        let stride = pool.len() / k;
+        (0..k)
+            .map(|i| {
+                let (s, a, b) = pool[i * stride];
+                (s.to_string(), a, b)
+            })
+            .collect()
+    };
+
+    println!();
+    println!(
+        "# === inspect: TP cohort size {}, FN cohort size {} ===",
+        tp_pool.len(),
+        fn_pool.len()
+    );
+
+    let dump = |label: &str, samples: &[(String, u64, u64)]| {
+        println!();
+        println!("# --- {} ({} samples) ---", label, samples.len());
+        for (name, addr_a, addr_b) in samples {
+            let func_a = funcs1_by_ep[addr_a];
+            let func_b = funcs2_by_ep[addr_b];
+            let feats_a = extract_features(pe1, func_a, &iat_a, use_bigrams);
+            let feats_b = extract_features(pe2, func_b, &iat_b, use_bigrams);
+
+            let alg_b = alg_match.get(addr_a).copied();
+            let alg_str = match alg_b {
+                None => "<no algorithm match>".to_string(),
+                Some(b) if b == *addr_b => "<correct>".to_string(),
+                Some(b) => {
+                    let alg_names = names_b
+                        .get(&b)
+                        .and_then(|v| v.first())
+                        .cloned()
+                        .unwrap_or_default();
+                    let trim = if alg_names.len() > 70 {
+                        format!("{}…", &alg_names[..70])
+                    } else {
+                        alg_names
+                    };
+                    format!("{:#x} ({})", b, trim)
+                }
+            };
+
+            let name_short = if name.len() > 70 {
+                format!("{}…", &name[..70])
+            } else {
+                name.clone()
+            };
+            println!();
+            println!("# {}", name_short);
+            println!(
+                "#   base   {:#x} ({} bytes, {} blocks, {} calls)",
+                addr_a,
+                func_a.size,
+                func_a.basic_blocks.len(),
+                func_a.calls.len()
+            );
+            println!(
+                "#   target {:#x} ({} bytes, {} blocks, {} calls)",
+                addr_b,
+                func_b.size,
+                func_b.basic_blocks.len(),
+                func_b.calls.len()
+            );
+            println!("#   algorithm matched base → {}", alg_str);
+
+            // Per-category counts and intersection.
+            let mut cats: std::collections::BTreeMap<
+                &'static str,
+                (FxHashSet<Feat>, FxHashSet<Feat>),
+            > = Default::default();
+            for f in &feats_a {
+                cats.entry(feat_category(f)).or_default().0.insert(*f);
+            }
+            for f in &feats_b {
+                cats.entry(feat_category(f)).or_default().1.insert(*f);
+            }
+            for (c, (sa, sb)) in &cats {
+                let inter = sa.intersection(sb).count();
+                let union = sa.union(sb).count();
+                let jac = if union > 0 {
+                    inter as f64 / union as f64
+                } else {
+                    0.0
+                };
+                println!(
+                    "#     {:>9}: a={:>5} b={:>5} ∩={:>5} ∪={:>5}  J={:.3}",
+                    c,
+                    sa.len(),
+                    sb.len(),
+                    inter,
+                    union,
+                    jac
+                );
+            }
+            let inter_all = feats_a.intersection(&feats_b).count();
+            let union_all = feats_a.union(&feats_b).count();
+            let jac_all = if union_all > 0 {
+                inter_all as f64 / union_all as f64
+            } else {
+                0.0
+            };
+            println!(
+                "#     {:>9}: a={:>5} b={:>5} ∩={:>5} ∪={:>5}  J={:.3}",
+                "TOTAL",
+                feats_a.len(),
+                feats_b.len(),
+                inter_all,
+                union_all,
+                jac_all
+            );
+        }
+    };
+
+    let tp_samples = stride_pick(&tp_pool, n);
+    let fn_samples = stride_pick(&fn_pool, n);
+    dump("TP (algorithm matched correctly)", &tp_samples);
+    dump("FN (same name in both, algorithm missed)", &fn_samples);
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -459,10 +922,38 @@ fn main() -> Result<()> {
     let hasher = config.hasher(args.seed);
 
     let use_bigrams = !args.no_bigrams;
+    // Resolve the optional bundle-features filter into a static-str set the
+    // bundling loop can match against feat_category().
+    static CATEGORIES: &[&str] = &[
+        "bigram",
+        "import",
+        "string",
+        "const",
+        "blkcount",
+        "callcount",
+    ];
+    let bundle_filter: Option<FxHashSet<&'static str>> = args.bundle_features.as_ref().map(|v| {
+        v.iter()
+            .map(|s| {
+                CATEGORIES
+                    .iter()
+                    .copied()
+                    .find(|c| *c == s.as_str())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "unknown --bundle-features category '{}'. Allowed: {:?}",
+                            s, CATEGORIES
+                        )
+                    })
+            })
+            .collect()
+    });
+
     tick(&format!(
-        "building base graph (bigrams={}, hops={})",
+        "building base graph (bigrams={}, hops={}, bundle_filter={:?})",
         if use_bigrams { "on" } else { "off" },
-        args.hops
+        args.hops,
+        bundle_filter
     ));
     let g1 = build_graph(
         &pe1,
@@ -472,6 +963,7 @@ fn main() -> Result<()> {
         args.hops,
         args.hub_degree,
         &args.bundle,
+        bundle_filter.as_ref(),
     )?;
     tick("building target graph");
     let g2 = build_graph(
@@ -482,6 +974,7 @@ fn main() -> Result<()> {
         args.hops,
         args.hub_degree,
         &args.bundle,
+        bundle_filter.as_ref(),
     )?;
 
     tick("matching");
@@ -611,6 +1104,37 @@ fn main() -> Result<()> {
                 let nb = if nb.len() > 80 { &nb[..80] } else { nb };
                 println!("#   {}\n# ≠ {}", na, nb);
             }
+        }
+
+        if args.inspect_samples > 0 {
+            inspect_samples(
+                args.inspect_samples,
+                &sorted,
+                &names_a,
+                &names_b,
+                &names_in_a,
+                &names_in_b,
+                &funcs1,
+                &funcs2,
+                &pe1,
+                &pe2,
+                !args.no_bigrams,
+            )?;
+        }
+
+        if !args.inspect_patterns.is_empty() {
+            inspect_patterns(
+                &args.inspect_patterns,
+                args.inspect_pattern_limit,
+                &sorted,
+                &names_a,
+                &names_b,
+                &funcs1,
+                &funcs2,
+                &pe1,
+                &pe2,
+                !args.no_bigrams,
+            )?;
         }
     }
 
