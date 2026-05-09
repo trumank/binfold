@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-mod mmap_source;
+pub mod mmap_source;
 
 pub mod db;
 pub mod hash;

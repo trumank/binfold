@@ -26,3 +26,4 @@ dashmap = "6.1"
 twox-hash = "2"
 rustc-hash = "2"
 walkdir = "2"
+grapnel = { path = "grapnel/crates/core" }

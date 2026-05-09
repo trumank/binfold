@@ -81,6 +81,7 @@ dependencies = [
  "byteorder",
  "clap",
  "dashmap",
+ "grapnel",
  "iced-x86",
  "indicatif",
  "memmap2",
@@ -357,6 +358,14 @@ dependencies = [
  "libc",
  "r-efi",
  "wasip2",
+]
+
+[[package]]
+name = "grapnel"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+ "rustc-hash",
 ]
 
 [[package]]
