@@ -99,6 +99,15 @@ struct Args {
     /// Cap on how many name matches per pattern to inspect.
     #[arg(long, default_value_t = 5)]
     inspect_pattern_limit: usize,
+
+    /// Number of iterative anchor-rebuild passes. 1 = single match (current
+    /// behavior). >1 = after pass 1, every confirmed pair (a, b) becomes a
+    /// synthetic identity feature `Feat::SyntCallee(S)` injected into any
+    /// function that calls `a` (base) or `b` (target). Subsequent passes can
+    /// then anchor functions on their *certified* call topology.
+    /// Stable IDs are preserved across passes.
+    #[arg(long, default_value_t = 1)]
+    iterations: usize,
 }
 
 /// All features are pre-hashed to u64 for cheap hashing in the inner MinHash
@@ -125,6 +134,14 @@ enum Feat {
     /// neighbor's Bigram(x). Topology contributes signal without overwriting
     /// F's own identity.
     Nbr { depth: u8, hash: u64 },
+    /// Synthetic callee identity from iterative anchor-rebuild. After a match
+    /// pass, every confirmed pair `(a, b)` is assigned a unique synthetic ID
+    /// `S`. If function F calls address `a` (base) or `b` (target), it emits
+    /// `Feat::SyntCallee(S)` — the SAME `S` on both sides because both maps
+    /// reference the same matched-pair counter. This is a *certified*
+    /// cross-binary identity feature: it's only ever created from confirmed
+    /// matches, so its presence on both sides is guaranteed-stable.
+    SyntCallee(u64),
 }
 
 impl Feature for Feat {
@@ -148,6 +165,9 @@ impl Feature for Feat {
                 1 => 2,
                 _ => 1,
             },
+            // Certified cross-binary identity from a previous match pass.
+            // Strongest signal — weighted higher than imports/strings.
+            Feat::SyntCallee(_) => 16,
         }
     }
 }
@@ -168,6 +188,7 @@ fn extract_features(
     func: &FunctionAnalysis,
     iat: &HashMap<u64, String>,
     use_bigrams: bool,
+    synth_map: Option<&FxHashMap<u64, u64>>,
 ) -> FxHashSet<Feat> {
     let mut feats: FxHashSet<Feat> = FxHashSet::default();
     let bytes = match pe.read_at_va(func.entry_point, func.size) {
@@ -232,6 +253,13 @@ fn extract_features(
             feats.insert(Feat::Import(fxhash(name)));
         } else if let Some(name) = pe.thunk_import(call.target, iat) {
             feats.insert(Feat::Import(fxhash(&name)));
+        } else if let Some(map) = synth_map
+            && let Some(&s) = map.get(&call.target)
+        {
+            // Internal callee whose pair was confirmed in a prior pass.
+            // Emit the synthetic identity feature; both binaries' versions
+            // of this caller will produce the same `s`.
+            feats.insert(Feat::SyntCallee(s));
         }
     }
 
@@ -252,6 +280,7 @@ fn extract_features(
     feats
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_graph(
     pe: &PeLoader,
     funcs: &[FunctionAnalysis],
@@ -261,6 +290,7 @@ fn build_graph(
     hub_degree: usize,
     bundle_dir: &str,
     bundle_filter: Option<&FxHashSet<&'static str>>,
+    synth_map: Option<&FxHashMap<u64, u64>>,
 ) -> Result<Graph<u64>> {
     use rayon::prelude::*;
     let iat = pe.iat()?;
@@ -269,7 +299,12 @@ fn build_graph(
     // Per-function "own" features.
     let own: FxHashMap<u64, FxHashSet<Feat>> = funcs
         .par_iter()
-        .map(|f| (f.entry_point, extract_features(pe, f, &iat, use_bigrams)))
+        .map(|f| {
+            (
+                f.entry_point,
+                extract_features(pe, f, &iat, use_bigrams, synth_map),
+            )
+        })
         .collect();
 
     // Build adjacency lists in both directions, restricted to functions in
@@ -467,6 +502,7 @@ fn feat_category(f: &Feat) -> &'static str {
         Feat::BlockCountBucket(_) => "blkcount",
         Feat::CallCountBucket(_) => "callcount",
         Feat::Nbr { .. } => "nbr",
+        Feat::SyntCallee(_) => "synt",
     }
 }
 
@@ -677,8 +713,8 @@ fn inspect_patterns(
             else {
                 continue;
             };
-            let feats_a = extract_features(pe1, fa, &iat_a, use_bigrams);
-            let feats_b = extract_features(pe2, fb, &iat_b, use_bigrams);
+            let feats_a = extract_features(pe1, fa, &iat_a, use_bigrams, None);
+            let feats_b = extract_features(pe2, fb, &iat_b, use_bigrams, None);
             report_pair(
                 name, addr_a, addr_b, fa, fb, &feats_a, &feats_b, &alg_match, names_a, names_b,
                 &iat_a, &iat_b, pe1, pe2,
@@ -784,8 +820,8 @@ fn inspect_samples(
         for (name, addr_a, addr_b) in samples {
             let func_a = funcs1_by_ep[addr_a];
             let func_b = funcs2_by_ep[addr_b];
-            let feats_a = extract_features(pe1, func_a, &iat_a, use_bigrams);
-            let feats_b = extract_features(pe2, func_b, &iat_b, use_bigrams);
+            let feats_a = extract_features(pe1, func_a, &iat_a, use_bigrams, None);
+            let feats_b = extract_features(pe2, func_b, &iat_b, use_bigrams, None);
 
             let alg_b = alg_match.get(addr_a).copied();
             let alg_str = match alg_b {
@@ -949,77 +985,37 @@ fn main() -> Result<()> {
             .collect()
     });
 
-    tick(&format!(
-        "building base graph (bigrams={}, hops={}, bundle_filter={:?})",
-        if use_bigrams { "on" } else { "off" },
-        args.hops,
-        bundle_filter
-    ));
-    let g1 = build_graph(
-        &pe1,
-        &funcs1,
-        &hasher,
-        use_bigrams,
-        args.hops,
-        args.hub_degree,
-        &args.bundle,
-        bundle_filter.as_ref(),
-    )?;
-    tick("building target graph");
-    let g2 = build_graph(
-        &pe2,
-        &funcs2,
-        &hasher,
-        use_bigrams,
-        args.hops,
-        args.hub_degree,
-        &args.bundle,
-        bundle_filter.as_ref(),
-    )?;
+    // Iterative anchor-rebuild loop.
+    //
+    // Each pass rebuilds graphs (with synth maps from the previous pass's
+    // matches) and re-runs match_graphs. Confirmed pairs from earlier passes
+    // keep their synthetic IDs, so a function whose callees were matched in
+    // pass N can anchor on those certified identities in pass N+1.
+    let mut synth_a: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut synth_b: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut next_synth_id: u64 = 0;
+    let mut matches: rustc_hash::FxHashMap<u64, u64> = rustc_hash::FxHashMap::default();
 
-    tick("matching");
-    let matches = config.run(&g1, &g2);
-    tick("done");
-
-    let mut sorted: Vec<(u64, u64)> = matches.into_iter().collect();
-    sorted.sort_unstable();
-
-    println!(
-        "# matched {} / {} base functions",
-        sorted.len(),
-        funcs1.len()
-    );
-
-    if args.validate {
+    // Load PDBs once up front if validating — reused for per-pass metric.
+    // We only store the owned `names_a`/`names_b` maps + the precomputed
+    // baseline; the borrowed `sets_*` views are rebuilt fresh per pass to
+    // avoid self-referential storage.
+    let pdb_data: Option<(HashMap<u64, Vec<String>>, HashMap<u64, Vec<String>>, usize)> = if args
+        .validate
+    {
         tick("loading PDBs");
         let names_a = load_pdb_names(&args.base, &pe1)?;
         let names_b = load_pdb_names(&args.target, &pe2)?;
 
-        // Per-address name sets. Multi-name handling: a function with
-        // multiple symbols (COMDAT-folded, public + procedure forms,
-        // aliases) gets credit if ANY of its names matches ANY name on the
-        // other side.
-        let sets_a: HashMap<u64, FxHashSet<&str>> = names_a
-            .iter()
-            .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
-            .collect();
-        let sets_b: HashMap<u64, FxHashSet<&str>> = names_b
-            .iter()
-            .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
-            .collect();
-
-        // Universe of names. Used for the baseline: how many distinct names
-        // do the two binaries share, and how many base addrs have at least
-        // one of their names present in target.
-        let names_in_a: FxHashSet<&str> = sets_a.values().flatten().copied().collect();
-        let names_in_b: FxHashSet<&str> = sets_b.values().flatten().copied().collect();
+        let names_in_a: FxHashSet<&str> = names_a.values().flatten().map(String::as_str).collect();
+        let names_in_b: FxHashSet<&str> = names_b.values().flatten().map(String::as_str).collect();
         let shared: usize = names_in_a
             .iter()
             .filter(|n| names_in_b.contains(*n))
             .count();
-        let baseline_addrs: usize = sets_a
+        let baseline_addrs: usize = names_a
             .iter()
-            .filter(|(_, s)| s.iter().any(|n| names_in_b.contains(n)))
+            .filter(|(_, ns)| ns.iter().any(|n| names_in_b.contains(n.as_str())))
             .count();
 
         tick(&format!(
@@ -1039,9 +1035,154 @@ fn main() -> Result<()> {
         println!(
             "#   base addrs with any name present in target: {} ({:.1}% of {} base addrs with names)",
             baseline_addrs,
-            baseline_addrs as f64 / sets_a.len().max(1) as f64 * 100.0,
-            sets_a.len(),
+            baseline_addrs as f64 / names_a.len().max(1) as f64 * 100.0,
+            names_a.len(),
         );
+        Some((names_a, names_b, baseline_addrs))
+    } else {
+        None
+    };
+
+    for pass in 0..args.iterations.max(1) {
+        let synth_a_ref = if synth_a.is_empty() {
+            None
+        } else {
+            Some(&synth_a)
+        };
+        let synth_b_ref = if synth_b.is_empty() {
+            None
+        } else {
+            Some(&synth_b)
+        };
+
+        tick(&format!(
+            "pass {}/{}: building base graph (bigrams={}, hops={}, bundle_filter={:?}, synth={})",
+            pass + 1,
+            args.iterations.max(1),
+            if use_bigrams { "on" } else { "off" },
+            args.hops,
+            bundle_filter,
+            synth_a.len(),
+        ));
+        let g1 = build_graph(
+            &pe1,
+            &funcs1,
+            &hasher,
+            use_bigrams,
+            args.hops,
+            args.hub_degree,
+            &args.bundle,
+            bundle_filter.as_ref(),
+            synth_a_ref,
+        )?;
+        tick(&format!("pass {}: building target graph", pass + 1));
+        let g2 = build_graph(
+            &pe2,
+            &funcs2,
+            &hasher,
+            use_bigrams,
+            args.hops,
+            args.hub_degree,
+            &args.bundle,
+            bundle_filter.as_ref(),
+            synth_b_ref,
+        )?;
+
+        tick(&format!("pass {}: matching", pass + 1));
+        let new_matches = config.run(&g1, &g2);
+        tick(&format!(
+            "pass {}: done — matched {}",
+            pass + 1,
+            new_matches.len()
+        ));
+
+        // Promote the new matches into stable synthetic IDs. Pairs that were
+        // already in synth_a/synth_b keep their ID; only newly-confirmed
+        // pairs get fresh IDs. This stability is what lets pass N+1's
+        // signatures partly overlap with pass N's.
+        let mut new_pair_count = 0usize;
+        for (&a, &b) in &new_matches {
+            // Skip if either side already has a synth ID — keeps pass-1
+            // identity stable. (If a previous match was (a, x) and we now
+            // claim (a, b), we DON'T overwrite — pass 1 had higher
+            // confidence as a tiebreaker.)
+            if synth_a.contains_key(&a) || synth_b.contains_key(&b) {
+                continue;
+            }
+            let s = next_synth_id;
+            next_synth_id += 1;
+            synth_a.insert(a, s);
+            synth_b.insert(b, s);
+            new_pair_count += 1;
+        }
+
+        eprintln!(
+            "  pass {}: {} matches total, {} new pairs assigned synth IDs (synth pool: {})",
+            pass + 1,
+            new_matches.len(),
+            new_pair_count,
+            synth_a.len()
+        );
+
+        // Per-pass precision/recall against the PDB-name baseline.
+        if let Some((names_a, names_b, baseline_addrs)) = &pdb_data {
+            let sets_a: HashMap<u64, FxHashSet<&str>> = names_a
+                .iter()
+                .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
+                .collect();
+            let sets_b: HashMap<u64, FxHashSet<&str>> = names_b
+                .iter()
+                .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
+                .collect();
+            let mut both_named = 0usize;
+            let mut tp = 0usize;
+            for (a, b) in &new_matches {
+                if let (Some(sa), Some(sb)) = (sets_a.get(a), sets_b.get(b)) {
+                    if sa.is_empty() || sb.is_empty() {
+                        continue;
+                    }
+                    both_named += 1;
+                    if sa.iter().any(|n| sb.contains(n)) {
+                        tp += 1;
+                    }
+                }
+            }
+            let precision = tp as f64 / both_named.max(1) as f64;
+            let recall = tp as f64 / (*baseline_addrs).max(1) as f64;
+            println!(
+                "# pass {}/{}: matched={} valid={} prec={:.2}% recall={:.2}%",
+                pass + 1,
+                args.iterations.max(1),
+                new_matches.len(),
+                both_named,
+                precision * 100.0,
+                recall * 100.0,
+            );
+        }
+
+        matches = new_matches;
+    }
+
+    let mut sorted: Vec<(u64, u64)> = matches.into_iter().collect();
+    sorted.sort_unstable();
+
+    println!(
+        "# matched {} / {} base functions",
+        sorted.len(),
+        funcs1.len()
+    );
+
+    if let Some((names_a, names_b, baseline_addrs)) = pdb_data {
+        let sets_a: HashMap<u64, FxHashSet<&str>> = names_a
+            .iter()
+            .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
+            .collect();
+        let sets_b: HashMap<u64, FxHashSet<&str>> = names_b
+            .iter()
+            .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
+            .collect();
+        let names_in_a: FxHashSet<&str> = sets_a.values().flatten().copied().collect();
+        let names_in_b: FxHashSet<&str> = sets_b.values().flatten().copied().collect();
 
         // Validate each algorithm match. TP = the matched (a, b) pair shares
         // at least one PDB name. This reuses the same first-public-then-
