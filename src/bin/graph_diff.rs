@@ -125,10 +125,6 @@ struct MatchesCache {
     matches: FxHashMap<u64, u64>,
     synth_a: FxHashMap<u64, u64>,
     synth_b: FxHashMap<u64, u64>,
-    #[allow(dead_code)]
-    data_synth_a: FxHashMap<u64, u64>,
-    #[allow(dead_code)]
-    data_synth_b: FxHashMap<u64, u64>,
 }
 
 fn parse_matches_cache(path: &Path) -> Result<MatchesCache> {
@@ -137,8 +133,6 @@ fn parse_matches_cache(path: &Path) -> Result<MatchesCache> {
     let mut matches = FxHashMap::default();
     let mut synth_a = FxHashMap::default();
     let mut synth_b = FxHashMap::default();
-    let mut data_synth_a = FxHashMap::default();
-    let mut data_synth_b = FxHashMap::default();
 
     enum Sec {
         None,
@@ -146,8 +140,6 @@ fn parse_matches_cache(path: &Path) -> Result<MatchesCache> {
         Matches,
         SynthA,
         SynthB,
-        DataA,
-        DataB,
     }
     let mut sec = Sec::None;
 
@@ -162,8 +154,8 @@ fn parse_matches_cache(path: &Path) -> Result<MatchesCache> {
                 "matches" => Sec::Matches,
                 "synth_a" => Sec::SynthA,
                 "synth_b" => Sec::SynthB,
-                "data_synth_a" => Sec::DataA,
-                "data_synth_b" => Sec::DataB,
+                // Older cache files may have [data_synth_a] / [data_synth_b]
+                // sections; ignore them silently for backward compat.
                 _ => Sec::None,
             };
             continue;
@@ -191,12 +183,6 @@ fn parse_matches_cache(path: &Path) -> Result<MatchesCache> {
             Sec::SynthB => {
                 synth_b.insert(parse_u64(k)?, parse_u64(v)?);
             }
-            Sec::DataA => {
-                data_synth_a.insert(parse_u64(k)?, parse_u64(v)?);
-            }
-            Sec::DataB => {
-                data_synth_b.insert(parse_u64(k)?, parse_u64(v)?);
-            }
             Sec::None => {}
         }
     }
@@ -205,8 +191,6 @@ fn parse_matches_cache(path: &Path) -> Result<MatchesCache> {
         matches,
         synth_a,
         synth_b,
-        data_synth_a,
-        data_synth_b,
     })
 }
 

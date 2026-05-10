@@ -128,19 +128,6 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     iterations: usize,
 
-    /// Minimum co-occurrence votes for a (base_dref, target_dref) pair to be
-    /// promoted to a synthetic data-ref identity. Higher = stricter, fewer
-    /// false data pairings. 0 = disable data-synth feature entirely.
-    #[arg(long, default_value_t = 3)]
-    data_synth_min_votes: u32,
-
-    /// Cap on data refs per function used for vote computation. Prevents
-    /// quadratic blowup from huge functions with hundreds of data refs.
-    /// Stricter (16) gave best precision in tuning; higher (32-64) widens
-    /// the data-pair pool slightly.
-    #[arg(long, default_value_t = 16)]
-    data_synth_max_drefs: usize,
-
     /// One-at-a-time perturbation sweep around the current args. Loads PE
     /// and PDB once, then re-runs the matcher with each parameter
     /// individually perturbed across a few values, holding everything else
@@ -220,15 +207,6 @@ enum Feat {
     /// depth-2 don't collide. This is a *certified* cross-binary identity
     /// feature: it's only ever created from confirmed matches.
     SyntCallee { depth: u8, hash: u64 },
-    /// Synthetic global-data-ref identity from iterative anchor-rebuild,
-    /// inferred via co-occurrence voting. After a match pass, for each
-    /// confirmed function pair (F_a, F_b), every (X, Y) ∈ D(F_a) × D(F_b)
-    /// gets one vote. After all pairs voted, greedy max-vote pairing assigns
-    /// a synth ID `S` to high-co-occurrence (X, Y) data-ref pairs. In the
-    /// next iteration, any function referencing X (base) or Y (target) emits
-    /// `Feat::SyntDataRef(S)`. Captures shared singletons/vtables/lookup
-    /// tables (GUObjectArray, GLog, FName pool, etc.).
-    SyntDataRef(u64),
 }
 
 impl Feature for Feat {
@@ -262,10 +240,6 @@ impl Feature for Feat {
                 3 => 4,
                 _ => 2,
             },
-            // Inferred via co-occurrence voting — slightly less direct than
-            // SyntCallee (which comes from confirmed matches), so weighted at
-            // the same level as imports/strings rather than the SyntCallee 16.
-            Feat::SyntDataRef(_) => 8,
         }
     }
 }
@@ -288,7 +262,6 @@ fn extract_features(
     iat: &HashMap<u64, String>,
     use_bigrams: bool,
     synth_map: Option<&FxHashMap<u64, u64>>,
-    data_synth_map: Option<&FxHashMap<u64, u64>>,
     funcs_by_ep: Option<&FxHashMap<u64, &FunctionAnalysis>>,
     synt_depth: u8,
 ) -> FxHashSet<Feat> {
@@ -409,14 +382,6 @@ fn extract_features(
         {
             feats.insert(Feat::StringLit(fxhash(&s)));
         }
-        // Synth global identity from co-occurrence voting in a prior pass.
-        // Both binaries' references to the same paired global produce the
-        // same `s` — captures GUObjectArray, vtables, GLog, etc.
-        if let Some(map) = data_synth_map
-            && let Some(&s) = map.get(&dref.target)
-        {
-            feats.insert(Feat::SyntDataRef(s));
-        }
     }
 
     feats.insert(Feat::BlockCountBucket(
@@ -438,7 +403,6 @@ fn build_graph(
     bundle_dir: &str,
     bundle_filter: Option<&FxHashSet<&'static str>>,
     synth_map: Option<&FxHashMap<u64, u64>>,
-    data_synth_map: Option<&FxHashMap<u64, u64>>,
     synt_depth: u8,
 ) -> Result<Graph<u64>> {
     use rayon::prelude::*;
@@ -461,7 +425,6 @@ fn build_graph(
                     &iat,
                     use_bigrams,
                     synth_map,
-                    data_synth_map,
                     Some(&funcs_by_ep),
                     synt_depth,
                 ),
@@ -665,7 +628,6 @@ fn feat_category(f: &Feat) -> &'static str {
         Feat::CallCountBucket(_) => "callcount",
         Feat::Nbr { .. } => "nbr",
         Feat::SyntCallee { .. } => "synt",
-        Feat::SyntDataRef(_) => "syndata",
     }
 }
 
@@ -939,8 +901,6 @@ fn inspect_patterns(
     use_bigrams: bool,
     synth_a: Option<&FxHashMap<u64, u64>>,
     synth_b: Option<&FxHashMap<u64, u64>>,
-    data_synth_a: Option<&FxHashMap<u64, u64>>,
-    data_synth_b: Option<&FxHashMap<u64, u64>>,
     synt_depth: u8,
 ) -> Result<()> {
     let mut by_name_a: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
@@ -994,7 +954,6 @@ fn inspect_patterns(
                 &iat_a,
                 use_bigrams,
                 synth_a,
-                data_synth_a,
                 Some(&funcs1_by_ep),
                 synt_depth,
             );
@@ -1004,7 +963,6 @@ fn inspect_patterns(
                 &iat_b,
                 use_bigrams,
                 synth_b,
-                data_synth_b,
                 Some(&funcs2_by_ep),
                 synt_depth,
             );
@@ -1047,8 +1005,6 @@ fn inspect_samples(
     use_bigrams: bool,
     synth_a: Option<&FxHashMap<u64, u64>>,
     synth_b: Option<&FxHashMap<u64, u64>>,
-    data_synth_a: Option<&FxHashMap<u64, u64>>,
-    data_synth_b: Option<&FxHashMap<u64, u64>>,
     synt_depth: u8,
 ) -> Result<()> {
     // Build name → addrs maps.
@@ -1140,7 +1096,6 @@ fn inspect_samples(
                 &iat_a,
                 use_bigrams,
                 synth_a,
-                data_synth_a,
                 Some(&funcs1_by_ep),
                 synt_depth,
             );
@@ -1150,7 +1105,6 @@ fn inspect_samples(
                 &iat_b,
                 use_bigrams,
                 synth_b,
-                data_synth_b,
                 Some(&funcs2_by_ep),
                 synt_depth,
             );
@@ -1194,8 +1148,6 @@ struct RunResult {
     sorted: Vec<(u64, u64)>,
     synth_a: FxHashMap<u64, u64>,
     synth_b: FxHashMap<u64, u64>,
-    data_synth_a: FxHashMap<u64, u64>,
-    data_synth_b: FxHashMap<u64, u64>,
     matched: usize,
     valid: usize,
     tp: usize,
@@ -1256,17 +1208,9 @@ fn run_match(
             .collect()
     });
 
-    let funcs1_by_ep: FxHashMap<u64, &FunctionAnalysis> =
-        funcs1.iter().map(|f| (f.entry_point, f)).collect();
-    let funcs2_by_ep: FxHashMap<u64, &FunctionAnalysis> =
-        funcs2.iter().map(|f| (f.entry_point, f)).collect();
-
     let mut synth_a: FxHashMap<u64, u64> = FxHashMap::default();
     let mut synth_b: FxHashMap<u64, u64> = FxHashMap::default();
     let mut next_synth_id: u64 = 0;
-    let mut data_synth_a: FxHashMap<u64, u64> = FxHashMap::default();
-    let mut data_synth_b: FxHashMap<u64, u64> = FxHashMap::default();
-    let mut next_data_synth_id: u64 = 0;
     let mut matches: FxHashMap<u64, u64> = FxHashMap::default();
 
     let mut last_precision = 0.0;
@@ -1286,27 +1230,16 @@ fn run_match(
         } else {
             Some(&synth_b)
         };
-        let data_synth_a_ref = if data_synth_a.is_empty() {
-            None
-        } else {
-            Some(&data_synth_a)
-        };
-        let data_synth_b_ref = if data_synth_b.is_empty() {
-            None
-        } else {
-            Some(&data_synth_b)
-        };
 
         if !quiet {
             eprintln!(
-                "pass {}/{}: building graphs (bigrams={}, hops={}, bundle_filter={:?}, synth={}, data_synth={})",
+                "pass {}/{}: building graphs (bigrams={}, hops={}, bundle_filter={:?}, synth={})",
                 pass + 1,
                 total_passes,
                 if use_bigrams { "on" } else { "off" },
                 args.hops,
                 bundle_filter,
                 synth_a.len(),
-                data_synth_a.len(),
             );
         }
         let g1 = build_graph(
@@ -1319,7 +1252,6 @@ fn run_match(
             &args.bundle,
             bundle_filter.as_ref(),
             synth_a_ref,
-            data_synth_a_ref,
             args.synt_depth,
         )?;
         let g2 = build_graph(
@@ -1332,7 +1264,6 @@ fn run_match(
             &args.bundle,
             bundle_filter.as_ref(),
             synth_b_ref,
-            data_synth_b_ref,
             args.synt_depth,
         )?;
 
@@ -1360,72 +1291,6 @@ fn run_match(
                 new_pair_count,
                 synth_a.len()
             );
-        }
-
-        if args.data_synth_min_votes > 0 {
-            let mut votes: FxHashMap<(u64, u64), u32> = FxHashMap::default();
-            let collect_drefs = |func: &FunctionAnalysis| -> Vec<u64> {
-                func.data_refs
-                    .iter()
-                    .filter(|d| !(d.is_readonly && d.estimated_size.is_none()))
-                    .map(|d| d.target)
-                    .collect::<FxHashSet<_>>()
-                    .into_iter()
-                    .collect()
-            };
-            let mut pairs_voted = 0usize;
-            for (&a, &b) in &new_matches {
-                let (Some(&fa), Some(&fb)) = (funcs1_by_ep.get(&a), funcs2_by_ep.get(&b)) else {
-                    continue;
-                };
-                let drefs_a = collect_drefs(fa);
-                let drefs_b = collect_drefs(fb);
-                if drefs_a.len() > args.data_synth_max_drefs
-                    || drefs_b.len() > args.data_synth_max_drefs
-                {
-                    continue;
-                }
-                if drefs_a.is_empty() || drefs_b.is_empty() {
-                    continue;
-                }
-                pairs_voted += 1;
-                for &x in &drefs_a {
-                    for &y in &drefs_b {
-                        *votes.entry((x, y)).or_insert(0) += 1;
-                    }
-                }
-            }
-
-            let mut ranked: Vec<((u64, u64), u32)> = votes.into_iter().collect();
-            ranked.sort_unstable_by(|a, b| {
-                b.1.cmp(&a.1)
-                    .then_with(|| a.0.0.cmp(&b.0.0))
-                    .then_with(|| a.0.1.cmp(&b.0.1))
-            });
-            let mut new_data_pair_count = 0usize;
-            for ((x, y), v) in ranked {
-                if v < args.data_synth_min_votes {
-                    break;
-                }
-                if data_synth_a.contains_key(&x) || data_synth_b.contains_key(&y) {
-                    continue;
-                }
-                let s = next_data_synth_id;
-                next_data_synth_id += 1;
-                data_synth_a.insert(x, s);
-                data_synth_b.insert(y, s);
-                new_data_pair_count += 1;
-            }
-
-            if !quiet {
-                eprintln!(
-                    "  pass {}: voted on {} function pairs → {} new data pairs (data-synth pool: {})",
-                    pass + 1,
-                    pairs_voted,
-                    new_data_pair_count,
-                    data_synth_a.len()
-                );
-            }
         }
 
         if let Some(pdb) = pdb {
@@ -1523,8 +1388,6 @@ fn run_match(
         sorted,
         synth_a,
         synth_b,
-        data_synth_a,
-        data_synth_b,
         valid: last_valid,
         tp: last_tp,
         precision: last_precision,
@@ -1556,8 +1419,6 @@ fn write_matches_cache(path: &Path, args: &Args, result: &RunResult) -> Result<(
     };
     dump("synth_a", &result.synth_a);
     dump("synth_b", &result.synth_b);
-    dump("data_synth_a", &result.data_synth_a);
-    dump("data_synth_b", &result.data_synth_b);
     std::fs::write(path, s)?;
     Ok(())
 }
@@ -1784,44 +1645,6 @@ fn run_sweep(
                 ("iterations=2", Box::new(|a: &mut Args| a.iterations = 2)),
                 ("iterations=4", Box::new(|a: &mut Args| a.iterations = 4)),
                 ("iterations=5", Box::new(|a: &mut Args| a.iterations = 5)),
-            ],
-        ),
-        (
-            "data-synth-min-votes",
-            vec![
-                (
-                    "min-votes=0 (off)",
-                    Box::new(|a: &mut Args| a.data_synth_min_votes = 0),
-                ),
-                (
-                    "min-votes=2",
-                    Box::new(|a: &mut Args| a.data_synth_min_votes = 2),
-                ),
-                (
-                    "min-votes=5",
-                    Box::new(|a: &mut Args| a.data_synth_min_votes = 5),
-                ),
-                (
-                    "min-votes=10",
-                    Box::new(|a: &mut Args| a.data_synth_min_votes = 10),
-                ),
-            ],
-        ),
-        (
-            "data-synth-max-drefs",
-            vec![
-                (
-                    "max-drefs=8",
-                    Box::new(|a: &mut Args| a.data_synth_max_drefs = 8),
-                ),
-                (
-                    "max-drefs=32",
-                    Box::new(|a: &mut Args| a.data_synth_max_drefs = 32),
-                ),
-                (
-                    "max-drefs=64",
-                    Box::new(|a: &mut Args| a.data_synth_max_drefs = 64),
-                ),
             ],
         ),
     ];
@@ -2228,17 +2051,6 @@ fn main() -> Result<()> {
         } else {
             Some(&result.synth_b)
         };
-        let data_synth_a_ref = if result.data_synth_a.is_empty() {
-            None
-        } else {
-            Some(&result.data_synth_a)
-        };
-        let data_synth_b_ref = if result.data_synth_b.is_empty() {
-            None
-        } else {
-            Some(&result.data_synth_b)
-        };
-
         if args.inspect_samples > 0 {
             inspect_samples(
                 args.inspect_samples,
@@ -2254,8 +2066,6 @@ fn main() -> Result<()> {
                 !args.no_bigrams,
                 synth_a_ref,
                 synth_b_ref,
-                data_synth_a_ref,
-                data_synth_b_ref,
                 args.synt_depth,
             )?;
         }
@@ -2274,8 +2084,6 @@ fn main() -> Result<()> {
                 !args.no_bigrams,
                 synth_a_ref,
                 synth_b_ref,
-                data_synth_a_ref,
-                data_synth_b_ref,
                 args.synt_depth,
             )?;
         }
