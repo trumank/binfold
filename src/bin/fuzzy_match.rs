@@ -17,28 +17,42 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(about = "Fuzzy-match functions between two PEs using grapnel")]
 struct Args {
     base: PathBuf,
     target: PathBuf,
 
-    #[arg(long, default_value_t = 200)]
+    /// MinHash permutations. Higher = sharper similarity estimates but more
+    /// work per node. K=800 was the diminishing-returns point in tuning.
+    #[arg(long, default_value_t = 800)]
     k: usize,
-    /// Number of LSH bands. With K=200, defaults to 25 (8 rows/band → ~0.69
-    /// effective threshold). Increase to lower threshold (more candidates).
-    #[arg(long, default_value_t = 25)]
+    /// Number of LSH bands. Should track K to keep rows-per-band ≈ 8
+    /// (effective LSH threshold around 0.5–0.7). K=200→25, K=400→50,
+    /// K=800→100.
+    #[arg(long, default_value_t = 100)]
     bands: usize,
-    /// Minimum total feature weight for a node to enter the LSH index. Higher
-    /// values exclude trivial thunks/getters from anchoring (propagation
-    /// handles them) and dramatically shrinks candidate lists on UE binaries.
-    #[arg(long, default_value_t = 16)]
+    /// Minimum total feature weight for a node to enter the LSH index. With
+    /// the current weights (bigram=1, str/imp/const=8, shape=4), a value of 4
+    /// admits even sparse-feature functions; raising this filters out
+    /// trivial stubs at the cost of recall.
+    #[arg(long, default_value_t = 4)]
     min_features: u32,
-    #[arg(long, default_value_t = 0.72)]
+    /// Minimum Jaccard similarity for a pair to be accepted as an anchor in
+    /// Phase 3. The grapnel default of 0.72 was calibrated for rich
+    /// same-compiler features; for cross-compiler with sparse stable
+    /// features, 0.5 is the sweet spot.
+    #[arg(long, default_value_t = 0.5)]
     anchor: f64,
-    #[arg(long, default_value_t = 0.48)]
+    /// Minimum Jaccard similarity for graph propagation in Phase 4.
+    #[arg(long, default_value_t = 0.2)]
     propagate: f64,
-    #[arg(long, default_value_t = 16)]
+    /// Phase 4 hub filter: skip propagating from a matched pair if either
+    /// side's call list exceeds this. Default 64 is calibrated for
+    /// cross-compiler — Clang inlines less than MSVC, often producing
+    /// 2-3× larger callee lists on the target side; the grapnel default of
+    /// 16 was too tight and blocked otherwise-matchable propagation paths.
+    #[arg(long, default_value_t = 64)]
     max_degree: usize,
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -58,9 +72,9 @@ struct Args {
     no_bigrams: bool,
 
     /// Bundle features from functions within this many call-graph hops into
-    /// each node's signature. 0 = no bundling. Higher = more topological
-    /// context (helps anchor leaf functions via their callers' strings).
-    #[arg(long, default_value_t = 0)]
+    /// each node's signature. 0 = no bundling. Hops=2 was the sweet spot in
+    /// tuning; hops=1 is too tight, hops=3 over-bundles into noise.
+    #[arg(long, default_value_t = 2)]
     hops: usize,
 
     /// When bundling, skip expansion through any node with more incoming or
@@ -71,16 +85,17 @@ struct Args {
 
     /// Bundling direction. "callees" walks downward (semantic dependencies).
     /// "callers" walks upward (where F is used). "both" walks both.
-    #[arg(long, default_value = "callees", value_parser = ["callees", "callers", "both"])]
+    #[arg(long, default_value = "both", value_parser = ["callees", "callers", "both"])]
     bundle: String,
 
     /// Restrict which feature categories get propagated through bundling.
     /// Comma-separated subset of: bigram, import, string, const, blkcount,
-    /// callcount. If unset, all categories propagate (current default).
-    /// Useful for "asymmetric bundling": e.g. `--bundle-features
-    /// import,string,const` carries the cross-compiler-stable signal through
-    /// the neighborhood while keeping bigrams local to each node.
-    #[arg(long, value_delimiter = ',')]
+    /// callcount. Default `import,string,const` is the asymmetric-bundling
+    /// sweet spot: carries cross-compiler-stable identity through the
+    /// neighborhood while keeping bigrams local. Set to "all" (any
+    /// nonexistent category sentinel) is not supported — pass an empty value
+    /// or omit the flag for the legacy "all categories propagate" behavior.
+    #[arg(long, value_delimiter = ',', default_value = "import,string,const")]
     bundle_features: Option<Vec<String>>,
 
     /// After --validate, sample N "should-match" pairs (same name in both
@@ -100,14 +115,76 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     inspect_pattern_limit: usize,
 
-    /// Number of iterative anchor-rebuild passes. 1 = single match (current
-    /// behavior). >1 = after pass 1, every confirmed pair (a, b) becomes a
-    /// synthetic identity feature `Feat::SyntCallee(S)` injected into any
-    /// function that calls `a` (base) or `b` (target). Subsequent passes can
-    /// then anchor functions on their *certified* call topology.
-    /// Stable IDs are preserved across passes.
-    #[arg(long, default_value_t = 1)]
+    /// Number of iterative anchor-rebuild passes. 1 = single match. >1 =
+    /// after each pass, every confirmed pair `(a, b)` is assigned a
+    /// synthetic identity feature `Feat::SyntCallee { depth, hash }` injected
+    /// into functions that reach `a` (base) or `b` (target) within
+    /// `--synt-depth` hops. Subsequent passes can then anchor functions on
+    /// their *certified* call topology. Stable IDs are preserved across
+    /// passes. **Default 2** when paired with `--synt-depth 2`: the multi-hop
+    /// reach gets pass-3-equivalent topology coverage in pass 2, and pass 3
+    /// then regresses (richer-but-asymmetric synth dilutes Jaccard via
+    /// inlining-asymmetry). Use `--iterations 3` only with `--synt-depth 1`.
+    #[arg(long, default_value_t = 2)]
     iterations: usize,
+
+    /// Minimum co-occurrence votes for a (base_dref, target_dref) pair to be
+    /// promoted to a synthetic data-ref identity. Higher = stricter, fewer
+    /// false data pairings. 0 = disable data-synth feature entirely.
+    #[arg(long, default_value_t = 3)]
+    data_synth_min_votes: u32,
+
+    /// Cap on data refs per function used for vote computation. Prevents
+    /// quadratic blowup from huge functions with hundreds of data refs.
+    /// Stricter (16) gave best precision in tuning; higher (32-64) widens
+    /// the data-pair pool slightly.
+    #[arg(long, default_value_t = 16)]
+    data_synth_max_drefs: usize,
+
+    /// One-at-a-time perturbation sweep around the current args. Loads PE
+    /// and PDB once, then re-runs the matcher with each parameter
+    /// individually perturbed across a few values, holding everything else
+    /// fixed at whatever the user passed. Prints a sensitivity table to
+    /// stdout — one block per parameter, with absolute prec/recall and
+    /// delta vs baseline. Auto-enables --validate. Each perturbation costs
+    /// one full match (~30s on 505S/SC); the full sweep is ~25-30 min.
+    #[arg(long)]
+    sweep: bool,
+
+    /// Run a small grid of pre-defined combinations of the precision/recall
+    /// levers identified by --sweep, to test for interactions (do
+    /// precision-positive perturbations stack, or do they saturate?). Loads
+    /// PE+PDB once. Auto-enables --validate. ~10-12 runs, ~6-8 min.
+    #[arg(long)]
+    sweep_combos: bool,
+
+    /// Minimum number of LSH bands a candidate must collide in to be scored
+    /// in Phase 2. With low rows-per-band (e.g. K=800 + bands=200 → rows=4),
+    /// many low-J candidates leak through individual bands by chance and
+    /// dominate Phase 2 cost. Requiring ≥2 collisions drops near-all J<0.3
+    /// candidates while keeping J≥0.5 candidates with ~99% probability —
+    /// near-free precision/speed in those regimes. Default 1 = original
+    /// "any-band collision" behaviour.
+    #[arg(long, default_value_t = 1)]
+    min_band_collisions: usize,
+
+    /// Write match results + synth maps to this file as a plain-text cache
+    /// for graph_diff to consume. Decouples visualization from the matcher
+    /// cycle — render graphs without re-running the 30s match each time.
+    #[arg(long)]
+    emit_matches: Option<PathBuf>,
+
+    /// Multi-hop SyntCallee depth. **Default 2**: each pass BFS-walks up to
+    /// 2 callee hops from each function and emits a depth-tagged synth
+    /// feature for any reached callee whose pair was confirmed in a prior
+    /// pass. Depth lives in the hash key so depth-1 and depth-2 don't
+    /// collide; weight decays geometrically (16/8/4/2). Multi-hop reach in
+    /// one pass collapses what previously took multiple iterations to
+    /// achieve via single-hop propagation: depth=2 iter=2 is +0.31pp prec /
+    /// +2.01pp recall / 28% faster than the prior depth=1 iter=3 default.
+    /// Depth>=3 over-fits (asymmetric inlining dilutes Jaccard).
+    #[arg(long, default_value_t = 2)]
+    synt_depth: u8,
 }
 
 /// All features are pre-hashed to u64 for cheap hashing in the inner MinHash
@@ -136,12 +213,22 @@ enum Feat {
     Nbr { depth: u8, hash: u64 },
     /// Synthetic callee identity from iterative anchor-rebuild. After a match
     /// pass, every confirmed pair `(a, b)` is assigned a unique synthetic ID
-    /// `S`. If function F calls address `a` (base) or `b` (target), it emits
-    /// `Feat::SyntCallee(S)` — the SAME `S` on both sides because both maps
-    /// reference the same matched-pair counter. This is a *certified*
-    /// cross-binary identity feature: it's only ever created from confirmed
-    /// matches, so its presence on both sides is guaranteed-stable.
-    SyntCallee(u64),
+    /// `S`. With `--synt-depth 1` (default), depth=1 entries are emitted for
+    /// every direct callee that has a synth ID — equivalent to the original
+    /// `Feat::SyntCallee(S)`. With `--synt-depth N>1`, BFS reaches N hops
+    /// and emits at each depth; depth lives in the hash key so depth-1 and
+    /// depth-2 don't collide. This is a *certified* cross-binary identity
+    /// feature: it's only ever created from confirmed matches.
+    SyntCallee { depth: u8, hash: u64 },
+    /// Synthetic global-data-ref identity from iterative anchor-rebuild,
+    /// inferred via co-occurrence voting. After a match pass, for each
+    /// confirmed function pair (F_a, F_b), every (X, Y) ∈ D(F_a) × D(F_b)
+    /// gets one vote. After all pairs voted, greedy max-vote pairing assigns
+    /// a synth ID `S` to high-co-occurrence (X, Y) data-ref pairs. In the
+    /// next iteration, any function referencing X (base) or Y (target) emits
+    /// `Feat::SyntDataRef(S)`. Captures shared singletons/vtables/lookup
+    /// tables (GUObjectArray, GLog, FName pool, etc.).
+    SyntDataRef(u64),
 }
 
 impl Feature for Feat {
@@ -166,8 +253,19 @@ impl Feature for Feat {
                 _ => 1,
             },
             // Certified cross-binary identity from a previous match pass.
-            // Strongest signal — weighted higher than imports/strings.
-            Feat::SyntCallee(_) => 16,
+            // Strongest signal at depth=1 (direct callee). Decays
+            // geometrically with depth: depth=2 callees-of-callees carry
+            // weaker evidence, etc. Each depth has its own feature space.
+            Feat::SyntCallee { depth, .. } => match depth {
+                1 => 16,
+                2 => 8,
+                3 => 4,
+                _ => 2,
+            },
+            // Inferred via co-occurrence voting — slightly less direct than
+            // SyntCallee (which comes from confirmed matches), so weighted at
+            // the same level as imports/strings rather than the SyntCallee 16.
+            Feat::SyntDataRef(_) => 8,
         }
     }
 }
@@ -183,12 +281,16 @@ fn fxhash<T: Hash>(t: T) -> u64 {
 /// and are useless for anchoring.
 const CONST_NOISE_THRESHOLD: i64 = 256;
 
+#[allow(clippy::too_many_arguments)]
 fn extract_features(
     pe: &PeLoader,
     func: &FunctionAnalysis,
     iat: &HashMap<u64, String>,
     use_bigrams: bool,
     synth_map: Option<&FxHashMap<u64, u64>>,
+    data_synth_map: Option<&FxHashMap<u64, u64>>,
+    funcs_by_ep: Option<&FxHashMap<u64, &FunctionAnalysis>>,
+    synt_depth: u8,
 ) -> FxHashSet<Feat> {
     let mut feats: FxHashSet<Feat> = FxHashSet::default();
     let bytes = match pe.read_at_va(func.entry_point, func.size) {
@@ -253,13 +355,50 @@ fn extract_features(
             feats.insert(Feat::Import(fxhash(name)));
         } else if let Some(name) = pe.thunk_import(call.target, iat) {
             feats.insert(Feat::Import(fxhash(&name)));
-        } else if let Some(map) = synth_map
-            && let Some(&s) = map.get(&call.target)
-        {
-            // Internal callee whose pair was confirmed in a prior pass.
-            // Emit the synthetic identity feature; both binaries' versions
-            // of this caller will produce the same `s`.
-            feats.insert(Feat::SyntCallee(s));
+        }
+    }
+
+    // Multi-hop SyntCallee: BFS callees up to `synt_depth` and emit a
+    // depth-tagged synth feature for any callee whose pair was confirmed in
+    // a prior pass. Depth-1 = direct callees (original behaviour). Higher
+    // depths reach grandchildren etc., propagating identity signal further
+    // per pass — at the cost of more features per signature and the risk
+    // of hub explosion through nodes with high branching factor.
+    if let Some(map) = synth_map
+        && let Some(funcs_by_ep) = funcs_by_ep
+    {
+        let mut visited: FxHashSet<u64> = FxHashSet::default();
+        visited.insert(func.entry_point);
+        let mut queue: VecDeque<(u64, u8)> = VecDeque::new();
+        for call in &func.calls {
+            if iat.contains_key(&call.target) || pe.thunk_import(call.target, iat).is_some() {
+                continue; // imports already handled
+            }
+            if visited.insert(call.target) {
+                queue.push_back((call.target, 1));
+            }
+        }
+        while let Some((node, depth)) = queue.pop_front() {
+            if let Some(&s) = map.get(&node) {
+                feats.insert(Feat::SyntCallee { depth, hash: s });
+            }
+            if depth < synt_depth
+                && let Some(callee_func) = funcs_by_ep.get(&node)
+            {
+                // Hub gate: don't recurse through high-branching nodes.
+                // Same threshold concept as bundling; hardcoded for now.
+                if callee_func.calls.len() > 32 {
+                    continue;
+                }
+                for c in &callee_func.calls {
+                    if iat.contains_key(&c.target) {
+                        continue;
+                    }
+                    if visited.insert(c.target) {
+                        queue.push_back((c.target, depth + 1));
+                    }
+                }
+            }
         }
     }
 
@@ -269,6 +408,14 @@ fn extract_features(
             && let Some(s) = read_string_data(pe, dref.target)
         {
             feats.insert(Feat::StringLit(fxhash(&s)));
+        }
+        // Synth global identity from co-occurrence voting in a prior pass.
+        // Both binaries' references to the same paired global produce the
+        // same `s` — captures GUObjectArray, vtables, GLog, etc.
+        if let Some(map) = data_synth_map
+            && let Some(&s) = map.get(&dref.target)
+        {
+            feats.insert(Feat::SyntDataRef(s));
         }
     }
 
@@ -291,10 +438,16 @@ fn build_graph(
     bundle_dir: &str,
     bundle_filter: Option<&FxHashSet<&'static str>>,
     synth_map: Option<&FxHashMap<u64, u64>>,
+    data_synth_map: Option<&FxHashMap<u64, u64>>,
+    synt_depth: u8,
 ) -> Result<Graph<u64>> {
     use rayon::prelude::*;
     let iat = pe.iat()?;
     let func_set: FxHashSet<u64> = funcs.iter().map(|f| f.entry_point).collect();
+    // Used by the multi-hop SyntCallee BFS in extract_features to recurse
+    // through the call graph.
+    let funcs_by_ep: FxHashMap<u64, &FunctionAnalysis> =
+        funcs.iter().map(|f| (f.entry_point, f)).collect();
 
     // Per-function "own" features.
     let own: FxHashMap<u64, FxHashSet<Feat>> = funcs
@@ -302,7 +455,16 @@ fn build_graph(
         .map(|f| {
             (
                 f.entry_point,
-                extract_features(pe, f, &iat, use_bigrams, synth_map),
+                extract_features(
+                    pe,
+                    f,
+                    &iat,
+                    use_bigrams,
+                    synth_map,
+                    data_synth_map,
+                    Some(&funcs_by_ep),
+                    synt_depth,
+                ),
             )
         })
         .collect();
@@ -502,7 +664,8 @@ fn feat_category(f: &Feat) -> &'static str {
         Feat::BlockCountBucket(_) => "blkcount",
         Feat::CallCountBucket(_) => "callcount",
         Feat::Nbr { .. } => "nbr",
-        Feat::SyntCallee(_) => "synt",
+        Feat::SyntCallee { .. } => "synt",
+        Feat::SyntDataRef(_) => "syndata",
     }
 }
 
@@ -762,6 +925,7 @@ fn report_pair(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn inspect_patterns(
     patterns: &[String],
     limit: usize,
@@ -775,6 +939,9 @@ fn inspect_patterns(
     use_bigrams: bool,
     synth_a: Option<&FxHashMap<u64, u64>>,
     synth_b: Option<&FxHashMap<u64, u64>>,
+    data_synth_a: Option<&FxHashMap<u64, u64>>,
+    data_synth_b: Option<&FxHashMap<u64, u64>>,
+    synt_depth: u8,
 ) -> Result<()> {
     let mut by_name_a: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
     for (addr, ns) in names_a {
@@ -821,8 +988,26 @@ fn inspect_patterns(
             else {
                 continue;
             };
-            let feats_a = extract_features(pe1, fa, &iat_a, use_bigrams, synth_a);
-            let feats_b = extract_features(pe2, fb, &iat_b, use_bigrams, synth_b);
+            let feats_a = extract_features(
+                pe1,
+                fa,
+                &iat_a,
+                use_bigrams,
+                synth_a,
+                data_synth_a,
+                Some(&funcs1_by_ep),
+                synt_depth,
+            );
+            let feats_b = extract_features(
+                pe2,
+                fb,
+                &iat_b,
+                use_bigrams,
+                synth_b,
+                data_synth_b,
+                Some(&funcs2_by_ep),
+                synt_depth,
+            );
             report_pair(
                 name,
                 addr_a,
@@ -862,6 +1047,9 @@ fn inspect_samples(
     use_bigrams: bool,
     synth_a: Option<&FxHashMap<u64, u64>>,
     synth_b: Option<&FxHashMap<u64, u64>>,
+    data_synth_a: Option<&FxHashMap<u64, u64>>,
+    data_synth_b: Option<&FxHashMap<u64, u64>>,
+    synt_depth: u8,
 ) -> Result<()> {
     // Build name → addrs maps.
     let mut by_name_a: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
@@ -946,8 +1134,26 @@ fn inspect_samples(
         for (name, addr_a, addr_b) in samples {
             let func_a = funcs1_by_ep[addr_a];
             let func_b = funcs2_by_ep[addr_b];
-            let feats_a = extract_features(pe1, func_a, &iat_a, use_bigrams, synth_a);
-            let feats_b = extract_features(pe2, func_b, &iat_b, use_bigrams, synth_b);
+            let feats_a = extract_features(
+                pe1,
+                func_a,
+                &iat_a,
+                use_bigrams,
+                synth_a,
+                data_synth_a,
+                Some(&funcs1_by_ep),
+                synt_depth,
+            );
+            let feats_b = extract_features(
+                pe2,
+                func_b,
+                &iat_b,
+                use_bigrams,
+                synth_b,
+                data_synth_b,
+                Some(&funcs2_by_ep),
+                synt_depth,
+            );
             report_pair(
                 name,
                 *addr_a,
@@ -978,29 +1184,38 @@ fn inspect_samples(
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+struct PdbContext {
+    names_a: HashMap<u64, Vec<String>>,
+    names_b: HashMap<u64, Vec<String>>,
+    baseline_addrs: usize,
+}
 
-    let t = std::time::Instant::now();
-    let mut last = t;
-    let mut tick = |label: &str| {
-        let now = std::time::Instant::now();
-        eprintln!(
-            "[{:>6.1}s +{:>5.1}s] {}",
-            (now - t).as_secs_f64(),
-            (now - last).as_secs_f64(),
-            label
-        );
-        last = now;
-    };
+struct RunResult {
+    sorted: Vec<(u64, u64)>,
+    synth_a: FxHashMap<u64, u64>,
+    synth_b: FxHashMap<u64, u64>,
+    data_synth_a: FxHashMap<u64, u64>,
+    data_synth_b: FxHashMap<u64, u64>,
+    matched: usize,
+    valid: usize,
+    tp: usize,
+    precision: f64,
+    recall: f64,
+    time_secs: f64,
+    disagree_examples: Vec<(String, String)>,
+}
 
-    tick(&format!("loading {}", args.base.display()));
-    let (pe1, funcs1) = analyze(&args.base)?;
-    tick(&format!("  {} functions", funcs1.len()));
-
-    tick(&format!("loading {}", args.target.display()));
-    let (pe2, funcs2) = analyze(&args.target)?;
-    tick(&format!("  {} functions", funcs2.len()));
+#[allow(clippy::too_many_arguments)]
+fn run_match(
+    args: &Args,
+    pe1: &PeLoader,
+    funcs1: &[FunctionAnalysis],
+    pe2: &PeLoader,
+    funcs2: &[FunctionAnalysis],
+    pdb: Option<&PdbContext>,
+    quiet: bool,
+) -> Result<RunResult> {
+    let start = std::time::Instant::now();
 
     let config = MatcherConfig {
         k_permutations: args.k,
@@ -1011,12 +1226,11 @@ fn main() -> Result<()> {
         max_propagation_degree: args.max_degree,
         size_mismatch_ratio: 2.0,
         pre_match_on_identifiers: false,
+        min_band_collisions: args.min_band_collisions,
     };
     let hasher = config.hasher(args.seed);
-
     let use_bigrams = !args.no_bigrams;
-    // Resolve the optional bundle-features filter into a static-str set the
-    // bundling loop can match against feat_category().
+
     static CATEGORIES: &[&str] = &[
         "bigram",
         "import",
@@ -1042,65 +1256,26 @@ fn main() -> Result<()> {
             .collect()
     });
 
-    // Iterative anchor-rebuild loop.
-    //
-    // Each pass rebuilds graphs (with synth maps from the previous pass's
-    // matches) and re-runs match_graphs. Confirmed pairs from earlier passes
-    // keep their synthetic IDs, so a function whose callees were matched in
-    // pass N can anchor on those certified identities in pass N+1.
+    let funcs1_by_ep: FxHashMap<u64, &FunctionAnalysis> =
+        funcs1.iter().map(|f| (f.entry_point, f)).collect();
+    let funcs2_by_ep: FxHashMap<u64, &FunctionAnalysis> =
+        funcs2.iter().map(|f| (f.entry_point, f)).collect();
+
     let mut synth_a: FxHashMap<u64, u64> = FxHashMap::default();
     let mut synth_b: FxHashMap<u64, u64> = FxHashMap::default();
     let mut next_synth_id: u64 = 0;
-    let mut matches: rustc_hash::FxHashMap<u64, u64> = rustc_hash::FxHashMap::default();
+    let mut data_synth_a: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut data_synth_b: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut next_data_synth_id: u64 = 0;
+    let mut matches: FxHashMap<u64, u64> = FxHashMap::default();
 
-    // Load PDBs once up front if validating — reused for per-pass metric.
-    // We only store the owned `names_a`/`names_b` maps + the precomputed
-    // baseline; the borrowed `sets_*` views are rebuilt fresh per pass to
-    // avoid self-referential storage.
-    let pdb_data: Option<(HashMap<u64, Vec<String>>, HashMap<u64, Vec<String>>, usize)> = if args
-        .validate
-    {
-        tick("loading PDBs");
-        let names_a = load_pdb_names(&args.base, &pe1)?;
-        let names_b = load_pdb_names(&args.target, &pe2)?;
+    let mut last_precision = 0.0;
+    let mut last_recall = 0.0;
+    let mut last_valid = 0usize;
+    let mut last_tp = 0usize;
 
-        let names_in_a: FxHashSet<&str> = names_a.values().flatten().map(String::as_str).collect();
-        let names_in_b: FxHashSet<&str> = names_b.values().flatten().map(String::as_str).collect();
-        let shared: usize = names_in_a
-            .iter()
-            .filter(|n| names_in_b.contains(*n))
-            .count();
-        let baseline_addrs: usize = names_a
-            .iter()
-            .filter(|(_, ns)| ns.iter().any(|n| names_in_b.contains(n.as_str())))
-            .count();
-
-        tick(&format!(
-            "  base PDB: {} addrs / {} unique names. target: {} addrs / {} unique names",
-            names_a.len(),
-            names_in_a.len(),
-            names_b.len(),
-            names_in_b.len(),
-        ));
-        println!("# baseline:");
-        println!(
-            "#   names present in BOTH binaries: {} ({:.1}% of base, {:.1}% of target)",
-            shared,
-            shared as f64 / names_in_a.len().max(1) as f64 * 100.0,
-            shared as f64 / names_in_b.len().max(1) as f64 * 100.0,
-        );
-        println!(
-            "#   base addrs with any name present in target: {} ({:.1}% of {} base addrs with names)",
-            baseline_addrs,
-            baseline_addrs as f64 / names_a.len().max(1) as f64 * 100.0,
-            names_a.len(),
-        );
-        Some((names_a, names_b, baseline_addrs))
-    } else {
-        None
-    };
-
-    for pass in 0..args.iterations.max(1) {
+    let total_passes = args.iterations.max(1);
+    for pass in 0..total_passes {
         let synth_a_ref = if synth_a.is_empty() {
             None
         } else {
@@ -1111,19 +1286,32 @@ fn main() -> Result<()> {
         } else {
             Some(&synth_b)
         };
+        let data_synth_a_ref = if data_synth_a.is_empty() {
+            None
+        } else {
+            Some(&data_synth_a)
+        };
+        let data_synth_b_ref = if data_synth_b.is_empty() {
+            None
+        } else {
+            Some(&data_synth_b)
+        };
 
-        tick(&format!(
-            "pass {}/{}: building base graph (bigrams={}, hops={}, bundle_filter={:?}, synth={})",
-            pass + 1,
-            args.iterations.max(1),
-            if use_bigrams { "on" } else { "off" },
-            args.hops,
-            bundle_filter,
-            synth_a.len(),
-        ));
+        if !quiet {
+            eprintln!(
+                "pass {}/{}: building graphs (bigrams={}, hops={}, bundle_filter={:?}, synth={}, data_synth={})",
+                pass + 1,
+                total_passes,
+                if use_bigrams { "on" } else { "off" },
+                args.hops,
+                bundle_filter,
+                synth_a.len(),
+                data_synth_a.len(),
+            );
+        }
         let g1 = build_graph(
-            &pe1,
-            &funcs1,
+            pe1,
+            funcs1,
             &hasher,
             use_bigrams,
             args.hops,
@@ -1131,11 +1319,12 @@ fn main() -> Result<()> {
             &args.bundle,
             bundle_filter.as_ref(),
             synth_a_ref,
+            data_synth_a_ref,
+            args.synt_depth,
         )?;
-        tick(&format!("pass {}: building target graph", pass + 1));
         let g2 = build_graph(
-            &pe2,
-            &funcs2,
+            pe2,
+            funcs2,
             &hasher,
             use_bigrams,
             args.hops,
@@ -1143,26 +1332,17 @@ fn main() -> Result<()> {
             &args.bundle,
             bundle_filter.as_ref(),
             synth_b_ref,
+            data_synth_b_ref,
+            args.synt_depth,
         )?;
 
-        tick(&format!("pass {}: matching", pass + 1));
+        if !quiet {
+            eprintln!("pass {}/{}: matching", pass + 1, total_passes);
+        }
         let new_matches = config.run(&g1, &g2);
-        tick(&format!(
-            "pass {}: done — matched {}",
-            pass + 1,
-            new_matches.len()
-        ));
 
-        // Promote the new matches into stable synthetic IDs. Pairs that were
-        // already in synth_a/synth_b keep their ID; only newly-confirmed
-        // pairs get fresh IDs. This stability is what lets pass N+1's
-        // signatures partly overlap with pass N's.
         let mut new_pair_count = 0usize;
         for (&a, &b) in &new_matches {
-            // Skip if either side already has a synth ID — keeps pass-1
-            // identity stable. (If a previous match was (a, x) and we now
-            // claim (a, b), we DON'T overwrite — pass 1 had higher
-            // confidence as a tiebreaker.)
             if synth_a.contains_key(&a) || synth_b.contains_key(&b) {
                 continue;
             }
@@ -1172,22 +1352,90 @@ fn main() -> Result<()> {
             synth_b.insert(b, s);
             new_pair_count += 1;
         }
+        if !quiet {
+            eprintln!(
+                "  pass {}: {} matches total, {} new pairs assigned synth IDs (synth pool: {})",
+                pass + 1,
+                new_matches.len(),
+                new_pair_count,
+                synth_a.len()
+            );
+        }
 
-        eprintln!(
-            "  pass {}: {} matches total, {} new pairs assigned synth IDs (synth pool: {})",
-            pass + 1,
-            new_matches.len(),
-            new_pair_count,
-            synth_a.len()
-        );
+        if args.data_synth_min_votes > 0 {
+            let mut votes: FxHashMap<(u64, u64), u32> = FxHashMap::default();
+            let collect_drefs = |func: &FunctionAnalysis| -> Vec<u64> {
+                func.data_refs
+                    .iter()
+                    .filter(|d| !(d.is_readonly && d.estimated_size.is_none()))
+                    .map(|d| d.target)
+                    .collect::<FxHashSet<_>>()
+                    .into_iter()
+                    .collect()
+            };
+            let mut pairs_voted = 0usize;
+            for (&a, &b) in &new_matches {
+                let (Some(&fa), Some(&fb)) = (funcs1_by_ep.get(&a), funcs2_by_ep.get(&b)) else {
+                    continue;
+                };
+                let drefs_a = collect_drefs(fa);
+                let drefs_b = collect_drefs(fb);
+                if drefs_a.len() > args.data_synth_max_drefs
+                    || drefs_b.len() > args.data_synth_max_drefs
+                {
+                    continue;
+                }
+                if drefs_a.is_empty() || drefs_b.is_empty() {
+                    continue;
+                }
+                pairs_voted += 1;
+                for &x in &drefs_a {
+                    for &y in &drefs_b {
+                        *votes.entry((x, y)).or_insert(0) += 1;
+                    }
+                }
+            }
 
-        // Per-pass precision/recall against the PDB-name baseline.
-        if let Some((names_a, names_b, baseline_addrs)) = &pdb_data {
-            let sets_a: HashMap<u64, FxHashSet<&str>> = names_a
+            let mut ranked: Vec<((u64, u64), u32)> = votes.into_iter().collect();
+            ranked.sort_unstable_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| a.0.0.cmp(&b.0.0))
+                    .then_with(|| a.0.1.cmp(&b.0.1))
+            });
+            let mut new_data_pair_count = 0usize;
+            for ((x, y), v) in ranked {
+                if v < args.data_synth_min_votes {
+                    break;
+                }
+                if data_synth_a.contains_key(&x) || data_synth_b.contains_key(&y) {
+                    continue;
+                }
+                let s = next_data_synth_id;
+                next_data_synth_id += 1;
+                data_synth_a.insert(x, s);
+                data_synth_b.insert(y, s);
+                new_data_pair_count += 1;
+            }
+
+            if !quiet {
+                eprintln!(
+                    "  pass {}: voted on {} function pairs → {} new data pairs (data-synth pool: {})",
+                    pass + 1,
+                    pairs_voted,
+                    new_data_pair_count,
+                    data_synth_a.len()
+                );
+            }
+        }
+
+        if let Some(pdb) = pdb {
+            let sets_a: HashMap<u64, FxHashSet<&str>> = pdb
+                .names_a
                 .iter()
                 .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
                 .collect();
-            let sets_b: HashMap<u64, FxHashSet<&str>> = names_b
+            let sets_b: HashMap<u64, FxHashSet<&str>> = pdb
+                .names_b
                 .iter()
                 .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
                 .collect();
@@ -1205,16 +1453,22 @@ fn main() -> Result<()> {
                 }
             }
             let precision = tp as f64 / both_named.max(1) as f64;
-            let recall = tp as f64 / (*baseline_addrs).max(1) as f64;
-            println!(
-                "# pass {}/{}: matched={} valid={} prec={:.2}% recall={:.2}%",
-                pass + 1,
-                args.iterations.max(1),
-                new_matches.len(),
-                both_named,
-                precision * 100.0,
-                recall * 100.0,
-            );
+            let recall = tp as f64 / pdb.baseline_addrs.max(1) as f64;
+            if !quiet {
+                println!(
+                    "# pass {}/{}: matched={} valid={} prec={:.2}% recall={:.2}%",
+                    pass + 1,
+                    total_passes,
+                    new_matches.len(),
+                    both_named,
+                    precision * 100.0,
+                    recall * 100.0,
+                );
+            }
+            last_precision = precision;
+            last_recall = recall;
+            last_valid = both_named;
+            last_tp = tp;
         }
 
         matches = new_matches;
@@ -1223,106 +1477,774 @@ fn main() -> Result<()> {
     let mut sorted: Vec<(u64, u64)> = matches.into_iter().collect();
     sorted.sort_unstable();
 
-    println!(
-        "# matched {} / {} base functions",
-        sorted.len(),
-        funcs1.len()
-    );
-
-    if let Some((names_a, names_b, baseline_addrs)) = pdb_data {
-        let sets_a: HashMap<u64, FxHashSet<&str>> = names_a
+    let mut disagree_examples: Vec<(String, String)> = Vec::new();
+    if let Some(pdb) = pdb {
+        let sets_a: HashMap<u64, FxHashSet<&str>> = pdb
+            .names_a
             .iter()
             .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
             .collect();
-        let sets_b: HashMap<u64, FxHashSet<&str>> = names_b
+        let sets_b: HashMap<u64, FxHashSet<&str>> = pdb
+            .names_b
             .iter()
             .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
             .collect();
-        let names_in_a: FxHashSet<&str> = sets_a.values().flatten().copied().collect();
-        let names_in_b: FxHashSet<&str> = sets_b.values().flatten().copied().collect();
-
-        // Validate each algorithm match. TP = the matched (a, b) pair shares
-        // at least one PDB name. This reuses the same first-public-then-
-        // procedure name pool binfold collects for its own database.
-        let mut both_named = 0usize;
-        let mut tp = 0usize;
-        let mut disagree_examples: Vec<(&str, &str)> = Vec::new();
         for (a, b) in &sorted {
+            if disagree_examples.len() >= 10 {
+                break;
+            }
             if let (Some(sa), Some(sb)) = (sets_a.get(a), sets_b.get(b)) {
                 if sa.is_empty() || sb.is_empty() {
                     continue;
                 }
-                both_named += 1;
-                if sa.iter().any(|n| sb.contains(n)) {
-                    tp += 1;
-                } else if disagree_examples.len() < 10 {
-                    let na = names_a
+                if !sa.iter().any(|n| sb.contains(n)) {
+                    let na = pdb
+                        .names_a
                         .get(a)
                         .and_then(|v| v.first())
-                        .map(String::as_str)
-                        .unwrap_or("");
-                    let nb = names_b
+                        .cloned()
+                        .unwrap_or_default();
+                    let nb = pdb
+                        .names_b
                         .get(b)
                         .and_then(|v| v.first())
-                        .map(String::as_str)
-                        .unwrap_or("");
+                        .cloned()
+                        .unwrap_or_default();
                     disagree_examples.push((na, nb));
                 }
             }
         }
+    }
 
-        let precision = tp as f64 / both_named.max(1) as f64;
-        let recall = tp as f64 / baseline_addrs.max(1) as f64;
+    let time_secs = start.elapsed().as_secs_f64();
+
+    Ok(RunResult {
+        matched: sorted.len(),
+        sorted,
+        synth_a,
+        synth_b,
+        data_synth_a,
+        data_synth_b,
+        valid: last_valid,
+        tp: last_tp,
+        precision: last_precision,
+        recall: last_recall,
+        time_secs,
+        disagree_examples,
+    })
+}
+
+fn write_matches_cache(path: &Path, args: &Args, result: &RunResult) -> Result<()> {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    writeln!(s, "# binfold graph-diff matches cache v1").unwrap();
+    writeln!(s, "[meta]").unwrap();
+    writeln!(s, "base_exe\t{}", args.base.display()).unwrap();
+    writeln!(s, "target_exe\t{}", args.target.display()).unwrap();
+    writeln!(s, "matched\t{}", result.matched).unwrap();
+    writeln!(s, "[matches]").unwrap();
+    for (a, b) in &result.sorted {
+        writeln!(s, "{:#x}\t{:#x}", a, b).unwrap();
+    }
+    let mut dump = |label: &str, m: &FxHashMap<u64, u64>| {
+        writeln!(s, "[{}]", label).unwrap();
+        let mut sorted: Vec<(&u64, &u64)> = m.iter().collect();
+        sorted.sort_unstable_by_key(|(k, _)| *k);
+        for (k, v) in sorted {
+            writeln!(s, "{:#x}\t{}", k, v).unwrap();
+        }
+    };
+    dump("synth_a", &result.synth_a);
+    dump("synth_b", &result.synth_b);
+    dump("data_synth_a", &result.data_synth_a);
+    dump("data_synth_b", &result.data_synth_b);
+    std::fs::write(path, s)?;
+    Ok(())
+}
+
+fn load_pdb_context(args: &Args, pe1: &PeLoader, pe2: &PeLoader) -> Result<PdbContext> {
+    let names_a = load_pdb_names(&args.base, pe1)?;
+    let names_b = load_pdb_names(&args.target, pe2)?;
+    let names_in_a: FxHashSet<&str> = names_a.values().flatten().map(String::as_str).collect();
+    let names_in_b: FxHashSet<&str> = names_b.values().flatten().map(String::as_str).collect();
+    let shared: usize = names_in_a
+        .iter()
+        .filter(|n| names_in_b.contains(*n))
+        .count();
+    let baseline_addrs: usize = names_a
+        .iter()
+        .filter(|(_, ns)| ns.iter().any(|n| names_in_b.contains(n.as_str())))
+        .count();
+    eprintln!(
+        "  base PDB: {} addrs / {} unique names. target: {} addrs / {} unique names",
+        names_a.len(),
+        names_in_a.len(),
+        names_b.len(),
+        names_in_b.len(),
+    );
+    println!("# baseline:");
+    println!(
+        "#   names present in BOTH binaries: {} ({:.1}% of base, {:.1}% of target)",
+        shared,
+        shared as f64 / names_in_a.len().max(1) as f64 * 100.0,
+        shared as f64 / names_in_b.len().max(1) as f64 * 100.0,
+    );
+    println!(
+        "#   base addrs with any name present in target: {} ({:.1}% of {} base addrs with names)",
+        baseline_addrs,
+        baseline_addrs as f64 / names_a.len().max(1) as f64 * 100.0,
+        names_a.len(),
+    );
+    Ok(PdbContext {
+        names_a,
+        names_b,
+        baseline_addrs,
+    })
+}
+
+fn run_sweep(
+    base_args: &Args,
+    pe1: &PeLoader,
+    funcs1: &[FunctionAnalysis],
+    pe2: &PeLoader,
+    funcs2: &[FunctionAnalysis],
+    pdb: &PdbContext,
+) -> Result<()> {
+    type Mut = Box<dyn Fn(&mut Args)>;
+    let groups: Vec<(&'static str, Vec<(&'static str, Mut)>)> = vec![
+        (
+            "k (bands tracks K, rows≈8)",
+            vec![
+                (
+                    "k=200 bands=25",
+                    Box::new(|a: &mut Args| {
+                        a.k = 200;
+                        a.bands = 25;
+                    }),
+                ),
+                (
+                    "k=400 bands=50",
+                    Box::new(|a: &mut Args| {
+                        a.k = 400;
+                        a.bands = 50;
+                    }),
+                ),
+                (
+                    "k=1200 bands=150",
+                    Box::new(|a: &mut Args| {
+                        a.k = 1200;
+                        a.bands = 150;
+                    }),
+                ),
+                (
+                    "k=1600 bands=200",
+                    Box::new(|a: &mut Args| {
+                        a.k = 1600;
+                        a.bands = 200;
+                    }),
+                ),
+            ],
+        ),
+        (
+            "bands at fixed K (rows-per-band)",
+            vec![
+                ("bands=50 (rows≈16)", Box::new(|a: &mut Args| a.bands = 50)),
+                ("bands=200 (rows≈4)", Box::new(|a: &mut Args| a.bands = 200)),
+            ],
+        ),
+        (
+            "anchor threshold",
+            vec![
+                ("anchor=0.3", Box::new(|a: &mut Args| a.anchor = 0.3)),
+                ("anchor=0.4", Box::new(|a: &mut Args| a.anchor = 0.4)),
+                ("anchor=0.6", Box::new(|a: &mut Args| a.anchor = 0.6)),
+                ("anchor=0.7", Box::new(|a: &mut Args| a.anchor = 0.7)),
+            ],
+        ),
+        (
+            "propagate threshold",
+            vec![
+                (
+                    "propagate=0.05",
+                    Box::new(|a: &mut Args| a.propagate = 0.05),
+                ),
+                ("propagate=0.1", Box::new(|a: &mut Args| a.propagate = 0.1)),
+                ("propagate=0.3", Box::new(|a: &mut Args| a.propagate = 0.3)),
+                ("propagate=0.4", Box::new(|a: &mut Args| a.propagate = 0.4)),
+            ],
+        ),
+        (
+            "max-degree (Phase 4 hub gate)",
+            vec![
+                ("max-degree=16", Box::new(|a: &mut Args| a.max_degree = 16)),
+                ("max-degree=32", Box::new(|a: &mut Args| a.max_degree = 32)),
+                (
+                    "max-degree=128",
+                    Box::new(|a: &mut Args| a.max_degree = 128),
+                ),
+                (
+                    "max-degree=256",
+                    Box::new(|a: &mut Args| a.max_degree = 256),
+                ),
+            ],
+        ),
+        (
+            "min-features",
+            vec![
+                (
+                    "min-features=2",
+                    Box::new(|a: &mut Args| a.min_features = 2),
+                ),
+                (
+                    "min-features=8",
+                    Box::new(|a: &mut Args| a.min_features = 8),
+                ),
+                (
+                    "min-features=16",
+                    Box::new(|a: &mut Args| a.min_features = 16),
+                ),
+                (
+                    "min-features=32",
+                    Box::new(|a: &mut Args| a.min_features = 32),
+                ),
+            ],
+        ),
+        (
+            "hops (bundling depth)",
+            vec![
+                ("hops=0", Box::new(|a: &mut Args| a.hops = 0)),
+                ("hops=1", Box::new(|a: &mut Args| a.hops = 1)),
+                ("hops=3", Box::new(|a: &mut Args| a.hops = 3)),
+            ],
+        ),
+        (
+            "hub-degree (bundling hub gate)",
+            vec![
+                ("hub-degree=8", Box::new(|a: &mut Args| a.hub_degree = 8)),
+                ("hub-degree=16", Box::new(|a: &mut Args| a.hub_degree = 16)),
+                ("hub-degree=64", Box::new(|a: &mut Args| a.hub_degree = 64)),
+                (
+                    "hub-degree=128",
+                    Box::new(|a: &mut Args| a.hub_degree = 128),
+                ),
+            ],
+        ),
+        (
+            "bundle direction",
+            vec![
+                (
+                    "bundle=callees",
+                    Box::new(|a: &mut Args| a.bundle = "callees".to_string()),
+                ),
+                (
+                    "bundle=callers",
+                    Box::new(|a: &mut Args| a.bundle = "callers".to_string()),
+                ),
+            ],
+        ),
+        (
+            "bundle-features",
+            vec![
+                (
+                    "(all categories propagate)",
+                    Box::new(|a: &mut Args| a.bundle_features = None),
+                ),
+                (
+                    "import,string",
+                    Box::new(|a: &mut Args| {
+                        a.bundle_features = Some(vec!["import".into(), "string".into()])
+                    }),
+                ),
+                (
+                    "string only",
+                    Box::new(|a: &mut Args| a.bundle_features = Some(vec!["string".into()])),
+                ),
+                (
+                    "import,string,const,callcount,blkcount",
+                    Box::new(|a: &mut Args| {
+                        a.bundle_features = Some(vec![
+                            "import".into(),
+                            "string".into(),
+                            "const".into(),
+                            "callcount".into(),
+                            "blkcount".into(),
+                        ])
+                    }),
+                ),
+            ],
+        ),
+        (
+            "bigrams",
+            vec![("--no-bigrams", Box::new(|a: &mut Args| a.no_bigrams = true))],
+        ),
+        (
+            "iterations",
+            vec![
+                ("iterations=1", Box::new(|a: &mut Args| a.iterations = 1)),
+                ("iterations=2", Box::new(|a: &mut Args| a.iterations = 2)),
+                ("iterations=4", Box::new(|a: &mut Args| a.iterations = 4)),
+                ("iterations=5", Box::new(|a: &mut Args| a.iterations = 5)),
+            ],
+        ),
+        (
+            "data-synth-min-votes",
+            vec![
+                (
+                    "min-votes=0 (off)",
+                    Box::new(|a: &mut Args| a.data_synth_min_votes = 0),
+                ),
+                (
+                    "min-votes=2",
+                    Box::new(|a: &mut Args| a.data_synth_min_votes = 2),
+                ),
+                (
+                    "min-votes=5",
+                    Box::new(|a: &mut Args| a.data_synth_min_votes = 5),
+                ),
+                (
+                    "min-votes=10",
+                    Box::new(|a: &mut Args| a.data_synth_min_votes = 10),
+                ),
+            ],
+        ),
+        (
+            "data-synth-max-drefs",
+            vec![
+                (
+                    "max-drefs=8",
+                    Box::new(|a: &mut Args| a.data_synth_max_drefs = 8),
+                ),
+                (
+                    "max-drefs=32",
+                    Box::new(|a: &mut Args| a.data_synth_max_drefs = 32),
+                ),
+                (
+                    "max-drefs=64",
+                    Box::new(|a: &mut Args| a.data_synth_max_drefs = 64),
+                ),
+            ],
+        ),
+    ];
+
+    let total_runs: usize = 1 + groups.iter().map(|(_, vs)| vs.len()).sum::<usize>();
+
+    println!();
+    println!(
+        "# === sweep: OAT perturbation ({} runs, ~{:.0}-{:.0} min estimated) ===",
+        total_runs,
+        total_runs as f64 * 25.0 / 60.0,
+        total_runs as f64 * 45.0 / 60.0,
+    );
+    eprintln!("[sweep 1/{}] running baseline...", total_runs);
+    let baseline = run_match(base_args, pe1, funcs1, pe2, funcs2, Some(pdb), true)?;
+    println!();
+    println!(
+        "# baseline: prec={:.2}%  recall={:.2}%  matched={}  valid={}  time={:.1}s",
+        baseline.precision * 100.0,
+        baseline.recall * 100.0,
+        baseline.matched,
+        baseline.valid,
+        baseline.time_secs
+    );
+
+    let mut run_idx = 1usize;
+    for (group_name, variations) in &groups {
+        println!();
+        println!("# === {} ===", group_name);
+        println!(
+            "# {:<42} {:>7} {:>7} {:>9} {:>8} {:>7}   {}",
+            "config", "prec", "recall", "matched", "valid", "time", "Δ vs baseline"
+        );
+        println!(
+            "# {:<42} {:>6.2}% {:>6.2}% {:>9} {:>8} {:>6.1}s   (baseline)",
+            "[baseline]",
+            baseline.precision * 100.0,
+            baseline.recall * 100.0,
+            baseline.matched,
+            baseline.valid,
+            baseline.time_secs,
+        );
+        for (label, mutate) in variations {
+            run_idx += 1;
+            eprintln!(
+                "[sweep {}/{}] {}: {} ...",
+                run_idx, total_runs, group_name, label
+            );
+            let mut a = base_args.clone();
+            mutate(&mut a);
+            let r = match run_match(&a, pe1, funcs1, pe2, funcs2, Some(pdb), true) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("# {:<42} ERROR: {}", label, e);
+                    continue;
+                }
+            };
+            let dp = (r.precision - baseline.precision) * 100.0;
+            let dr = (r.recall - baseline.recall) * 100.0;
+            println!(
+                "# {:<42} {:>6.2}% {:>6.2}% {:>9} {:>8} {:>6.1}s   Δprec={:+.2}pp Δrecall={:+.2}pp",
+                label,
+                r.precision * 100.0,
+                r.recall * 100.0,
+                r.matched,
+                r.valid,
+                r.time_secs,
+                dp,
+                dr,
+            );
+        }
+    }
+
+    println!();
+    println!(
+        "# sweep done. baseline: prec={:.2}% recall={:.2}%",
+        baseline.precision * 100.0,
+        baseline.recall * 100.0
+    );
+    Ok(())
+}
+
+fn run_sweep_combos(
+    base_args: &Args,
+    pe1: &PeLoader,
+    funcs1: &[FunctionAnalysis],
+    pe2: &PeLoader,
+    funcs2: &[FunctionAnalysis],
+    pdb: &PdbContext,
+) -> Result<()> {
+    type Mut = Box<dyn Fn(&mut Args)>;
+    // Combinations of OAT-identified levers. Each tests whether the
+    // independent perturbations stack additively or saturate when combined.
+    // Categories:
+    //  - "stack precision-positives": bands=50, max-degree=32, min-features=32
+    //  - "trade prec for recall": add bundle shape categories or anchor=0.6
+    //  - "max-precision push": stack + raise anchor
+    //  - "max-recall push": loosen bands, drop bigrams
+    let combos: Vec<(&'static str, Mut)> = vec![
+        (
+            "bands=50 + min-features=32",
+            Box::new(|a: &mut Args| {
+                a.bands = 50;
+                a.min_features = 32;
+            }),
+        ),
+        (
+            "bands=50 + max-degree=32",
+            Box::new(|a: &mut Args| {
+                a.bands = 50;
+                a.max_degree = 32;
+            }),
+        ),
+        (
+            "min-features=32 + max-degree=32",
+            Box::new(|a: &mut Args| {
+                a.min_features = 32;
+                a.max_degree = 32;
+            }),
+        ),
+        (
+            "bands=50 + min-features=32 + max-degree=32",
+            Box::new(|a: &mut Args| {
+                a.bands = 50;
+                a.min_features = 32;
+                a.max_degree = 32;
+            }),
+        ),
+        (
+            "triple stack + anchor=0.6",
+            Box::new(|a: &mut Args| {
+                a.bands = 50;
+                a.min_features = 32;
+                a.max_degree = 32;
+                a.anchor = 0.6;
+            }),
+        ),
+        (
+            "triple stack + anchor=0.7",
+            Box::new(|a: &mut Args| {
+                a.bands = 50;
+                a.min_features = 32;
+                a.max_degree = 32;
+                a.anchor = 0.7;
+            }),
+        ),
+        (
+            "triple stack + bundle+callcount,blkcount",
+            Box::new(|a: &mut Args| {
+                a.bands = 50;
+                a.min_features = 32;
+                a.max_degree = 32;
+                a.bundle_features = Some(vec![
+                    "import".into(),
+                    "string".into(),
+                    "const".into(),
+                    "callcount".into(),
+                    "blkcount".into(),
+                ]);
+            }),
+        ),
+        (
+            "min-features=32 + bundle+callcount,blkcount",
+            Box::new(|a: &mut Args| {
+                a.min_features = 32;
+                a.bundle_features = Some(vec![
+                    "import".into(),
+                    "string".into(),
+                    "const".into(),
+                    "callcount".into(),
+                    "blkcount".into(),
+                ]);
+            }),
+        ),
+        (
+            "bundle+callcount,blkcount + max-degree=128",
+            Box::new(|a: &mut Args| {
+                a.bundle_features = Some(vec![
+                    "import".into(),
+                    "string".into(),
+                    "const".into(),
+                    "callcount".into(),
+                    "blkcount".into(),
+                ]);
+                a.max_degree = 128;
+            }),
+        ),
+        (
+            "max-recall push: bands=200 + bundle+callcount,blkcount",
+            Box::new(|a: &mut Args| {
+                a.bands = 200;
+                a.bundle_features = Some(vec![
+                    "import".into(),
+                    "string".into(),
+                    "const".into(),
+                    "callcount".into(),
+                    "blkcount".into(),
+                ]);
+            }),
+        ),
+        (
+            "max-recall push: --no-bigrams + bundle+callcount,blkcount",
+            Box::new(|a: &mut Args| {
+                a.no_bigrams = true;
+                a.bundle_features = Some(vec![
+                    "import".into(),
+                    "string".into(),
+                    "const".into(),
+                    "callcount".into(),
+                    "blkcount".into(),
+                ]);
+            }),
+        ),
+    ];
+
+    let total_runs = 1 + combos.len();
+
+    println!();
+    println!(
+        "# === sweep-combos: {} combinations of OAT-identified levers ===",
+        combos.len()
+    );
+    eprintln!("[combos 1/{}] running baseline...", total_runs);
+    let baseline = run_match(base_args, pe1, funcs1, pe2, funcs2, Some(pdb), true)?;
+    println!();
+    println!(
+        "# baseline: prec={:.2}%  recall={:.2}%  matched={}  valid={}  time={:.1}s",
+        baseline.precision * 100.0,
+        baseline.recall * 100.0,
+        baseline.matched,
+        baseline.valid,
+        baseline.time_secs
+    );
+    println!();
+    println!(
+        "# {:<58} {:>7} {:>7} {:>9} {:>8} {:>7}   {}",
+        "config", "prec", "recall", "matched", "valid", "time", "Δ vs baseline"
+    );
+    println!(
+        "# {:<58} {:>6.2}% {:>6.2}% {:>9} {:>8} {:>6.1}s   (baseline)",
+        "[baseline]",
+        baseline.precision * 100.0,
+        baseline.recall * 100.0,
+        baseline.matched,
+        baseline.valid,
+        baseline.time_secs,
+    );
+
+    let mut idx = 1usize;
+    for (label, mutate) in &combos {
+        idx += 1;
+        eprintln!("[combos {}/{}] {} ...", idx, total_runs, label);
+        let mut a = base_args.clone();
+        mutate(&mut a);
+        let r = match run_match(&a, pe1, funcs1, pe2, funcs2, Some(pdb), true) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("# {:<58} ERROR: {}", label, e);
+                continue;
+            }
+        };
+        let dp = (r.precision - baseline.precision) * 100.0;
+        let dr = (r.recall - baseline.recall) * 100.0;
+        println!(
+            "# {:<58} {:>6.2}% {:>6.2}% {:>9} {:>8} {:>6.1}s   Δprec={:+.2}pp Δrecall={:+.2}pp",
+            label,
+            r.precision * 100.0,
+            r.recall * 100.0,
+            r.matched,
+            r.valid,
+            r.time_secs,
+            dp,
+            dr,
+        );
+    }
+
+    println!();
+    println!(
+        "# combos done. baseline: prec={:.2}% recall={:.2}%",
+        baseline.precision * 100.0,
+        baseline.recall * 100.0
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let t = std::time::Instant::now();
+    let mut last = t;
+    let mut tick = |label: &str| {
+        let now = std::time::Instant::now();
+        eprintln!(
+            "[{:>6.1}s +{:>5.1}s] {}",
+            (now - t).as_secs_f64(),
+            (now - last).as_secs_f64(),
+            label
+        );
+        last = now;
+    };
+
+    tick(&format!("loading {}", args.base.display()));
+    let (pe1, funcs1) = analyze(&args.base)?;
+    tick(&format!("  {} functions", funcs1.len()));
+
+    tick(&format!("loading {}", args.target.display()));
+    let (pe2, funcs2) = analyze(&args.target)?;
+    tick(&format!("  {} functions", funcs2.len()));
+
+    let need_pdb = args.validate || args.sweep || args.sweep_combos;
+    let pdb_ctx: Option<PdbContext> = if need_pdb {
+        tick("loading PDBs");
+        Some(load_pdb_context(&args, &pe1, &pe2)?)
+    } else {
+        None
+    };
+
+    if args.sweep {
+        return run_sweep(
+            &args,
+            &pe1,
+            &funcs1,
+            &pe2,
+            &funcs2,
+            pdb_ctx.as_ref().expect("sweep requires PDBs"),
+        );
+    }
+    if args.sweep_combos {
+        return run_sweep_combos(
+            &args,
+            &pe1,
+            &funcs1,
+            &pe2,
+            &funcs2,
+            pdb_ctx.as_ref().expect("sweep-combos requires PDBs"),
+        );
+    }
+
+    let result = run_match(&args, &pe1, &funcs1, &pe2, &funcs2, pdb_ctx.as_ref(), false)?;
+    tick("matching done");
+
+    if let Some(path) = &args.emit_matches {
+        write_matches_cache(path, &args, &result)?;
+        tick(&format!("wrote matches cache to {}", path.display()));
+    }
+
+    println!(
+        "# matched {} / {} base functions",
+        result.matched,
+        funcs1.len()
+    );
+
+    if let Some(pdb) = &pdb_ctx {
         println!("# matches:");
         println!(
             "#   algorithm matched {} / {} base functions",
-            sorted.len(),
+            result.matched,
             funcs1.len()
         );
         println!(
             "#   of matches, {} have PDB names on BOTH sides (validatable)",
-            both_named
+            result.valid
         );
         println!(
             "#   precision (any-name overlap): {} / {} = {:.2}%",
-            tp,
-            both_named,
-            precision * 100.0
+            result.tp,
+            result.valid,
+            result.precision * 100.0
         );
         println!(
             "#   recall vs baseline:           {} / {} = {:.2}%",
-            tp,
-            baseline_addrs,
-            recall * 100.0
+            result.tp,
+            pdb.baseline_addrs,
+            result.recall * 100.0
         );
-        if !disagree_examples.is_empty() {
+        if !result.disagree_examples.is_empty() {
             println!("# example disagreements (first name shown each side):");
-            for (na, nb) in &disagree_examples {
-                let na = if na.len() > 80 { &na[..80] } else { na };
-                let nb = if nb.len() > 80 { &nb[..80] } else { nb };
+            for (na, nb) in &result.disagree_examples {
+                let na = if na.len() > 80 {
+                    &na[..80]
+                } else {
+                    na.as_str()
+                };
+                let nb = if nb.len() > 80 {
+                    &nb[..80]
+                } else {
+                    nb.as_str()
+                };
                 println!("#   {}\n# ≠ {}", na, nb);
             }
         }
 
-        // Inspectors get the synth maps from the final iteration so they can
-        // report what the matcher actually saw on the last pass.
-        let synth_a_ref = if synth_a.is_empty() {
+        let names_in_a: FxHashSet<&str> =
+            pdb.names_a.values().flatten().map(String::as_str).collect();
+        let names_in_b: FxHashSet<&str> =
+            pdb.names_b.values().flatten().map(String::as_str).collect();
+        let synth_a_ref = if result.synth_a.is_empty() {
             None
         } else {
-            Some(&synth_a)
+            Some(&result.synth_a)
         };
-        let synth_b_ref = if synth_b.is_empty() {
+        let synth_b_ref = if result.synth_b.is_empty() {
             None
         } else {
-            Some(&synth_b)
+            Some(&result.synth_b)
+        };
+        let data_synth_a_ref = if result.data_synth_a.is_empty() {
+            None
+        } else {
+            Some(&result.data_synth_a)
+        };
+        let data_synth_b_ref = if result.data_synth_b.is_empty() {
+            None
+        } else {
+            Some(&result.data_synth_b)
         };
 
         if args.inspect_samples > 0 {
             inspect_samples(
                 args.inspect_samples,
-                &sorted,
-                &names_a,
-                &names_b,
+                &result.sorted,
+                &pdb.names_a,
+                &pdb.names_b,
                 &names_in_a,
                 &names_in_b,
                 &funcs1,
@@ -1332,6 +2254,9 @@ fn main() -> Result<()> {
                 !args.no_bigrams,
                 synth_a_ref,
                 synth_b_ref,
+                data_synth_a_ref,
+                data_synth_b_ref,
+                args.synt_depth,
             )?;
         }
 
@@ -1339,9 +2264,9 @@ fn main() -> Result<()> {
             inspect_patterns(
                 &args.inspect_patterns,
                 args.inspect_pattern_limit,
-                &sorted,
-                &names_a,
-                &names_b,
+                &result.sorted,
+                &pdb.names_a,
+                &pdb.names_b,
                 &funcs1,
                 &funcs2,
                 &pe1,
@@ -1349,16 +2274,19 @@ fn main() -> Result<()> {
                 !args.no_bigrams,
                 synth_a_ref,
                 synth_b_ref,
+                data_synth_a_ref,
+                data_synth_b_ref,
+                args.synt_depth,
             )?;
         }
     }
 
     println!("# {:>16} -> {:>16}", "base", "target");
-    for (a, b) in sorted.iter().take(args.limit) {
+    for (a, b) in result.sorted.iter().take(args.limit) {
         println!("{:#018x} -> {:#018x}", a, b);
     }
-    if sorted.len() > args.limit {
-        println!("... ({} more)", sorted.len() - args.limit);
+    if result.sorted.len() > args.limit {
+        println!("... ({} more)", result.sorted.len() - args.limit);
     }
 
     Ok(())
