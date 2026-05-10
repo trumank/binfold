@@ -546,12 +546,15 @@ fn report_pair(
     feats_a: &FxHashSet<Feat>,
     feats_b: &FxHashSet<Feat>,
     alg_match: &FxHashMap<u64, u64>,
+    alg_match_rev: &FxHashMap<u64, u64>,
     names_a: &HashMap<u64, Vec<String>>,
     names_b: &HashMap<u64, Vec<String>>,
     iat_a: &HashMap<u64, String>,
     iat_b: &HashMap<u64, String>,
     pe1: &PeLoader,
     pe2: &PeLoader,
+    synth_a: Option<&FxHashMap<u64, u64>>,
+    synth_b: Option<&FxHashMap<u64, u64>>,
 ) {
     let name_short = if name.len() > 78 {
         format!("{}…", &name[..78])
@@ -596,18 +599,76 @@ fn report_pair(
     );
     println!("#   algorithm: base → {}", alg_str);
 
+    // Target's match status — was it claimed by another base addr?
+    let target_status = match alg_match_rev.get(&addr_b).copied() {
+        None => "<unmatched>".to_string(),
+        Some(a) if a == addr_a => "<correct (paired with our base)>".to_string(),
+        Some(a) => {
+            let claim_name = names_a
+                .get(&a)
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_default();
+            let trim = if claim_name.len() > 64 {
+                format!("{}…", &claim_name[..64])
+            } else {
+                claim_name
+            };
+            format!("claimed by base {:#x} ({})", a, trim)
+        }
+    };
+    println!("#   target ← {}", target_status);
+
     // Callee lists side-by-side — directly visualizes inlining differences.
+    // Annotate each callee with synth-status: ✓=both sides have synth IDs and
+    // they're paired, △=both have IDs but different pairs, ·=at least one
+    // side missing synth ID, ⌀=internal call but not in synth maps yet.
     let calls_a = callee_labels(func_a, pe1, iat_a, names_a);
     let calls_b = callee_labels(func_b, pe2, iat_b, names_b);
+    let synth_marks_a: Vec<String> = func_a
+        .calls
+        .iter()
+        .map(|c| match synth_a.and_then(|m| m.get(&c.target).copied()) {
+            Some(s) => format!("S={}", s),
+            None => "—".to_string(),
+        })
+        .collect();
+    let synth_marks_b: Vec<String> = func_b
+        .calls
+        .iter()
+        .map(|c| match synth_b.and_then(|m| m.get(&c.target).copied()) {
+            Some(s) => format!("S={}", s),
+            None => "—".to_string(),
+        })
+        .collect();
+    let mut paired_synth_count = 0usize;
+    let synth_a_set: FxHashSet<u64> = synth_marks_a
+        .iter()
+        .filter_map(|s| s.strip_prefix("S=").and_then(|n| n.parse().ok()))
+        .collect();
+    let synth_b_set: FxHashSet<u64> = synth_marks_b
+        .iter()
+        .filter_map(|s| s.strip_prefix("S=").and_then(|n| n.parse().ok()))
+        .collect();
+    for s in &synth_a_set {
+        if synth_b_set.contains(s) {
+            paired_synth_count += 1;
+        }
+    }
     let max = calls_a.len().max(calls_b.len());
     if max > 0 {
-        println!("#   callees:");
+        println!(
+            "#   callees: ({} synth IDs paired across sides)",
+            paired_synth_count
+        );
         for i in 0..max {
             let ca = calls_a.get(i).map(String::as_str).unwrap_or("");
             let cb = calls_b.get(i).map(String::as_str).unwrap_or("");
-            let ca = if ca.len() > 50 { &ca[..50] } else { ca };
-            let cb = if cb.len() > 50 { &cb[..50] } else { cb };
-            println!("#     {:<52} | {}", ca, cb);
+            let ca = if ca.len() > 46 { &ca[..46] } else { ca };
+            let cb = if cb.len() > 46 { &cb[..46] } else { cb };
+            let ma = synth_marks_a.get(i).map(String::as_str).unwrap_or("");
+            let mb = synth_marks_b.get(i).map(String::as_str).unwrap_or("");
+            println!("#     [{:<8}] {:<48} | [{:<8}] {}", ma, ca, mb, cb);
         }
     }
 
@@ -654,6 +715,50 @@ fn report_pair(
         union_all,
         jac_all
     );
+
+    // Weighted Jaccard — what the matcher actually approximates via MinHash.
+    // This is what determines whether the pair clears the anchor threshold.
+    // Note: this is OWN-only (no bundling); the matcher runs with bundling.
+    // If hops>0 in the run, the actual matcher view is even richer than this.
+    let w_a: u32 = feats_a.iter().map(|f| f.weight()).sum();
+    let w_b: u32 = feats_b.iter().map(|f| f.weight()).sum();
+    let w_inter: u32 = feats_a.intersection(feats_b).map(|f| f.weight()).sum();
+    let w_union = w_a + w_b - w_inter;
+    let w_jac = if w_union > 0 {
+        w_inter as f64 / w_union as f64
+    } else {
+        0.0
+    };
+    println!(
+        "#     {:>9}: a={:>5} b={:>5} ∩={:>5} ∪={:>5}  J={:.3}  (own-only, no bundling)",
+        "WEIGHTED", w_a, w_b, w_inter, w_union, w_jac
+    );
+
+    // SyntCallee feature signal — what synth IDs would be added to this
+    // function's feature set in the next iteration's signature. Both sides
+    // emit Feat::SyntCallee(S) for any callee with a synth ID; if both sides
+    // have callees with the SAME S, that's a free cross-binary anchor.
+    if let (Some(sa), Some(sb)) = (synth_a, synth_b) {
+        let mut a_ids: FxHashSet<u64> = FxHashSet::default();
+        let mut b_ids: FxHashSet<u64> = FxHashSet::default();
+        for c in &func_a.calls {
+            if let Some(&s) = sa.get(&c.target) {
+                a_ids.insert(s);
+            }
+        }
+        for c in &func_b.calls {
+            if let Some(&s) = sb.get(&c.target) {
+                b_ids.insert(s);
+            }
+        }
+        let shared = a_ids.intersection(&b_ids).count();
+        println!(
+            "#   synth-callee signal: a={} b={} shared={} (each shared = 1 weight-16 anchor on both sides)",
+            a_ids.len(),
+            b_ids.len(),
+            shared
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -668,6 +773,8 @@ fn inspect_patterns(
     pe1: &PeLoader,
     pe2: &PeLoader,
     use_bigrams: bool,
+    synth_a: Option<&FxHashMap<u64, u64>>,
+    synth_b: Option<&FxHashMap<u64, u64>>,
 ) -> Result<()> {
     let mut by_name_a: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
     for (addr, ns) in names_a {
@@ -682,6 +789,7 @@ fn inspect_patterns(
         }
     }
     let alg_match: FxHashMap<u64, u64> = sorted.iter().copied().collect();
+    let alg_match_rev: FxHashMap<u64, u64> = sorted.iter().map(|&(a, b)| (b, a)).collect();
     let funcs1_by_ep: FxHashMap<u64, &FunctionAnalysis> =
         funcs1.iter().map(|f| (f.entry_point, f)).collect();
     let funcs2_by_ep: FxHashMap<u64, &FunctionAnalysis> =
@@ -713,11 +821,26 @@ fn inspect_patterns(
             else {
                 continue;
             };
-            let feats_a = extract_features(pe1, fa, &iat_a, use_bigrams, None);
-            let feats_b = extract_features(pe2, fb, &iat_b, use_bigrams, None);
+            let feats_a = extract_features(pe1, fa, &iat_a, use_bigrams, synth_a);
+            let feats_b = extract_features(pe2, fb, &iat_b, use_bigrams, synth_b);
             report_pair(
-                name, addr_a, addr_b, fa, fb, &feats_a, &feats_b, &alg_match, names_a, names_b,
-                &iat_a, &iat_b, pe1, pe2,
+                name,
+                addr_a,
+                addr_b,
+                fa,
+                fb,
+                &feats_a,
+                &feats_b,
+                &alg_match,
+                &alg_match_rev,
+                names_a,
+                names_b,
+                &iat_a,
+                &iat_b,
+                pe1,
+                pe2,
+                synth_a,
+                synth_b,
             );
         }
     }
@@ -737,6 +860,8 @@ fn inspect_samples(
     pe1: &PeLoader,
     pe2: &PeLoader,
     use_bigrams: bool,
+    synth_a: Option<&FxHashMap<u64, u64>>,
+    synth_b: Option<&FxHashMap<u64, u64>>,
 ) -> Result<()> {
     // Build name → addrs maps.
     let mut by_name_a: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
@@ -753,6 +878,7 @@ fn inspect_samples(
     }
 
     let alg_match: FxHashMap<u64, u64> = sorted.iter().copied().collect();
+    let alg_match_rev: FxHashMap<u64, u64> = sorted.iter().map(|&(a, b)| (b, a)).collect();
 
     let funcs1_by_ep: FxHashMap<u64, &FunctionAnalysis> =
         funcs1.iter().map(|f| (f.entry_point, f)).collect();
@@ -820,95 +946,26 @@ fn inspect_samples(
         for (name, addr_a, addr_b) in samples {
             let func_a = funcs1_by_ep[addr_a];
             let func_b = funcs2_by_ep[addr_b];
-            let feats_a = extract_features(pe1, func_a, &iat_a, use_bigrams, None);
-            let feats_b = extract_features(pe2, func_b, &iat_b, use_bigrams, None);
-
-            let alg_b = alg_match.get(addr_a).copied();
-            let alg_str = match alg_b {
-                None => "<no algorithm match>".to_string(),
-                Some(b) if b == *addr_b => "<correct>".to_string(),
-                Some(b) => {
-                    let alg_names = names_b
-                        .get(&b)
-                        .and_then(|v| v.first())
-                        .cloned()
-                        .unwrap_or_default();
-                    let trim = if alg_names.len() > 70 {
-                        format!("{}…", &alg_names[..70])
-                    } else {
-                        alg_names
-                    };
-                    format!("{:#x} ({})", b, trim)
-                }
-            };
-
-            let name_short = if name.len() > 70 {
-                format!("{}…", &name[..70])
-            } else {
-                name.clone()
-            };
-            println!();
-            println!("# {}", name_short);
-            println!(
-                "#   base   {:#x} ({} bytes, {} blocks, {} calls)",
-                addr_a,
-                func_a.size,
-                func_a.basic_blocks.len(),
-                func_a.calls.len()
-            );
-            println!(
-                "#   target {:#x} ({} bytes, {} blocks, {} calls)",
-                addr_b,
-                func_b.size,
-                func_b.basic_blocks.len(),
-                func_b.calls.len()
-            );
-            println!("#   algorithm matched base → {}", alg_str);
-
-            // Per-category counts and intersection.
-            let mut cats: std::collections::BTreeMap<
-                &'static str,
-                (FxHashSet<Feat>, FxHashSet<Feat>),
-            > = Default::default();
-            for f in &feats_a {
-                cats.entry(feat_category(f)).or_default().0.insert(*f);
-            }
-            for f in &feats_b {
-                cats.entry(feat_category(f)).or_default().1.insert(*f);
-            }
-            for (c, (sa, sb)) in &cats {
-                let inter = sa.intersection(sb).count();
-                let union = sa.union(sb).count();
-                let jac = if union > 0 {
-                    inter as f64 / union as f64
-                } else {
-                    0.0
-                };
-                println!(
-                    "#     {:>9}: a={:>5} b={:>5} ∩={:>5} ∪={:>5}  J={:.3}",
-                    c,
-                    sa.len(),
-                    sb.len(),
-                    inter,
-                    union,
-                    jac
-                );
-            }
-            let inter_all = feats_a.intersection(&feats_b).count();
-            let union_all = feats_a.union(&feats_b).count();
-            let jac_all = if union_all > 0 {
-                inter_all as f64 / union_all as f64
-            } else {
-                0.0
-            };
-            println!(
-                "#     {:>9}: a={:>5} b={:>5} ∩={:>5} ∪={:>5}  J={:.3}",
-                "TOTAL",
-                feats_a.len(),
-                feats_b.len(),
-                inter_all,
-                union_all,
-                jac_all
+            let feats_a = extract_features(pe1, func_a, &iat_a, use_bigrams, synth_a);
+            let feats_b = extract_features(pe2, func_b, &iat_b, use_bigrams, synth_b);
+            report_pair(
+                name,
+                *addr_a,
+                *addr_b,
+                func_a,
+                func_b,
+                &feats_a,
+                &feats_b,
+                &alg_match,
+                &alg_match_rev,
+                names_a,
+                names_b,
+                &iat_a,
+                &iat_b,
+                pe1,
+                pe2,
+                synth_a,
+                synth_b,
             );
         }
     };
@@ -1247,6 +1304,19 @@ fn main() -> Result<()> {
             }
         }
 
+        // Inspectors get the synth maps from the final iteration so they can
+        // report what the matcher actually saw on the last pass.
+        let synth_a_ref = if synth_a.is_empty() {
+            None
+        } else {
+            Some(&synth_a)
+        };
+        let synth_b_ref = if synth_b.is_empty() {
+            None
+        } else {
+            Some(&synth_b)
+        };
+
         if args.inspect_samples > 0 {
             inspect_samples(
                 args.inspect_samples,
@@ -1260,6 +1330,8 @@ fn main() -> Result<()> {
                 &pe1,
                 &pe2,
                 !args.no_bigrams,
+                synth_a_ref,
+                synth_b_ref,
             )?;
         }
 
@@ -1275,6 +1347,8 @@ fn main() -> Result<()> {
                 &pe1,
                 &pe2,
                 !args.no_bigrams,
+                synth_a_ref,
+                synth_b_ref,
             )?;
         }
     }
