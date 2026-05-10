@@ -8,7 +8,7 @@ use anyhow::Result;
 use binfold::mmap_source::MmapSource;
 use binfold::pe_loader::{FunctionAnalysis, PeLoader};
 use binfold::warp::read_string_data;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use grapnel::{Feature, Graph, MatcherConfig, UniversalMinHash};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
 use pdb::{FallibleIterator, PDB, SymbolData};
@@ -85,8 +85,8 @@ struct Args {
 
     /// Bundling direction. "callees" walks downward (semantic dependencies).
     /// "callers" walks upward (where F is used). "both" walks both.
-    #[arg(long, default_value = "both", value_parser = ["callees", "callers", "both"])]
-    bundle: String,
+    #[arg(long, value_enum, default_value_t = BundleDir::Both)]
+    bundle: BundleDir,
 
     /// Restrict which feature categories get propagated through bundling.
     /// Comma-separated subset of: bigram, import, string, const, blkcount,
@@ -96,7 +96,7 @@ struct Args {
     /// nonexistent category sentinel) is not supported — pass an empty value
     /// or omit the flag for the legacy "all categories propagate" behavior.
     #[arg(long, value_delimiter = ',', default_value = "import,string,const")]
-    bundle_features: Option<Vec<String>>,
+    bundle_features: Option<Vec<FeatureCategory>>,
 
     /// After --validate, sample N "should-match" pairs (same name in both
     /// binaries) and dump their feature decomposition side-by-side. Splits
@@ -172,6 +172,82 @@ struct Args {
     /// Depth>=3 over-fits (asymmetric inlining dilutes Jaccard).
     #[arg(long, default_value_t = 2)]
     synt_depth: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BundleDir {
+    Callees,
+    Callers,
+    Both,
+}
+
+/// Display + bundling categories for `Feat` variants. The user-bundleable
+/// subset (everything except `Nbr` and `Synt`) is exposed to clap via
+/// `ValueEnum`; the two `#[value(skip)]` variants exist only for the
+/// inspector's per-category display and never appear in a user-supplied
+/// `--bundle-features` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ValueEnum)]
+enum FeatureCategory {
+    Bigram,
+    Import,
+    String,
+    Const,
+    #[value(name = "blkcount")]
+    BlkCount,
+    #[value(name = "callcount")]
+    CallCount,
+    #[value(skip)]
+    Nbr,
+    #[value(skip)]
+    Synt,
+}
+
+impl FeatureCategory {
+    /// Short label used in inspector column headers (≤9 chars wide).
+    fn label(self) -> &'static str {
+        match self {
+            FeatureCategory::Bigram => "bigram",
+            FeatureCategory::Import => "import",
+            FeatureCategory::String => "string",
+            FeatureCategory::Const => "const",
+            FeatureCategory::BlkCount => "blkcount",
+            FeatureCategory::CallCount => "callcount",
+            FeatureCategory::Nbr => "nbr",
+            FeatureCategory::Synt => "synt",
+        }
+    }
+}
+
+/// All knobs that flow through feature extraction, graph build, and the
+/// inspectors. Constructed once via `FeatureConfig::from_args`, then passed
+/// by reference. Adding a new feature-extraction knob = add a field here,
+/// not a parameter on every signature.
+#[derive(Clone)]
+struct FeatureConfig {
+    use_bigrams: bool,
+    hops: usize,
+    /// Shared between bundling BFS and multi-hop SyntCallee BFS — same
+    /// "don't recurse through hubs" semantics in both places.
+    hub_degree: usize,
+    bundle_dir: BundleDir,
+    bundle_filter: Option<FxHashSet<FeatureCategory>>,
+    synt_depth: u8,
+}
+
+impl FeatureConfig {
+    fn from_args(args: &Args) -> Self {
+        FeatureConfig {
+            use_bigrams: !args.no_bigrams,
+            hops: args.hops,
+            hub_degree: args.hub_degree,
+            bundle_dir: args.bundle,
+            bundle_filter: args
+                .bundle_features
+                .as_ref()
+                .map(|v| v.iter().copied().collect()),
+            synt_depth: args.synt_depth,
+        }
+    }
 }
 
 /// All features are pre-hashed to u64 for cheap hashing in the inner MinHash
@@ -255,15 +331,13 @@ fn fxhash<T: Hash>(t: T) -> u64 {
 /// and are useless for anchoring.
 const CONST_NOISE_THRESHOLD: i64 = 256;
 
-#[allow(clippy::too_many_arguments)]
 fn extract_features(
     pe: &PeLoader,
     func: &FunctionAnalysis,
     iat: &HashMap<u64, String>,
-    use_bigrams: bool,
     synth_map: Option<&FxHashMap<u64, u64>>,
     funcs_by_ep: Option<&FxHashMap<u64, &FunctionAnalysis>>,
-    synt_depth: u8,
+    cfg: &FeatureConfig,
 ) -> FxHashSet<Feat> {
     let mut feats: FxHashSet<Feat> = FxHashSet::default();
     let bytes = match pe.read_at_va(func.entry_point, func.size) {
@@ -286,12 +360,13 @@ fn extract_features(
         while decoder.can_decode() {
             let insn = decoder.decode();
             let mut ops: [Option<OpKind>; 5] = [None; 5];
-            let n = (insn.op_count() as usize).min(5);
-            for i in 0..n {
-                ops[i] = Some(insn.op_kind(i as u32));
+            for (i, slot) in ops.iter_mut().enumerate().take(insn.op_count() as usize) {
+                *slot = Some(insn.op_kind(i as u32));
             }
             let cur = (insn.mnemonic(), ops);
-            if use_bigrams && let Some(p) = prev {
+            if cfg.use_bigrams
+                && let Some(p) = prev
+            {
                 feats.insert(Feat::Bigram(fxhash((p, cur))));
             }
             prev = Some(cur);
@@ -355,12 +430,12 @@ fn extract_features(
             if let Some(&s) = map.get(&node) {
                 feats.insert(Feat::SyntCallee { depth, hash: s });
             }
-            if depth < synt_depth
+            if depth < cfg.synt_depth
                 && let Some(callee_func) = funcs_by_ep.get(&node)
             {
                 // Hub gate: don't recurse through high-branching nodes.
-                // Same threshold concept as bundling; hardcoded for now.
-                if callee_func.calls.len() > 32 {
+                // Same threshold concept as bundling.
+                if callee_func.calls.len() > cfg.hub_degree {
                     continue;
                 }
                 for c in &callee_func.calls {
@@ -392,18 +467,12 @@ fn extract_features(
     feats
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_graph(
     pe: &PeLoader,
     funcs: &[FunctionAnalysis],
     hasher: &UniversalMinHash,
-    use_bigrams: bool,
-    hops: usize,
-    hub_degree: usize,
-    bundle_dir: &str,
-    bundle_filter: Option<&FxHashSet<&'static str>>,
     synth_map: Option<&FxHashMap<u64, u64>>,
-    synt_depth: u8,
+    cfg: &FeatureConfig,
 ) -> Result<Graph<u64>> {
     use rayon::prelude::*;
     let iat = pe.iat()?;
@@ -419,15 +488,7 @@ fn build_graph(
         .map(|f| {
             (
                 f.entry_point,
-                extract_features(
-                    pe,
-                    f,
-                    &iat,
-                    use_bigrams,
-                    synth_map,
-                    Some(&funcs_by_ep),
-                    synt_depth,
-                ),
+                extract_features(pe, f, &iat, synth_map, Some(&funcs_by_ep), cfg),
             )
         })
         .collect();
@@ -451,11 +512,10 @@ fn build_graph(
         }
     }
 
-    let dirs: &[&FxHashMap<u64, Vec<u64>>] = match bundle_dir {
-        "callees" => &[&callees],
-        "callers" => &[&callers],
-        "both" => &[&callees, &callers],
-        _ => unreachable!(),
+    let dirs: &[&FxHashMap<u64, Vec<u64>>] = match cfg.bundle_dir {
+        BundleDir::Callees => &[&callees],
+        BundleDir::Callers => &[&callers],
+        BundleDir::Both => &[&callees, &callers],
     };
 
     // Bundle features from the k-hop neighborhood. The node's *own* features
@@ -471,7 +531,7 @@ fn build_graph(
             if let Some(nf) = own.get(&start) {
                 feats.extend(nf.iter().copied());
             }
-            if hops == 0 {
+            if cfg.hops == 0 {
                 return (start, feats);
             }
             let mut visited: FxHashSet<u64> = FxHashSet::default();
@@ -484,8 +544,8 @@ fn build_graph(
                     // optionally filtering by category.
                     if let Some(nf) = own.get(&node) {
                         for nbr_feat in nf {
-                            if let Some(allowed) = bundle_filter
-                                && !allowed.contains(feat_category(nbr_feat))
+                            if let Some(allowed) = cfg.bundle_filter.as_ref()
+                                && !allowed.contains(&feat_category(nbr_feat))
                             {
                                 continue;
                             }
@@ -496,14 +556,14 @@ fn build_graph(
                         }
                     }
                 }
-                if depth >= hops {
+                if depth >= cfg.hops {
                     continue;
                 }
                 for adj in dirs {
                     if let Some(neighbors) = adj.get(&node) {
                         // Don't expand THROUGH a hub. We still consumed its
                         // own features when we popped it above.
-                        if node != start && neighbors.len() > hub_degree {
+                        if node != start && neighbors.len() > cfg.hub_degree {
                             continue;
                         }
                         for &n in neighbors {
@@ -523,7 +583,7 @@ fn build_graph(
     let pct = |p: f64| counts[((counts.len() as f64 * p) as usize).min(counts.len() - 1)];
     eprintln!(
         "  feature counts (hops={}): p50={} p90={} p99={} max={}",
-        hops,
+        cfg.hops,
         pct(0.50),
         pct(0.90),
         pct(0.99),
@@ -617,17 +677,87 @@ fn analyze(path: &PathBuf) -> Result<(PeLoader, Vec<FunctionAnalysis>)> {
     Ok((pe, funcs))
 }
 
-/// Categorize a feature for per-bucket reporting.
-fn feat_category(f: &Feat) -> &'static str {
+/// All per-binary state the inspectors need bundled together. Constructed
+/// once after analysis; pairs as `a` / `b` in the inspector entry points.
+struct BinaryCtx<'a> {
+    pe: &'a PeLoader,
+    funcs_by_ep: FxHashMap<u64, &'a FunctionAnalysis>,
+    iat: HashMap<u64, String>,
+    names: &'a HashMap<u64, Vec<String>>,
+    /// Synthetic-callee map for this binary. `None` before iter 2 / when
+    /// iteration is off.
+    synth: Option<&'a FxHashMap<u64, u64>>,
+}
+
+impl<'a> BinaryCtx<'a> {
+    fn new(
+        pe: &'a PeLoader,
+        funcs: &'a [FunctionAnalysis],
+        names: &'a HashMap<u64, Vec<String>>,
+        synth: Option<&'a FxHashMap<u64, u64>>,
+    ) -> Result<Self> {
+        let funcs_by_ep = funcs.iter().map(|f| (f.entry_point, f)).collect();
+        let iat = pe.iat()?;
+        Ok(Self {
+            pe,
+            funcs_by_ep,
+            iat,
+            names,
+            synth,
+        })
+    }
+
+    fn extract(&self, func: &FunctionAnalysis, cfg: &FeatureConfig) -> FxHashSet<Feat> {
+        extract_features(
+            self.pe,
+            func,
+            &self.iat,
+            self.synth,
+            Some(&self.funcs_by_ep),
+            cfg,
+        )
+    }
+
+    fn side<'s>(
+        &'s self,
+        addr: u64,
+        func: &'s FunctionAnalysis,
+        feats: &'s FxHashSet<Feat>,
+    ) -> Side<'s> {
+        Side {
+            addr,
+            func,
+            feats,
+            pe: self.pe,
+            iat: &self.iat,
+            names: self.names,
+            synth: self.synth,
+        }
+    }
+}
+
+/// Per-side view of a single matched function pair, used by `report_pair`.
+struct Side<'a> {
+    addr: u64,
+    func: &'a FunctionAnalysis,
+    feats: &'a FxHashSet<Feat>,
+    pe: &'a PeLoader,
+    iat: &'a HashMap<u64, String>,
+    names: &'a HashMap<u64, Vec<String>>,
+    synth: Option<&'a FxHashMap<u64, u64>>,
+}
+
+/// Categorize a feature for per-bucket reporting and bundle-filter lookups.
+fn feat_category(f: &Feat) -> FeatureCategory {
     match f {
-        Feat::Bigram(_) => "bigram",
-        Feat::Import(_) => "import",
-        Feat::StringLit(_) => "string",
-        Feat::Const(_) => "const",
-        Feat::BlockCountBucket(_) => "blkcount",
-        Feat::CallCountBucket(_) => "callcount",
-        Feat::Nbr { .. } => "nbr",
-        Feat::SyntCallee { .. } => "synt",
+        Feat::Bigram(_) => FeatureCategory::Bigram,
+        Feat::Import(_) => FeatureCategory::Import,
+        Feat::StringLit(_) => FeatureCategory::String,
+        Feat::Const(_) => FeatureCategory::Const,
+        Feat::BlockCountBucket(_) => FeatureCategory::BlkCount,
+        Feat::CallCountBucket(_) => FeatureCategory::CallCount,
+        Feat::Nbr { .. } => FeatureCategory::Nbr,
+        Feat::SyntCallee { .. } => FeatureCategory::Synt,
     }
 }
 
@@ -652,7 +782,7 @@ fn callee_labels(
             } else {
                 ns.as_str()
             };
-            format!("{}", trimmed)
+            trimmed.to_string()
         } else {
             format!("?{:#x}", call.target)
         };
@@ -661,25 +791,12 @@ fn callee_labels(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
 fn report_pair(
     name: &str,
-    addr_a: u64,
-    addr_b: u64,
-    func_a: &FunctionAnalysis,
-    func_b: &FunctionAnalysis,
-    feats_a: &FxHashSet<Feat>,
-    feats_b: &FxHashSet<Feat>,
+    a: &Side,
+    b: &Side,
     alg_match: &FxHashMap<u64, u64>,
     alg_match_rev: &FxHashMap<u64, u64>,
-    names_a: &HashMap<u64, Vec<String>>,
-    names_b: &HashMap<u64, Vec<String>>,
-    iat_a: &HashMap<u64, String>,
-    iat_b: &HashMap<u64, String>,
-    pe1: &PeLoader,
-    pe2: &PeLoader,
-    synth_a: Option<&FxHashMap<u64, u64>>,
-    synth_b: Option<&FxHashMap<u64, u64>>,
 ) {
     let name_short = if name.len() > 78 {
         format!("{}…", &name[..78])
@@ -687,13 +804,14 @@ fn report_pair(
         name.to_string()
     };
 
-    let alg_b = alg_match.get(&addr_a).copied();
+    let alg_b = alg_match.get(&a.addr).copied();
     let alg_str = match alg_b {
         None => "<no algorithm match>".to_string(),
-        Some(b) if b == addr_b => "<correct>".to_string(),
-        Some(b) => {
-            let alg_names = names_b
-                .get(&b)
+        Some(b_addr) if b_addr == b.addr => "<correct>".to_string(),
+        Some(b_addr) => {
+            let alg_names = b
+                .names
+                .get(&b_addr)
                 .and_then(|v| v.first())
                 .cloned()
                 .unwrap_or_default();
@@ -702,7 +820,7 @@ fn report_pair(
             } else {
                 alg_names
             };
-            format!("{:#x} ({})", b, trim)
+            format!("{:#x} ({})", b_addr, trim)
         }
     };
 
@@ -710,27 +828,28 @@ fn report_pair(
     println!("# {}", name_short);
     println!(
         "#   base   {:#x} ({} bytes, {} blocks, {} calls)",
-        addr_a,
-        func_a.size,
-        func_a.basic_blocks.len(),
-        func_a.calls.len()
+        a.addr,
+        a.func.size,
+        a.func.basic_blocks.len(),
+        a.func.calls.len()
     );
     println!(
         "#   target {:#x} ({} bytes, {} blocks, {} calls)",
-        addr_b,
-        func_b.size,
-        func_b.basic_blocks.len(),
-        func_b.calls.len()
+        b.addr,
+        b.func.size,
+        b.func.basic_blocks.len(),
+        b.func.calls.len()
     );
     println!("#   algorithm: base → {}", alg_str);
 
     // Target's match status — was it claimed by another base addr?
-    let target_status = match alg_match_rev.get(&addr_b).copied() {
+    let target_status = match alg_match_rev.get(&b.addr).copied() {
         None => "<unmatched>".to_string(),
-        Some(a) if a == addr_a => "<correct (paired with our base)>".to_string(),
-        Some(a) => {
-            let claim_name = names_a
-                .get(&a)
+        Some(a_addr) if a_addr == a.addr => "<correct (paired with our base)>".to_string(),
+        Some(a_addr) => {
+            let claim_name = a
+                .names
+                .get(&a_addr)
                 .and_then(|v| v.first())
                 .cloned()
                 .unwrap_or_default();
@@ -739,7 +858,7 @@ fn report_pair(
             } else {
                 claim_name
             };
-            format!("claimed by base {:#x} ({})", a, trim)
+            format!("claimed by base {:#x} ({})", a_addr, trim)
         }
     };
     println!("#   target ← {}", target_status);
@@ -748,20 +867,22 @@ fn report_pair(
     // Annotate each callee with synth-status: ✓=both sides have synth IDs and
     // they're paired, △=both have IDs but different pairs, ·=at least one
     // side missing synth ID, ⌀=internal call but not in synth maps yet.
-    let calls_a = callee_labels(func_a, pe1, iat_a, names_a);
-    let calls_b = callee_labels(func_b, pe2, iat_b, names_b);
-    let synth_marks_a: Vec<String> = func_a
+    let calls_a = callee_labels(a.func, a.pe, a.iat, a.names);
+    let calls_b = callee_labels(b.func, b.pe, b.iat, b.names);
+    let synth_marks_a: Vec<String> = a
+        .func
         .calls
         .iter()
-        .map(|c| match synth_a.and_then(|m| m.get(&c.target).copied()) {
+        .map(|c| match a.synth.and_then(|m| m.get(&c.target).copied()) {
             Some(s) => format!("S={}", s),
             None => "—".to_string(),
         })
         .collect();
-    let synth_marks_b: Vec<String> = func_b
+    let synth_marks_b: Vec<String> = b
+        .func
         .calls
         .iter()
-        .map(|c| match synth_b.and_then(|m| m.get(&c.target).copied()) {
+        .map(|c| match b.synth.and_then(|m| m.get(&c.target).copied()) {
             Some(s) => format!("S={}", s),
             None => "—".to_string(),
         })
@@ -798,12 +919,12 @@ fn report_pair(
     }
 
     // Per-category counts and intersection.
-    let mut cats: std::collections::BTreeMap<&'static str, (FxHashSet<Feat>, FxHashSet<Feat>)> =
+    let mut cats: std::collections::BTreeMap<FeatureCategory, (FxHashSet<Feat>, FxHashSet<Feat>)> =
         Default::default();
-    for f in feats_a {
+    for f in a.feats {
         cats.entry(feat_category(f)).or_default().0.insert(*f);
     }
-    for f in feats_b {
+    for f in b.feats {
         cats.entry(feat_category(f)).or_default().1.insert(*f);
     }
     for (c, (sa, sb)) in &cats {
@@ -816,7 +937,7 @@ fn report_pair(
         };
         println!(
             "#     {:>9}: a={:>5} b={:>5} ∩={:>5} ∪={:>5}  J={:.3}",
-            c,
+            c.label(),
             sa.len(),
             sb.len(),
             inter,
@@ -824,8 +945,8 @@ fn report_pair(
             jac
         );
     }
-    let inter_all = feats_a.intersection(feats_b).count();
-    let union_all = feats_a.union(feats_b).count();
+    let inter_all = a.feats.intersection(b.feats).count();
+    let union_all = a.feats.union(b.feats).count();
     let jac_all = if union_all > 0 {
         inter_all as f64 / union_all as f64
     } else {
@@ -834,8 +955,8 @@ fn report_pair(
     println!(
         "#     {:>9}: a={:>5} b={:>5} ∩={:>5} ∪={:>5}  J={:.3}",
         "TOTAL",
-        feats_a.len(),
-        feats_b.len(),
+        a.feats.len(),
+        b.feats.len(),
         inter_all,
         union_all,
         jac_all
@@ -845,9 +966,9 @@ fn report_pair(
     // This is what determines whether the pair clears the anchor threshold.
     // Note: this is OWN-only (no bundling); the matcher runs with bundling.
     // If hops>0 in the run, the actual matcher view is even richer than this.
-    let w_a: u32 = feats_a.iter().map(|f| f.weight()).sum();
-    let w_b: u32 = feats_b.iter().map(|f| f.weight()).sum();
-    let w_inter: u32 = feats_a.intersection(feats_b).map(|f| f.weight()).sum();
+    let w_a: u32 = a.feats.iter().map(|f| f.weight()).sum();
+    let w_b: u32 = b.feats.iter().map(|f| f.weight()).sum();
+    let w_inter: u32 = a.feats.intersection(b.feats).map(|f| f.weight()).sum();
     let w_union = w_a + w_b - w_inter;
     let w_jac = if w_union > 0 {
         w_inter as f64 / w_union as f64
@@ -863,15 +984,15 @@ fn report_pair(
     // function's feature set in the next iteration's signature. Both sides
     // emit Feat::SyntCallee(S) for any callee with a synth ID; if both sides
     // have callees with the SAME S, that's a free cross-binary anchor.
-    if let (Some(sa), Some(sb)) = (synth_a, synth_b) {
+    if let (Some(sa), Some(sb)) = (a.synth, b.synth) {
         let mut a_ids: FxHashSet<u64> = FxHashSet::default();
         let mut b_ids: FxHashSet<u64> = FxHashSet::default();
-        for c in &func_a.calls {
+        for c in &a.func.calls {
             if let Some(&s) = sa.get(&c.target) {
                 a_ids.insert(s);
             }
         }
-        for c in &func_b.calls {
+        for c in &b.func.calls {
             if let Some(&s) = sb.get(&c.target) {
                 b_ids.insert(s);
             }
@@ -886,43 +1007,28 @@ fn report_pair(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn inspect_patterns(
     patterns: &[String],
     limit: usize,
     sorted: &[(u64, u64)],
-    names_a: &HashMap<u64, Vec<String>>,
-    names_b: &HashMap<u64, Vec<String>>,
-    funcs1: &[FunctionAnalysis],
-    funcs2: &[FunctionAnalysis],
-    pe1: &PeLoader,
-    pe2: &PeLoader,
-    use_bigrams: bool,
-    synth_a: Option<&FxHashMap<u64, u64>>,
-    synth_b: Option<&FxHashMap<u64, u64>>,
-    synt_depth: u8,
+    a: &BinaryCtx,
+    b: &BinaryCtx,
+    cfg: &FeatureConfig,
 ) -> Result<()> {
     let mut by_name_a: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
-    for (addr, ns) in names_a {
+    for (addr, ns) in a.names {
         for s in ns {
             by_name_a.entry(s.as_str()).or_default().push(*addr);
         }
     }
     let mut by_name_b: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
-    for (addr, ns) in names_b {
+    for (addr, ns) in b.names {
         for s in ns {
             by_name_b.entry(s.as_str()).or_default().push(*addr);
         }
     }
     let alg_match: FxHashMap<u64, u64> = sorted.iter().copied().collect();
-    let alg_match_rev: FxHashMap<u64, u64> = sorted.iter().map(|&(a, b)| (b, a)).collect();
-    let funcs1_by_ep: FxHashMap<u64, &FunctionAnalysis> =
-        funcs1.iter().map(|f| (f.entry_point, f)).collect();
-    let funcs2_by_ep: FxHashMap<u64, &FunctionAnalysis> =
-        funcs2.iter().map(|f| (f.entry_point, f)).collect();
-    let iat_a = pe1.iat()?;
-    let iat_b = pe2.iat()?;
+    let alg_match_rev: FxHashMap<u64, u64> = sorted.iter().map(|&(x, y)| (y, x)).collect();
 
     // Universe of names present in both binaries.
     for pat in patterns {
@@ -944,93 +1050,49 @@ fn inspect_patterns(
         for name in hits.iter().take(limit) {
             let addr_a = by_name_a[name][0];
             let addr_b = by_name_b[name][0];
-            let (Some(&fa), Some(&fb)) = (funcs1_by_ep.get(&addr_a), funcs2_by_ep.get(&addr_b))
+            let (Some(&fa), Some(&fb)) = (a.funcs_by_ep.get(&addr_a), b.funcs_by_ep.get(&addr_b))
             else {
                 continue;
             };
-            let feats_a = extract_features(
-                pe1,
-                fa,
-                &iat_a,
-                use_bigrams,
-                synth_a,
-                Some(&funcs1_by_ep),
-                synt_depth,
-            );
-            let feats_b = extract_features(
-                pe2,
-                fb,
-                &iat_b,
-                use_bigrams,
-                synth_b,
-                Some(&funcs2_by_ep),
-                synt_depth,
-            );
+            let feats_a = a.extract(fa, cfg);
+            let feats_b = b.extract(fb, cfg);
             report_pair(
                 name,
-                addr_a,
-                addr_b,
-                fa,
-                fb,
-                &feats_a,
-                &feats_b,
+                &a.side(addr_a, fa, &feats_a),
+                &b.side(addr_b, fb, &feats_b),
                 &alg_match,
                 &alg_match_rev,
-                names_a,
-                names_b,
-                &iat_a,
-                &iat_b,
-                pe1,
-                pe2,
-                synth_a,
-                synth_b,
             );
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn inspect_samples(
     n: usize,
     sorted: &[(u64, u64)],
-    names_a: &HashMap<u64, Vec<String>>,
-    names_b: &HashMap<u64, Vec<String>>,
     names_in_a: &FxHashSet<&str>,
     names_in_b: &FxHashSet<&str>,
-    funcs1: &[FunctionAnalysis],
-    funcs2: &[FunctionAnalysis],
-    pe1: &PeLoader,
-    pe2: &PeLoader,
-    use_bigrams: bool,
-    synth_a: Option<&FxHashMap<u64, u64>>,
-    synth_b: Option<&FxHashMap<u64, u64>>,
-    synt_depth: u8,
+    a: &BinaryCtx,
+    b: &BinaryCtx,
+    cfg: &FeatureConfig,
 ) -> Result<()> {
     // Build name → addrs maps.
     let mut by_name_a: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
-    for (addr, ns) in names_a {
+    for (addr, ns) in a.names {
         for s in ns {
             by_name_a.entry(s.as_str()).or_default().push(*addr);
         }
     }
     let mut by_name_b: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
-    for (addr, ns) in names_b {
+    for (addr, ns) in b.names {
         for s in ns {
             by_name_b.entry(s.as_str()).or_default().push(*addr);
         }
     }
 
     let alg_match: FxHashMap<u64, u64> = sorted.iter().copied().collect();
-    let alg_match_rev: FxHashMap<u64, u64> = sorted.iter().map(|&(a, b)| (b, a)).collect();
-
-    let funcs1_by_ep: FxHashMap<u64, &FunctionAnalysis> =
-        funcs1.iter().map(|f| (f.entry_point, f)).collect();
-    let funcs2_by_ep: FxHashMap<u64, &FunctionAnalysis> =
-        funcs2.iter().map(|f| (f.entry_point, f)).collect();
-
-    let iat_a = pe1.iat()?;
-    let iat_b = pe2.iat()?;
+    let alg_match_rev: FxHashMap<u64, u64> = sorted.iter().map(|&(x, y)| (y, x)).collect();
 
     // Walk shared names; for each, take the canonical (first-addr, first-addr)
     // pair and bucket into TP / FN cohorts.
@@ -1049,7 +1111,7 @@ fn inspect_samples(
         };
         let addr_a = a_addrs[0];
         let addr_b = b_addrs[0];
-        if !funcs1_by_ep.contains_key(&addr_a) || !funcs2_by_ep.contains_key(&addr_b) {
+        if !a.funcs_by_ep.contains_key(&addr_a) || !b.funcs_by_ep.contains_key(&addr_b) {
             continue;
         }
         if alg_match.get(&addr_a).copied() == Some(addr_b) {
@@ -1060,8 +1122,8 @@ fn inspect_samples(
     }
 
     // Stable sort to get deterministic samples across runs.
-    tp_pool.sort_by_key(|&(_, a, _)| a);
-    fn_pool.sort_by_key(|&(_, a, _)| a);
+    tp_pool.sort_by_key(|&(_, addr, _)| addr);
+    fn_pool.sort_by_key(|&(_, addr, _)| addr);
 
     let stride_pick = |pool: &[(&str, u64, u64)], k: usize| -> Vec<(String, u64, u64)> {
         if pool.is_empty() || k == 0 {
@@ -1071,8 +1133,8 @@ fn inspect_samples(
         let stride = pool.len() / k;
         (0..k)
             .map(|i| {
-                let (s, a, b) = pool[i * stride];
-                (s.to_string(), a, b)
+                let (s, x, y) = pool[i * stride];
+                (s.to_string(), x, y)
             })
             .collect()
     };
@@ -1088,44 +1150,16 @@ fn inspect_samples(
         println!();
         println!("# --- {} ({} samples) ---", label, samples.len());
         for (name, addr_a, addr_b) in samples {
-            let func_a = funcs1_by_ep[addr_a];
-            let func_b = funcs2_by_ep[addr_b];
-            let feats_a = extract_features(
-                pe1,
-                func_a,
-                &iat_a,
-                use_bigrams,
-                synth_a,
-                Some(&funcs1_by_ep),
-                synt_depth,
-            );
-            let feats_b = extract_features(
-                pe2,
-                func_b,
-                &iat_b,
-                use_bigrams,
-                synth_b,
-                Some(&funcs2_by_ep),
-                synt_depth,
-            );
+            let fa = a.funcs_by_ep[addr_a];
+            let fb = b.funcs_by_ep[addr_b];
+            let feats_a = a.extract(fa, cfg);
+            let feats_b = b.extract(fb, cfg);
             report_pair(
                 name,
-                *addr_a,
-                *addr_b,
-                func_a,
-                func_b,
-                &feats_a,
-                &feats_b,
+                &a.side(*addr_a, fa, &feats_a),
+                &b.side(*addr_b, fb, &feats_b),
                 &alg_match,
                 &alg_match_rev,
-                names_a,
-                names_b,
-                &iat_a,
-                &iat_b,
-                pe1,
-                pe2,
-                synth_a,
-                synth_b,
             );
         }
     };
@@ -1157,7 +1191,6 @@ struct RunResult {
     disagree_examples: Vec<(String, String)>,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_match(
     args: &Args,
     pe1: &PeLoader,
@@ -1181,36 +1214,20 @@ fn run_match(
         min_band_collisions: args.min_band_collisions,
     };
     let hasher = config.hasher(args.seed);
-    let use_bigrams = !args.no_bigrams;
-
-    static CATEGORIES: &[&str] = &[
-        "bigram",
-        "import",
-        "string",
-        "const",
-        "blkcount",
-        "callcount",
-    ];
-    let bundle_filter: Option<FxHashSet<&'static str>> = args.bundle_features.as_ref().map(|v| {
-        v.iter()
-            .map(|s| {
-                CATEGORIES
-                    .iter()
-                    .copied()
-                    .find(|c| *c == s.as_str())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "unknown --bundle-features category '{}'. Allowed: {:?}",
-                            s, CATEGORIES
-                        )
-                    })
-            })
-            .collect()
-    });
+    let feat_cfg = FeatureConfig::from_args(args);
 
     let mut synth_a: FxHashMap<u64, u64> = FxHashMap::default();
     let mut synth_b: FxHashMap<u64, u64> = FxHashMap::default();
     let mut next_synth_id: u64 = 0;
+    // Cumulative confirmed pairs across all passes (lock-existing-pairs
+    // means each (a, b) is added once, never overwritten — strict union).
+    // Reported in per-pass logs alongside per-pass stats so the iteration
+    // dynamic is visible. Empirically, the union has MORE matches but
+    // FEWER true positives than the last pass's `new_matches` — pass-1's
+    // wrong matches get retained by the lock rule, while pass-2+ with
+    // synth context implicitly drops them by not re-confirming. Keep
+    // last-pass output as the canonical answer (better TP density).
+    let mut confirmed_pairs: FxHashMap<u64, u64> = FxHashMap::default();
     let mut matches: FxHashMap<u64, u64> = FxHashMap::default();
 
     let mut last_precision = 0.0;
@@ -1236,36 +1253,14 @@ fn run_match(
                 "pass {}/{}: building graphs (bigrams={}, hops={}, bundle_filter={:?}, synth={})",
                 pass + 1,
                 total_passes,
-                if use_bigrams { "on" } else { "off" },
-                args.hops,
-                bundle_filter,
+                if feat_cfg.use_bigrams { "on" } else { "off" },
+                feat_cfg.hops,
+                feat_cfg.bundle_filter,
                 synth_a.len(),
             );
         }
-        let g1 = build_graph(
-            pe1,
-            funcs1,
-            &hasher,
-            use_bigrams,
-            args.hops,
-            args.hub_degree,
-            &args.bundle,
-            bundle_filter.as_ref(),
-            synth_a_ref,
-            args.synt_depth,
-        )?;
-        let g2 = build_graph(
-            pe2,
-            funcs2,
-            &hasher,
-            use_bigrams,
-            args.hops,
-            args.hub_degree,
-            &args.bundle,
-            bundle_filter.as_ref(),
-            synth_b_ref,
-            args.synt_depth,
-        )?;
+        let g1 = build_graph(pe1, funcs1, &hasher, synth_a_ref, &feat_cfg)?;
+        let g2 = build_graph(pe2, funcs2, &hasher, synth_b_ref, &feat_cfg)?;
 
         if !quiet {
             eprintln!("pass {}/{}: matching", pass + 1, total_passes);
@@ -1281,15 +1276,16 @@ fn run_match(
             next_synth_id += 1;
             synth_a.insert(a, s);
             synth_b.insert(b, s);
+            confirmed_pairs.insert(a, b);
             new_pair_count += 1;
         }
         if !quiet {
             eprintln!(
-                "  pass {}: {} matches total, {} new pairs assigned synth IDs (synth pool: {})",
+                "  pass {}: {} matches this pass, {} new pairs (cumulative confirmed: {})",
                 pass + 1,
                 new_matches.len(),
                 new_pair_count,
-                synth_a.len()
+                confirmed_pairs.len()
             );
         }
 
@@ -1304,40 +1300,66 @@ fn run_match(
                 .iter()
                 .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
                 .collect();
-            let mut both_named = 0usize;
-            let mut tp = 0usize;
+            // Per-pass stats over `new_matches` show the trajectory of what
+            // each individual pass found.
+            let mut pass_named = 0usize;
+            let mut pass_tp = 0usize;
             for (a, b) in &new_matches {
                 if let (Some(sa), Some(sb)) = (sets_a.get(a), sets_b.get(b)) {
                     if sa.is_empty() || sb.is_empty() {
                         continue;
                     }
-                    both_named += 1;
+                    pass_named += 1;
                     if sa.iter().any(|n| sb.contains(n)) {
-                        tp += 1;
+                        pass_tp += 1;
                     }
                 }
             }
-            let precision = tp as f64 / both_named.max(1) as f64;
-            let recall = tp as f64 / pdb.baseline_addrs.max(1) as f64;
+            let pass_prec = pass_tp as f64 / pass_named.max(1) as f64;
+            let pass_rec = pass_tp as f64 / pdb.baseline_addrs.max(1) as f64;
+
+            // Cumulative stats over confirmed_pairs are what gets reported
+            // as the final result; updating last_* here means the final
+            // summary always reflects the union, not just the last pass.
+            let mut cum_named = 0usize;
+            let mut cum_tp = 0usize;
+            for (a, b) in &confirmed_pairs {
+                if let (Some(sa), Some(sb)) = (sets_a.get(a), sets_b.get(b)) {
+                    if sa.is_empty() || sb.is_empty() {
+                        continue;
+                    }
+                    cum_named += 1;
+                    if sa.iter().any(|n| sb.contains(n)) {
+                        cum_tp += 1;
+                    }
+                }
+            }
+            let cum_prec = cum_tp as f64 / cum_named.max(1) as f64;
+            let cum_rec = cum_tp as f64 / pdb.baseline_addrs.max(1) as f64;
             if !quiet {
                 println!(
-                    "# pass {}/{}: matched={} valid={} prec={:.2}% recall={:.2}%",
+                    "# pass {}/{}: this-pass matched={} prec={:.2}% recall={:.2}% | cumulative matched={} prec={:.2}% recall={:.2}%",
                     pass + 1,
                     total_passes,
                     new_matches.len(),
-                    both_named,
-                    precision * 100.0,
-                    recall * 100.0,
+                    pass_prec * 100.0,
+                    pass_rec * 100.0,
+                    confirmed_pairs.len(),
+                    cum_prec * 100.0,
+                    cum_rec * 100.0,
                 );
             }
-            last_precision = precision;
-            last_recall = recall;
-            last_valid = both_named;
-            last_tp = tp;
+            last_precision = pass_prec;
+            last_recall = pass_rec;
+            last_valid = pass_named;
+            last_tp = pass_tp;
         }
 
         matches = new_matches;
     }
+    // Suppress unused-variable warning for the diagnostic accumulator when
+    // pdb is None (no per-pass stats path read it).
+    let _ = &confirmed_pairs;
 
     let mut sorted: Vec<(u64, u64)> = matches.into_iter().collect();
     sorted.sort_unstable();
@@ -1595,11 +1617,11 @@ fn run_sweep(
             vec![
                 (
                     "bundle=callees",
-                    Box::new(|a: &mut Args| a.bundle = "callees".to_string()),
+                    Box::new(|a: &mut Args| a.bundle = BundleDir::Callees),
                 ),
                 (
                     "bundle=callers",
-                    Box::new(|a: &mut Args| a.bundle = "callers".to_string()),
+                    Box::new(|a: &mut Args| a.bundle = BundleDir::Callers),
                 ),
             ],
         ),
@@ -1613,22 +1635,25 @@ fn run_sweep(
                 (
                     "import,string",
                     Box::new(|a: &mut Args| {
-                        a.bundle_features = Some(vec!["import".into(), "string".into()])
+                        a.bundle_features =
+                            Some(vec![FeatureCategory::Import, FeatureCategory::String])
                     }),
                 ),
                 (
                     "string only",
-                    Box::new(|a: &mut Args| a.bundle_features = Some(vec!["string".into()])),
+                    Box::new(|a: &mut Args| {
+                        a.bundle_features = Some(vec![FeatureCategory::String])
+                    }),
                 ),
                 (
                     "import,string,const,callcount,blkcount",
                     Box::new(|a: &mut Args| {
                         a.bundle_features = Some(vec![
-                            "import".into(),
-                            "string".into(),
-                            "const".into(),
-                            "callcount".into(),
-                            "blkcount".into(),
+                            FeatureCategory::Import,
+                            FeatureCategory::String,
+                            FeatureCategory::Const,
+                            FeatureCategory::CallCount,
+                            FeatureCategory::BlkCount,
                         ])
                     }),
                 ),
@@ -1675,8 +1700,8 @@ fn run_sweep(
         println!();
         println!("# === {} ===", group_name);
         println!(
-            "# {:<42} {:>7} {:>7} {:>9} {:>8} {:>7}   {}",
-            "config", "prec", "recall", "matched", "valid", "time", "Δ vs baseline"
+            "# {:<42} {:>7} {:>7} {:>9} {:>8} {:>7}   Δ vs baseline",
+            "config", "prec", "recall", "matched", "valid", "time"
         );
         println!(
             "# {:<42} {:>6.2}% {:>6.2}% {:>9} {:>8} {:>6.1}s   (baseline)",
@@ -1743,6 +1768,15 @@ fn run_sweep_combos(
     //  - "trade prec for recall": add bundle shape categories or anchor=0.6
     //  - "max-precision push": stack + raise anchor
     //  - "max-recall push": loosen bands, drop bigrams
+    let all_bundle = || {
+        Some(vec![
+            FeatureCategory::Import,
+            FeatureCategory::String,
+            FeatureCategory::Const,
+            FeatureCategory::CallCount,
+            FeatureCategory::BlkCount,
+        ])
+    };
     let combos: Vec<(&'static str, Mut)> = vec![
         (
             "bands=50 + min-features=32",
@@ -1793,69 +1827,39 @@ fn run_sweep_combos(
         ),
         (
             "triple stack + bundle+callcount,blkcount",
-            Box::new(|a: &mut Args| {
+            Box::new(move |a: &mut Args| {
                 a.bands = 50;
                 a.min_features = 32;
                 a.max_degree = 32;
-                a.bundle_features = Some(vec![
-                    "import".into(),
-                    "string".into(),
-                    "const".into(),
-                    "callcount".into(),
-                    "blkcount".into(),
-                ]);
+                a.bundle_features = all_bundle();
             }),
         ),
         (
             "min-features=32 + bundle+callcount,blkcount",
-            Box::new(|a: &mut Args| {
+            Box::new(move |a: &mut Args| {
                 a.min_features = 32;
-                a.bundle_features = Some(vec![
-                    "import".into(),
-                    "string".into(),
-                    "const".into(),
-                    "callcount".into(),
-                    "blkcount".into(),
-                ]);
+                a.bundle_features = all_bundle();
             }),
         ),
         (
             "bundle+callcount,blkcount + max-degree=128",
-            Box::new(|a: &mut Args| {
-                a.bundle_features = Some(vec![
-                    "import".into(),
-                    "string".into(),
-                    "const".into(),
-                    "callcount".into(),
-                    "blkcount".into(),
-                ]);
+            Box::new(move |a: &mut Args| {
+                a.bundle_features = all_bundle();
                 a.max_degree = 128;
             }),
         ),
         (
             "max-recall push: bands=200 + bundle+callcount,blkcount",
-            Box::new(|a: &mut Args| {
+            Box::new(move |a: &mut Args| {
                 a.bands = 200;
-                a.bundle_features = Some(vec![
-                    "import".into(),
-                    "string".into(),
-                    "const".into(),
-                    "callcount".into(),
-                    "blkcount".into(),
-                ]);
+                a.bundle_features = all_bundle();
             }),
         ),
         (
             "max-recall push: --no-bigrams + bundle+callcount,blkcount",
-            Box::new(|a: &mut Args| {
+            Box::new(move |a: &mut Args| {
                 a.no_bigrams = true;
-                a.bundle_features = Some(vec![
-                    "import".into(),
-                    "string".into(),
-                    "const".into(),
-                    "callcount".into(),
-                    "blkcount".into(),
-                ]);
+                a.bundle_features = all_bundle();
             }),
         ),
     ];
@@ -1880,8 +1884,8 @@ fn run_sweep_combos(
     );
     println!();
     println!(
-        "# {:<58} {:>7} {:>7} {:>9} {:>8} {:>7}   {}",
-        "config", "prec", "recall", "matched", "valid", "time", "Δ vs baseline"
+        "# {:<58} {:>7} {:>7} {:>9} {:>8} {:>7}   Δ vs baseline",
+        "config", "prec", "recall", "matched", "valid", "time"
     );
     println!(
         "# {:<58} {:>6.2}% {:>6.2}% {:>9} {:>8} {:>6.1}s   (baseline)",
@@ -2051,22 +2055,18 @@ fn main() -> Result<()> {
         } else {
             Some(&result.synth_b)
         };
+        let feat_cfg = FeatureConfig::from_args(&args);
+        let ctx_a = BinaryCtx::new(&pe1, &funcs1, &pdb.names_a, synth_a_ref)?;
+        let ctx_b = BinaryCtx::new(&pe2, &funcs2, &pdb.names_b, synth_b_ref)?;
         if args.inspect_samples > 0 {
             inspect_samples(
                 args.inspect_samples,
                 &result.sorted,
-                &pdb.names_a,
-                &pdb.names_b,
                 &names_in_a,
                 &names_in_b,
-                &funcs1,
-                &funcs2,
-                &pe1,
-                &pe2,
-                !args.no_bigrams,
-                synth_a_ref,
-                synth_b_ref,
-                args.synt_depth,
+                &ctx_a,
+                &ctx_b,
+                &feat_cfg,
             )?;
         }
 
@@ -2075,16 +2075,9 @@ fn main() -> Result<()> {
                 &args.inspect_patterns,
                 args.inspect_pattern_limit,
                 &result.sorted,
-                &pdb.names_a,
-                &pdb.names_b,
-                &funcs1,
-                &funcs2,
-                &pe1,
-                &pe2,
-                !args.no_bigrams,
-                synth_a_ref,
-                synth_b_ref,
-                args.synt_depth,
+                &ctx_a,
+                &ctx_b,
+                &feat_cfg,
             )?;
         }
     }
