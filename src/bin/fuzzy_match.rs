@@ -120,12 +120,11 @@ struct Args {
     /// synthetic identity feature `Feat::SyntCallee { depth, hash }` injected
     /// into functions that reach `a` (base) or `b` (target) within
     /// `--synt-depth` hops. Subsequent passes can then anchor functions on
-    /// their *certified* call topology. Stable IDs are preserved across
-    /// passes. **Default 2** when paired with `--synt-depth 2`: the multi-hop
-    /// reach gets pass-3-equivalent topology coverage in pass 2, and pass 3
-    /// then regresses (richer-but-asymmetric synth dilutes Jaccard via
-    /// inlining-asymmetry). Use `--iterations 3` only with `--synt-depth 1`.
-    #[arg(long, default_value_t = 2)]
+    /// their *certified* call topology. **Default 3** with soft re-evaluation
+    /// (default ON): metrics monotonically improve through iter=5+ — the
+    /// pass-3 regression that capped this at 2 under the lock rule is gone.
+    /// Use `--iterations 2` to match the prior lock-rule-era default.
+    #[arg(long, default_value_t = 3)]
     iterations: usize,
 
     /// One-at-a-time perturbation sweep around the current args. Loads PE
@@ -172,6 +171,26 @@ struct Args {
     /// Depth>=3 over-fits (asymmetric inlining dilutes Jaccard).
     #[arg(long, default_value_t = 2)]
     synt_depth: u8,
+
+    /// Disable soft re-evaluation. With soft re-eval (default ON), in
+    /// passes after the first a new pair (a, b) can overwrite an existing
+    /// pair if the new similarity exceeds the old by at least
+    /// `--revise-margin`. With this flag, falls back to the original
+    /// lock-existing-pairs rule (first pass to confirm wins). Soft re-eval
+    /// monotonically improves both precision and recall through iter=5+;
+    /// the lock rule had a recall regression at iter=3 that capped useful
+    /// iterations at 2.
+    #[arg(long)]
+    no_revision: bool,
+
+    /// Margin for soft re-evaluation. A new pair must beat an existing
+    /// pair's similarity by at least this much to overwrite. Empirically
+    /// 0.0 (any improvement wins) gives the best metrics — both precision
+    /// and recall — because the lock rule was preserving more wrong
+    /// answers than correct revisions would introduce. Higher = more
+    /// conservative; less revision activity per pass.
+    #[arg(long, default_value_t = 0.0)]
+    revise_margin: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1188,7 +1207,6 @@ struct RunResult {
     precision: f64,
     recall: f64,
     time_secs: f64,
-    disagree_examples: Vec<(String, String)>,
 }
 
 fn run_match(
@@ -1216,19 +1234,15 @@ fn run_match(
     let hasher = config.hasher(args.seed);
     let feat_cfg = FeatureConfig::from_args(args);
 
-    let mut synth_a: FxHashMap<u64, u64> = FxHashMap::default();
-    let mut synth_b: FxHashMap<u64, u64> = FxHashMap::default();
+    // Canonical pair state: base_addr -> (target_addr, sim, synth_id).
+    // `synth_a`/`synth_b` are derived per pass from this map. With
+    // `--allow-revision`, pass N can overwrite an existing pair (a, b_old)
+    // with (a, b_new) if the new similarity beats the old by
+    // `--revise-margin`. Without that flag, the original lock-existing-pairs
+    // rule applies: first pass to confirm wins, no overwrites.
+    let mut confirmed: FxHashMap<u64, (u64, f64, u64)> = FxHashMap::default();
+    let mut target_to_base: FxHashMap<u64, u64> = FxHashMap::default();
     let mut next_synth_id: u64 = 0;
-    // Cumulative confirmed pairs across all passes (lock-existing-pairs
-    // means each (a, b) is added once, never overwritten — strict union).
-    // Reported in per-pass logs alongside per-pass stats so the iteration
-    // dynamic is visible. Empirically, the union has MORE matches but
-    // FEWER true positives than the last pass's `new_matches` — pass-1's
-    // wrong matches get retained by the lock rule, while pass-2+ with
-    // synth context implicitly drops them by not re-confirming. Keep
-    // last-pass output as the canonical answer (better TP density).
-    let mut confirmed_pairs: FxHashMap<u64, u64> = FxHashMap::default();
-    let mut matches: FxHashMap<u64, u64> = FxHashMap::default();
 
     let mut last_precision = 0.0;
     let mut last_recall = 0.0;
@@ -1237,6 +1251,11 @@ fn run_match(
 
     let total_passes = args.iterations.max(1);
     for pass in 0..total_passes {
+        // Derive per-pass synth maps from the canonical confirmed state.
+        // Recomputed each pass so revisions immediately propagate.
+        let synth_a: FxHashMap<u64, u64> =
+            confirmed.iter().map(|(&a, &(_, _, s))| (a, s)).collect();
+        let synth_b: FxHashMap<u64, u64> = confirmed.values().map(|&(b, _, s)| (b, s)).collect();
         let synth_a_ref = if synth_a.is_empty() {
             None
         } else {
@@ -1267,25 +1286,59 @@ fn run_match(
         }
         let new_matches = config.run(&g1, &g2);
 
-        let mut new_pair_count = 0usize;
-        for (&a, &b) in &new_matches {
-            if synth_a.contains_key(&a) || synth_b.contains_key(&b) {
+        // Apply pairs to the canonical state. Without --allow-revision, this
+        // is the original lock rule (skip if either side already paired).
+        // With --allow-revision, a new pair can overwrite an existing one if
+        // its similarity beats both (a's old pair, if any) and (b's old pair,
+        // if any) by at least --revise-margin.
+        let mut new_count = 0usize;
+        let mut revised_count = 0usize;
+        let mut blocked_count = 0usize;
+        for (&a, &(b, sim)) in &new_matches {
+            let old_a_pair = confirmed.get(&a).copied();
+            let old_b_base = target_to_base.get(&b).copied();
+            let old_b_pair = old_b_base.and_then(|oa| confirmed.get(&oa).copied());
+
+            let win_a = match old_a_pair {
+                None => true,
+                Some((_, old_sim, _)) => !args.no_revision && sim > old_sim + args.revise_margin,
+            };
+            let win_b = match old_b_pair {
+                None => true,
+                Some((_, old_sim, _)) => !args.no_revision && sim > old_sim + args.revise_margin,
+            };
+            if !win_a || !win_b {
+                blocked_count += 1;
                 continue;
+            }
+
+            let is_revision = old_a_pair.is_some() || old_b_pair.is_some();
+            // Revoke conflicting old pairs so the bipartite invariant holds.
+            if let Some((old_b, _, _)) = old_a_pair {
+                target_to_base.remove(&old_b);
+            }
+            if let Some(oa) = old_b_base {
+                confirmed.remove(&oa);
             }
             let s = next_synth_id;
             next_synth_id += 1;
-            synth_a.insert(a, s);
-            synth_b.insert(b, s);
-            confirmed_pairs.insert(a, b);
-            new_pair_count += 1;
+            confirmed.insert(a, (b, sim, s));
+            target_to_base.insert(b, a);
+            if is_revision {
+                revised_count += 1;
+            } else {
+                new_count += 1;
+            }
         }
         if !quiet {
             eprintln!(
-                "  pass {}: {} matches this pass, {} new pairs (cumulative confirmed: {})",
+                "  pass {}: {} matches this pass, {} new, {} revised, {} blocked (canonical: {})",
                 pass + 1,
                 new_matches.len(),
-                new_pair_count,
-                confirmed_pairs.len()
+                new_count,
+                revised_count,
+                blocked_count,
+                confirmed.len()
             );
         }
 
@@ -1301,10 +1354,10 @@ fn run_match(
                 .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
                 .collect();
             // Per-pass stats over `new_matches` show the trajectory of what
-            // each individual pass found.
+            // each individual pass found (with its current synth context).
             let mut pass_named = 0usize;
             let mut pass_tp = 0usize;
-            for (a, b) in &new_matches {
+            for (a, (b, _)) in &new_matches {
                 if let (Some(sa), Some(sb)) = (sets_a.get(a), sets_b.get(b)) {
                     if sa.is_empty() || sb.is_empty() {
                         continue;
@@ -1318,12 +1371,10 @@ fn run_match(
             let pass_prec = pass_tp as f64 / pass_named.max(1) as f64;
             let pass_rec = pass_tp as f64 / pdb.baseline_addrs.max(1) as f64;
 
-            // Cumulative stats over confirmed_pairs are what gets reported
-            // as the final result; updating last_* here means the final
-            // summary always reflects the union, not just the last pass.
+            // Canonical (confirmed) stats are the actual final output.
             let mut cum_named = 0usize;
             let mut cum_tp = 0usize;
-            for (a, b) in &confirmed_pairs {
+            for (a, (b, _, _)) in &confirmed {
                 if let (Some(sa), Some(sb)) = (sets_a.get(a), sets_b.get(b)) {
                     if sa.is_empty() || sb.is_empty() {
                         continue;
@@ -1338,73 +1389,35 @@ fn run_match(
             let cum_rec = cum_tp as f64 / pdb.baseline_addrs.max(1) as f64;
             if !quiet {
                 println!(
-                    "# pass {}/{}: this-pass matched={} prec={:.2}% recall={:.2}% | cumulative matched={} prec={:.2}% recall={:.2}%",
+                    "# pass {}/{}: this-pass matched={} prec={:.2}% recall={:.2}% | canonical matched={} prec={:.2}% recall={:.2}%",
                     pass + 1,
                     total_passes,
                     new_matches.len(),
                     pass_prec * 100.0,
                     pass_rec * 100.0,
-                    confirmed_pairs.len(),
+                    confirmed.len(),
                     cum_prec * 100.0,
                     cum_rec * 100.0,
                 );
             }
-            last_precision = pass_prec;
-            last_recall = pass_rec;
-            last_valid = pass_named;
-            last_tp = pass_tp;
+            // Final reported metrics are the canonical (confirmed) values,
+            // not last-pass — this is the actual matcher output.
+            last_precision = cum_prec;
+            last_recall = cum_rec;
+            last_valid = cum_named;
+            last_tp = cum_tp;
         }
-
-        matches = new_matches;
     }
-    // Suppress unused-variable warning for the diagnostic accumulator when
-    // pdb is None (no per-pass stats path read it).
-    let _ = &confirmed_pairs;
 
-    let mut sorted: Vec<(u64, u64)> = matches.into_iter().collect();
+    let mut sorted: Vec<(u64, u64)> = confirmed.iter().map(|(&a, &(b, _, _))| (a, b)).collect();
     sorted.sort_unstable();
-
-    let mut disagree_examples: Vec<(String, String)> = Vec::new();
-    if let Some(pdb) = pdb {
-        let sets_a: HashMap<u64, FxHashSet<&str>> = pdb
-            .names_a
-            .iter()
-            .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
-            .collect();
-        let sets_b: HashMap<u64, FxHashSet<&str>> = pdb
-            .names_b
-            .iter()
-            .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
-            .collect();
-        for (a, b) in &sorted {
-            if disagree_examples.len() >= 10 {
-                break;
-            }
-            if let (Some(sa), Some(sb)) = (sets_a.get(a), sets_b.get(b)) {
-                if sa.is_empty() || sb.is_empty() {
-                    continue;
-                }
-                if !sa.iter().any(|n| sb.contains(n)) {
-                    let na = pdb
-                        .names_a
-                        .get(a)
-                        .and_then(|v| v.first())
-                        .cloned()
-                        .unwrap_or_default();
-                    let nb = pdb
-                        .names_b
-                        .get(b)
-                        .and_then(|v| v.first())
-                        .cloned()
-                        .unwrap_or_default();
-                    disagree_examples.push((na, nb));
-                }
-            }
-        }
-    }
 
     let time_secs = start.elapsed().as_secs_f64();
 
+    // Derive final synth maps from canonical state for downstream
+    // inspectors and cache export.
+    let synth_a: FxHashMap<u64, u64> = confirmed.iter().map(|(&a, &(_, _, s))| (a, s)).collect();
+    let synth_b: FxHashMap<u64, u64> = confirmed.values().map(|&(b, _, s)| (b, s)).collect();
     Ok(RunResult {
         matched: sorted.len(),
         sorted,
@@ -1415,7 +1428,6 @@ fn run_match(
         precision: last_precision,
         recall: last_recall,
         time_secs,
-        disagree_examples,
     })
 }
 
@@ -2024,22 +2036,6 @@ fn main() -> Result<()> {
             pdb.baseline_addrs,
             result.recall * 100.0
         );
-        if !result.disagree_examples.is_empty() {
-            println!("# example disagreements (first name shown each side):");
-            for (na, nb) in &result.disagree_examples {
-                let na = if na.len() > 80 {
-                    &na[..80]
-                } else {
-                    na.as_str()
-                };
-                let nb = if nb.len() > 80 {
-                    &nb[..80]
-                } else {
-                    nb.as_str()
-                };
-                println!("#   {}\n# ≠ {}", na, nb);
-            }
-        }
 
         let names_in_a: FxHashSet<&str> =
             pdb.names_a.values().flatten().map(String::as_str).collect();
