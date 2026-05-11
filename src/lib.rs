@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub mod mmap_source;
 
 pub mod db;
+pub mod fn_ptr_index;
 pub mod hash;
 pub mod pdb_analyzer;
 pub mod pdb_writer;

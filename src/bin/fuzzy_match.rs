@@ -5,6 +5,7 @@
 //! to target-binary function addresses.
 
 use anyhow::Result;
+use binfold::fn_ptr_index::{FnPtrIndex, find_fn_ptr_sites};
 use binfold::mmap_source::MmapSource;
 use binfold::pe_loader::{FunctionAnalysis, PeLoader};
 use binfold::warp::read_string_data;
@@ -191,6 +192,57 @@ struct Args {
     /// conservative; less revision activity per pass.
     #[arg(long, default_value_t = 0.0)]
     revise_margin: f64,
+
+    /// After --validate, also run achievability analysis: for every PDB
+    /// ground-truth pair (a, b) where the same name exists in both
+    /// binaries, compute the weighted Jaccard between their feature sets
+    /// (with the FINAL synth maps from the run). Histograms the J
+    /// distribution and cross-tabs against the matcher's actual outcome
+    /// (correct/wrong/missed). Tells you which pairs are structurally
+    /// invisible vs which the matcher actively missed.
+    #[arg(long)]
+    measure_achievability: bool,
+
+    /// Asymmetric Phase 4 hub gate: skip propagation only when BOTH sides
+    /// exceed `--max-degree` (default symmetric: skip when EITHER side
+    /// exceeds). Asymmetric accepts paths where one side is hub-inflated
+    /// by inlining asymmetry but the other isn't — the cross-compiler
+    /// case where target inlines more than base. Predicted to recover
+    /// pairs in [0.2, 0.5) propagation zone (per achievability data).
+    #[arg(long)]
+    asymmetric_hub_gate: bool,
+
+    /// Phase 4 size-mismatch ratio. Skip a candidate pair when
+    /// max(size_a, size_b) / min(size_a, size_b) exceeds this. The original
+    /// grapnel default 2.0 was calibrated for symmetric same-compiler
+    /// cases; cross-compiler inlining routinely produces 3-5x size
+    /// differences. Per the trace stats, the 2.0 cap blocked ~800k pairs/pass
+    /// (~160× more than the hub gate). Default 4.0: gives +0.79pp recall
+    /// alone on 505S/505SC; combines with `--fn-ptr-peer-radius >= 5` and
+    /// `--iterations >= 3` for the highest known recall regimes. Beyond 5.0
+    /// is non-monotonic on this fixture (extra admitted pairs introduce
+    /// wrong matches that perturb pass-2's synth context).
+    #[arg(long, default_value_t = 4.0)]
+    size_mismatch_ratio: f32,
+
+    /// Disable RO-data function-pointer features (FnPtrRefBucket +
+    /// FnPtrPeer). Provided for ablation only — these features
+    /// specifically target virtual functions, which dispatch indirectly
+    /// and therefore have no `func.calls` entries pointing at them
+    /// (i.e. SyntCallee never propagates *into* them from a parent).
+    #[arg(long)]
+    no_fn_ptr: bool,
+
+    /// Maximum |offset| (in pointer-sized slots) for FnPtrPeer features.
+    /// For each RO-data site of F, peers at offsets ±1..=N whose function
+    /// has a synth ID from a prior match pass are emitted. Weight decays
+    /// geometrically with |offset|: 16 / 8 / 4 / 2. Default 10: empirically
+    /// strict-Pareto-dominates radius=3 and radius=5 on 505S/505SC (45.85%
+    /// recall / 68.92% precision at iter=3). Past 15, recall drops because
+    /// peer features start crossing vtable boundaries — entries from
+    /// adjacent unrelated vtables get treated as peers, polluting Jaccard.
+    #[arg(long, default_value_t = 10)]
+    fn_ptr_peer_radius: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -219,6 +271,8 @@ enum FeatureCategory {
     Nbr,
     #[value(skip)]
     Synt,
+    #[value(skip)]
+    FnPtr,
 }
 
 impl FeatureCategory {
@@ -233,6 +287,7 @@ impl FeatureCategory {
             FeatureCategory::CallCount => "callcount",
             FeatureCategory::Nbr => "nbr",
             FeatureCategory::Synt => "synt",
+            FeatureCategory::FnPtr => "fnptr",
         }
     }
 }
@@ -251,6 +306,8 @@ struct FeatureConfig {
     bundle_dir: BundleDir,
     bundle_filter: Option<FxHashSet<FeatureCategory>>,
     synt_depth: u8,
+    use_fn_ptr: bool,
+    fn_ptr_peer_radius: u8,
 }
 
 impl FeatureConfig {
@@ -265,6 +322,8 @@ impl FeatureConfig {
                 .as_ref()
                 .map(|v| v.iter().copied().collect()),
             synt_depth: args.synt_depth,
+            use_fn_ptr: !args.no_fn_ptr,
+            fn_ptr_peer_radius: args.fn_ptr_peer_radius,
         }
     }
 }
@@ -302,6 +361,21 @@ enum Feat {
     /// depth-2 don't collide. This is a *certified* cross-binary identity
     /// feature: it's only ever created from confirmed matches.
     SyntCallee { depth: u8, hash: u64 },
+    /// Number of times F's address appears in RO data (vtables, RTTI,
+    /// dispatch tables), log-bucketed. Only emitted when at least one
+    /// reference exists — otherwise this feature would collapse every
+    /// non-virtual function into bucket 0 and produce a degenerate
+    /// "everyone matches" signal. Stable across compilers: the
+    /// reference count is a property of the class hierarchy, not codegen.
+    FnPtrRefBucket(u32),
+    /// Synthetic peer-identity from RO-data grid adjacency. For each
+    /// site `(data_addr, F)` and signed slot offset Δ within the peer
+    /// radius, if the function at `data_addr + Δ * ptr_size` has a synth
+    /// ID `S` from a prior match pass, emit `FnPtrPeer { offset: Δ, hash: S }`.
+    /// Vtable-adjacency analog of SyntCallee — gives virtual functions
+    /// a topology even though `func.calls` never lists them (dispatch
+    /// is indirect through `call [reg+off]`).
+    FnPtrPeer { offset: i8, hash: u64 },
 }
 
 impl Feature for Feat {
@@ -335,6 +409,20 @@ impl Feature for Feat {
                 3 => 4,
                 _ => 2,
             },
+            // Coarse shape — counts of vtable references group classes
+            // by "how widely is this method overridden". Mid-weight, same
+            // bucket as the block/call-count shape features.
+            Feat::FnPtrRefBucket(_) => 4,
+            // Certified peer identity through vtable adjacency. Same
+            // weight scheme as SyntCallee, indexed by |offset|: an
+            // immediate neighbor (Δ=±1) is the strongest signal, with
+            // geometric decay further out.
+            Feat::FnPtrPeer { offset, .. } => match offset.unsigned_abs() {
+                1 => 16,
+                2 => 8,
+                3 => 4,
+                _ => 2,
+            },
         }
     }
 }
@@ -356,6 +444,7 @@ fn extract_features(
     iat: &HashMap<u64, String>,
     synth_map: Option<&FxHashMap<u64, u64>>,
     funcs_by_ep: Option<&FxHashMap<u64, &FunctionAnalysis>>,
+    fn_ptrs: Option<&FnPtrIndex>,
     cfg: &FeatureConfig,
 ) -> FxHashSet<Feat> {
     let mut feats: FxHashSet<Feat> = FxHashSet::default();
@@ -483,6 +572,48 @@ fn extract_features(
     ));
     feats.insert(Feat::CallCountBucket((call_count + 1).ilog2()));
 
+    // RO-data adjacency features. Both depend on the function-pointer
+    // index built once per binary; if it's missing or disabled, skip
+    // silently. The ref-count bucket is tier-1 (own-feature, no
+    // iteration needed). The peer features are tier-2: like SyntCallee,
+    // they only fire once a prior pass has assigned synth IDs to other
+    // functions sharing the same vtable layout.
+    if cfg.use_fn_ptr
+        && let Some(idx) = fn_ptrs
+    {
+        let sites = idx.sites_of(func.entry_point);
+        if !sites.is_empty() {
+            // Bucket the reference count. n_sites >= 1, so ilog2 is
+            // 0 for one site, 1 for 2-3, 2 for 4-7, etc. — distinct
+            // from "no feature emitted" (the not-referenced case).
+            feats.insert(Feat::FnPtrRefBucket((sites.len() as u32).ilog2()));
+
+            // Peers — only meaningful with a synth map from a prior
+            // pass. Probe ±1..=radius grid neighbors at each site;
+            // emit one feature per (offset, synth_id) pair, with
+            // FxHashSet collapsing duplicates across F's multiple
+            // sites (common for ICF-folded thunks).
+            if let Some(map) = synth_map {
+                let radius = cfg.fn_ptr_peer_radius as i32;
+                for &site_idx in sites {
+                    let site = idx.site(site_idx);
+                    for delta in 1..=radius {
+                        for signed in [-delta, delta] {
+                            if let Some(peer) = idx.grid_neighbor(site, signed)
+                                && let Some(&s) = map.get(&peer.func)
+                            {
+                                feats.insert(Feat::FnPtrPeer {
+                                    offset: signed as i8,
+                                    hash: s,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     feats
 }
 
@@ -491,6 +622,7 @@ fn build_graph(
     funcs: &[FunctionAnalysis],
     hasher: &UniversalMinHash,
     synth_map: Option<&FxHashMap<u64, u64>>,
+    fn_ptrs: Option<&FnPtrIndex>,
     cfg: &FeatureConfig,
 ) -> Result<Graph<u64>> {
     use rayon::prelude::*;
@@ -507,7 +639,7 @@ fn build_graph(
         .map(|f| {
             (
                 f.entry_point,
-                extract_features(pe, f, &iat, synth_map, Some(&funcs_by_ep), cfg),
+                extract_features(pe, f, &iat, synth_map, Some(&funcs_by_ep), fn_ptrs, cfg),
             )
         })
         .collect();
@@ -706,6 +838,9 @@ struct BinaryCtx<'a> {
     /// Synthetic-callee map for this binary. `None` before iter 2 / when
     /// iteration is off.
     synth: Option<&'a FxHashMap<u64, u64>>,
+    /// RO-data function-pointer site index. `None` when fn-ptr features
+    /// are disabled via `--no-fn-ptr`.
+    fn_ptrs: Option<&'a FnPtrIndex>,
 }
 
 impl<'a> BinaryCtx<'a> {
@@ -714,6 +849,7 @@ impl<'a> BinaryCtx<'a> {
         funcs: &'a [FunctionAnalysis],
         names: &'a HashMap<u64, Vec<String>>,
         synth: Option<&'a FxHashMap<u64, u64>>,
+        fn_ptrs: Option<&'a FnPtrIndex>,
     ) -> Result<Self> {
         let funcs_by_ep = funcs.iter().map(|f| (f.entry_point, f)).collect();
         let iat = pe.iat()?;
@@ -723,6 +859,7 @@ impl<'a> BinaryCtx<'a> {
             iat,
             names,
             synth,
+            fn_ptrs,
         })
     }
 
@@ -733,6 +870,7 @@ impl<'a> BinaryCtx<'a> {
             &self.iat,
             self.synth,
             Some(&self.funcs_by_ep),
+            self.fn_ptrs,
             cfg,
         )
     }
@@ -751,6 +889,7 @@ impl<'a> BinaryCtx<'a> {
             iat: &self.iat,
             names: self.names,
             synth: self.synth,
+            fn_ptrs: self.fn_ptrs,
         }
     }
 }
@@ -764,6 +903,7 @@ struct Side<'a> {
     iat: &'a HashMap<u64, String>,
     names: &'a HashMap<u64, Vec<String>>,
     synth: Option<&'a FxHashMap<u64, u64>>,
+    fn_ptrs: Option<&'a FnPtrIndex>,
 }
 
 /// Categorize a feature for per-bucket reporting and bundle-filter lookups.
@@ -777,6 +917,7 @@ fn feat_category(f: &Feat) -> FeatureCategory {
         Feat::CallCountBucket(_) => FeatureCategory::CallCount,
         Feat::Nbr { .. } => FeatureCategory::Nbr,
         Feat::SyntCallee { .. } => FeatureCategory::Synt,
+        Feat::FnPtrRefBucket(_) | Feat::FnPtrPeer { .. } => FeatureCategory::FnPtr,
     }
 }
 
@@ -1024,6 +1165,49 @@ fn report_pair(
             shared
         );
     }
+
+    // Fn-ptr peer signal — vtable-adjacency identity. For each RO-data
+    // site of F on each side, peers at signed slot offsets within radius
+    // 3 contribute Feat::FnPtrPeer { offset, synth_id }. Shared
+    // (offset, synth_id) tuples are the cross-binary anchor: F's
+    // immediate neighbor in *its* vtable maps to F''s immediate neighbor
+    // in *its* vtable, identified by a synth ID confirmed in a prior pass.
+    if let (Some(ia), Some(ib), Some(sa), Some(sb)) = (a.fn_ptrs, b.fn_ptrs, a.synth, b.synth) {
+        let sites_a = ia.sites_of(a.addr);
+        let sites_b = ib.sites_of(b.addr);
+        let peer_set = |idx: &FnPtrIndex,
+                        site_idxs: &[u32],
+                        smap: &FxHashMap<u64, u64>|
+         -> FxHashSet<(i8, u64)> {
+            let mut out: FxHashSet<(i8, u64)> = FxHashSet::default();
+            for &si in site_idxs {
+                let site = idx.site(si);
+                for delta in 1i32..=3 {
+                    for signed in [-delta, delta] {
+                        if let Some(peer) = idx.grid_neighbor(site, signed)
+                            && let Some(&s) = smap.get(&peer.func)
+                        {
+                            out.insert((signed as i8, s));
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let peers_a = peer_set(ia, sites_a, sa);
+        let peers_b = peer_set(ib, sites_b, sb);
+        let shared = peers_a.intersection(&peers_b).count();
+        if !sites_a.is_empty() || !sites_b.is_empty() {
+            println!(
+                "#   fn-ptr signal: sites a={} b={} | peer-synth a={} b={} shared={} (each shared = 1 weight-≤16 anchor)",
+                sites_a.len(),
+                sites_b.len(),
+                peers_a.len(),
+                peers_b.len(),
+                shared
+            );
+        }
+    }
 }
 
 fn inspect_patterns(
@@ -1209,12 +1393,15 @@ struct RunResult {
     time_secs: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_match(
     args: &Args,
     pe1: &PeLoader,
     funcs1: &[FunctionAnalysis],
     pe2: &PeLoader,
     funcs2: &[FunctionAnalysis],
+    fn_ptrs1: Option<&FnPtrIndex>,
+    fn_ptrs2: Option<&FnPtrIndex>,
     pdb: Option<&PdbContext>,
     quiet: bool,
 ) -> Result<RunResult> {
@@ -1227,9 +1414,10 @@ fn run_match(
         anchor_threshold: args.anchor,
         propagation_threshold: args.propagate,
         max_propagation_degree: args.max_degree,
-        size_mismatch_ratio: 2.0,
+        size_mismatch_ratio: args.size_mismatch_ratio,
         pre_match_on_identifiers: false,
         min_band_collisions: args.min_band_collisions,
+        asymmetric_hub_gate: args.asymmetric_hub_gate,
     };
     let hasher = config.hasher(args.seed);
     let feat_cfg = FeatureConfig::from_args(args);
@@ -1278,13 +1466,31 @@ fn run_match(
                 synth_a.len(),
             );
         }
-        let g1 = build_graph(pe1, funcs1, &hasher, synth_a_ref, &feat_cfg)?;
-        let g2 = build_graph(pe2, funcs2, &hasher, synth_b_ref, &feat_cfg)?;
+        let g1 = build_graph(pe1, funcs1, &hasher, synth_a_ref, fn_ptrs1, &feat_cfg)?;
+        let g2 = build_graph(pe2, funcs2, &hasher, synth_b_ref, fn_ptrs2, &feat_cfg)?;
 
         if !quiet {
             eprintln!("pass {}/{}: matching", pass + 1, total_passes);
         }
-        let new_matches = config.run(&g1, &g2);
+        let (new_matches, mstats) = config.run_traced(&g1, &g2);
+        if !quiet {
+            eprintln!(
+                "  pass {} stats: lsh_cands={} above_anchor={} | p3 confirmed={} skip_a={} skip_b={} | p4 propose={} hub={} size={} below_thr={} skip_a={} skip_b={} confirmed={}",
+                pass + 1,
+                mstats.phase2_lsh_candidates,
+                mstats.phase2_above_anchor,
+                mstats.phase3_confirmed,
+                mstats.phase3_skip_a_taken,
+                mstats.phase3_skip_b_taken,
+                mstats.phase4_propose,
+                mstats.phase4_blocked_hub,
+                mstats.phase4_blocked_size,
+                mstats.phase4_below_threshold,
+                mstats.phase4_skip_a_taken,
+                mstats.phase4_skip_b_taken,
+                mstats.phase4_confirmed,
+            );
+        }
 
         // Apply pairs to the canonical state. Without --allow-revision, this
         // is the original lock rule (skip if either side already paired).
@@ -1431,6 +1637,254 @@ fn run_match(
     })
 }
 
+/// Weighted Jaccard between two feature sets. Each Feat carries its own
+/// weight; intersection and union are summed via Feat::weight.
+fn weighted_jaccard(a: &FxHashSet<Feat>, b: &FxHashSet<Feat>) -> f64 {
+    let inter_w: u32 = a.intersection(b).map(|f| f.weight()).sum();
+    let union_w: u32 = a.union(b).map(|f| f.weight()).sum();
+    if union_w == 0 {
+        0.0
+    } else {
+        inter_w as f64 / union_w as f64
+    }
+}
+
+/// Achievability analysis: for every PDB ground-truth pair, compute the
+/// weighted Jaccard of feature sets (using the final synth maps from the
+/// matcher run) and cross-tab against the algorithm's outcome.
+///
+/// Tells you the structural ceiling: how many ground-truth pairs are
+/// reachable by anchor mode at the current `--anchor` threshold, vs how
+/// many require Phase 4 propagation, vs how many are below all thresholds
+/// and effectively impossible.
+#[allow(clippy::too_many_arguments)]
+fn measure_achievability(
+    pe1: &PeLoader,
+    funcs1: &[FunctionAnalysis],
+    pe2: &PeLoader,
+    funcs2: &[FunctionAnalysis],
+    fn_ptrs1: Option<&FnPtrIndex>,
+    fn_ptrs2: Option<&FnPtrIndex>,
+    pdb: &PdbContext,
+    result: &RunResult,
+    feat_cfg: &FeatureConfig,
+    anchor_threshold: f64,
+    propagate_threshold: f64,
+) -> Result<()> {
+    use rayon::prelude::*;
+
+    eprintln!("achievability: extracting features for all functions...");
+    let iat_a = pe1.iat()?;
+    let iat_b = pe2.iat()?;
+    let funcs1_by_ep: FxHashMap<u64, &FunctionAnalysis> =
+        funcs1.iter().map(|f| (f.entry_point, f)).collect();
+    let funcs2_by_ep: FxHashMap<u64, &FunctionAnalysis> =
+        funcs2.iter().map(|f| (f.entry_point, f)).collect();
+
+    let synth_a_ref = if result.synth_a.is_empty() {
+        None
+    } else {
+        Some(&result.synth_a)
+    };
+    let synth_b_ref = if result.synth_b.is_empty() {
+        None
+    } else {
+        Some(&result.synth_b)
+    };
+
+    let feats_a: FxHashMap<u64, FxHashSet<Feat>> = funcs1
+        .par_iter()
+        .map(|f| {
+            (
+                f.entry_point,
+                extract_features(
+                    pe1,
+                    f,
+                    &iat_a,
+                    synth_a_ref,
+                    Some(&funcs1_by_ep),
+                    fn_ptrs1,
+                    feat_cfg,
+                ),
+            )
+        })
+        .collect();
+    let feats_b: FxHashMap<u64, FxHashSet<Feat>> = funcs2
+        .par_iter()
+        .map(|f| {
+            (
+                f.entry_point,
+                extract_features(
+                    pe2,
+                    f,
+                    &iat_b,
+                    synth_b_ref,
+                    Some(&funcs2_by_ep),
+                    fn_ptrs2,
+                    feat_cfg,
+                ),
+            )
+        })
+        .collect();
+
+    // PDB name → first canonical address per side.
+    let mut by_name_a: FxHashMap<&str, u64> = FxHashMap::default();
+    for (addr, ns) in &pdb.names_a {
+        for n in ns {
+            by_name_a.entry(n.as_str()).or_insert(*addr);
+        }
+    }
+    let mut by_name_b: FxHashMap<&str, u64> = FxHashMap::default();
+    for (addr, ns) in &pdb.names_b {
+        for n in ns {
+            by_name_b.entry(n.as_str()).or_insert(*addr);
+        }
+    }
+
+    // Algorithm result + per-address name set lookups (for outcome check).
+    let alg_match: FxHashMap<u64, u64> = result.sorted.iter().copied().collect();
+    let sets_a: HashMap<u64, FxHashSet<&str>> = pdb
+        .names_a
+        .iter()
+        .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
+        .collect();
+    let sets_b: HashMap<u64, FxHashSet<&str>> = pdb
+        .names_b
+        .iter()
+        .map(|(&addr, ns)| (addr, ns.iter().map(String::as_str).collect()))
+        .collect();
+
+    // Iterate ground-truth pairs (one canonical (a, b) per shared PDB name).
+    // We use base_addr as the dedup key so a multi-aliased base function
+    // contributes one pair per base address, not per name. Pairs that
+    // resolve to the same base address are deduped — only the first wins.
+    let mut seen_a: FxHashSet<u64> = FxHashSet::default();
+    let mut bucket_total = [0usize; 10];
+    let mut bucket_correct = [0usize; 10];
+    let mut bucket_wrong = [0usize; 10];
+    let mut bucket_missed = [0usize; 10];
+    let mut total_pairs = 0usize;
+
+    for (name, &addr_a) in &by_name_a {
+        let Some(&addr_b) = by_name_b.get(name) else {
+            continue;
+        };
+        if !seen_a.insert(addr_a) {
+            continue;
+        }
+        let Some(fa) = feats_a.get(&addr_a) else {
+            continue;
+        };
+        let Some(fb) = feats_b.get(&addr_b) else {
+            continue;
+        };
+
+        let j = weighted_jaccard(fa, fb);
+        let bucket = ((j * 10.0) as usize).min(9);
+        total_pairs += 1;
+        bucket_total[bucket] += 1;
+
+        // Outcome: did algorithm match (addr_a, ?), and is ? a name-overlap
+        // with addr_a's PDB names?
+        match alg_match.get(&addr_a) {
+            None => bucket_missed[bucket] += 1,
+            Some(&alg_b) => {
+                let correct = match (sets_a.get(&addr_a), sets_b.get(&alg_b)) {
+                    (Some(sa), Some(sb)) => sa.iter().any(|n: &&str| sb.contains(n)),
+                    _ => false,
+                };
+                if correct {
+                    bucket_correct[bucket] += 1;
+                } else {
+                    bucket_wrong[bucket] += 1;
+                }
+            }
+        }
+    }
+
+    // ----- print -----
+    println!("# ============== achievability analysis ==============");
+    println!(
+        "# {} ground-truth pairs (PDB name in both binaries, both addrs analyzed)",
+        total_pairs
+    );
+    println!("#");
+    println!("# weighted Jaccard distribution (with FINAL synth maps applied):");
+    println!(
+        "# {:<14} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "J range", "total", "correct", "wrong", "missed", "alg-rec%"
+    );
+    for i in (0..10).rev() {
+        let lo = i as f64 / 10.0;
+        let hi = (i + 1) as f64 / 10.0;
+        let total = bucket_total[i];
+        let correct = bucket_correct[i];
+        let wrong = bucket_wrong[i];
+        let missed = bucket_missed[i];
+        let rec = if total > 0 {
+            correct as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        // Mark which buckets are below thresholds.
+        let marker = if (lo + 1e-9) >= anchor_threshold {
+            " (anchor-eligible)"
+        } else if (lo + 1e-9) >= propagate_threshold {
+            " (propagate-only)"
+        } else {
+            " (sub-threshold)"
+        };
+        println!(
+            "# [{:.2}, {:.2}) {:>8} {:>8} {:>8} {:>8} {:>7.1}%{}",
+            lo, hi, total, correct, wrong, missed, rec, marker
+        );
+    }
+
+    println!("#");
+    println!("# Cumulative (ground-truth pairs WITH J >= threshold AND algorithm outcome):");
+    println!(
+        "# {:>10} {:>10} {:>10} {:>10}   {:>10} {:>10} {:>10}",
+        "J>=", "GT_pairs", "%_of_GT", "ceiling%", "alg_match", "alg_correct", "alg_recall%"
+    );
+    let mut cum_total = 0usize;
+    let mut cum_correct = 0usize;
+    let mut cum_wrong = 0usize;
+    let mut cum_missed = 0usize;
+    for i in (0..10).rev() {
+        cum_total += bucket_total[i];
+        cum_correct += bucket_correct[i];
+        cum_wrong += bucket_wrong[i];
+        cum_missed += bucket_missed[i];
+        let lo = i as f64 / 10.0;
+        let frac_gt = cum_total as f64 / total_pairs.max(1) as f64 * 100.0;
+        let ceiling = cum_total as f64 / pdb.baseline_addrs.max(1) as f64 * 100.0;
+        let alg_matched = cum_correct + cum_wrong;
+        let alg_rec_within = if cum_total > 0 {
+            cum_correct as f64 / cum_total as f64 * 100.0
+        } else {
+            0.0
+        };
+        let _ = cum_missed;
+        println!(
+            "# {:>9.2}  {:>10} {:>9.1}% {:>9.1}%   {:>10} {:>10} {:>10.1}%",
+            lo, cum_total, frac_gt, ceiling, alg_matched, cum_correct, alg_rec_within
+        );
+    }
+    println!("#");
+    println!("# Interpretation:");
+    println!("#   - 'ceiling%' = fraction of total recall ceiling (pairs with PDB names");
+    println!("#     in both binaries) reachable IF every ground-truth pair with J >= the");
+    println!("#     threshold were correctly matched by the algorithm.");
+    println!("#   - 'alg_recall%' = of THOSE pairs (J >= threshold), what fraction did");
+    println!("#     the algorithm get correct? Should approach 100% as threshold rises.");
+    println!(
+        "#   - Current --anchor={:.2} --propagate={:.2}: pairs below propagate are",
+        anchor_threshold, propagate_threshold
+    );
+    println!("#     structurally impossible; pairs in [propagate, anchor) need Phase 4.");
+    Ok(())
+}
+
 fn write_matches_cache(path: &Path, args: &Args, result: &RunResult) -> Result<()> {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -1497,12 +1951,15 @@ fn load_pdb_context(args: &Args, pe1: &PeLoader, pe2: &PeLoader) -> Result<PdbCo
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sweep(
     base_args: &Args,
     pe1: &PeLoader,
     funcs1: &[FunctionAnalysis],
     pe2: &PeLoader,
     funcs2: &[FunctionAnalysis],
+    fn_ptrs1: Option<&FnPtrIndex>,
+    fn_ptrs2: Option<&FnPtrIndex>,
     pdb: &PdbContext,
 ) -> Result<()> {
     type Mut = Box<dyn Fn(&mut Args)>;
@@ -1696,7 +2153,17 @@ fn run_sweep(
         total_runs as f64 * 45.0 / 60.0,
     );
     eprintln!("[sweep 1/{}] running baseline...", total_runs);
-    let baseline = run_match(base_args, pe1, funcs1, pe2, funcs2, Some(pdb), true)?;
+    let baseline = run_match(
+        base_args,
+        pe1,
+        funcs1,
+        pe2,
+        funcs2,
+        fn_ptrs1,
+        fn_ptrs2,
+        Some(pdb),
+        true,
+    )?;
     println!();
     println!(
         "# baseline: prec={:.2}%  recall={:.2}%  matched={}  valid={}  time={:.1}s",
@@ -1732,7 +2199,17 @@ fn run_sweep(
             );
             let mut a = base_args.clone();
             mutate(&mut a);
-            let r = match run_match(&a, pe1, funcs1, pe2, funcs2, Some(pdb), true) {
+            let r = match run_match(
+                &a,
+                pe1,
+                funcs1,
+                pe2,
+                funcs2,
+                fn_ptrs1,
+                fn_ptrs2,
+                Some(pdb),
+                true,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     println!("# {:<42} ERROR: {}", label, e);
@@ -1764,12 +2241,15 @@ fn run_sweep(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sweep_combos(
     base_args: &Args,
     pe1: &PeLoader,
     funcs1: &[FunctionAnalysis],
     pe2: &PeLoader,
     funcs2: &[FunctionAnalysis],
+    fn_ptrs1: Option<&FnPtrIndex>,
+    fn_ptrs2: Option<&FnPtrIndex>,
     pdb: &PdbContext,
 ) -> Result<()> {
     type Mut = Box<dyn Fn(&mut Args)>;
@@ -1884,7 +2364,17 @@ fn run_sweep_combos(
         combos.len()
     );
     eprintln!("[combos 1/{}] running baseline...", total_runs);
-    let baseline = run_match(base_args, pe1, funcs1, pe2, funcs2, Some(pdb), true)?;
+    let baseline = run_match(
+        base_args,
+        pe1,
+        funcs1,
+        pe2,
+        funcs2,
+        fn_ptrs1,
+        fn_ptrs2,
+        Some(pdb),
+        true,
+    )?;
     println!();
     println!(
         "# baseline: prec={:.2}%  recall={:.2}%  matched={}  valid={}  time={:.1}s",
@@ -1915,7 +2405,17 @@ fn run_sweep_combos(
         eprintln!("[combos {}/{}] {} ...", idx, total_runs, label);
         let mut a = base_args.clone();
         mutate(&mut a);
-        let r = match run_match(&a, pe1, funcs1, pe2, funcs2, Some(pdb), true) {
+        let r = match run_match(
+            &a,
+            pe1,
+            funcs1,
+            pe2,
+            funcs2,
+            fn_ptrs1,
+            fn_ptrs2,
+            Some(pdb),
+            true,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 println!("# {:<58} ERROR: {}", label, e);
@@ -1970,6 +2470,26 @@ fn main() -> Result<()> {
     let (pe2, funcs2) = analyze(&args.target)?;
     tick(&format!("  {} functions", funcs2.len()));
 
+    // Build the RO-data function-pointer index once per binary. Cheap
+    // (<1ms on typical binaries) and reused across every match pass and
+    // every sweep run. The `--no-fn-ptr` ablation gates emission via
+    // FeatureConfig.use_fn_ptr, not via skipping the build — keeping the
+    // index always-available simplifies plumbing for sweep variants that
+    // might toggle the flag.
+    let entries1: FxHashSet<u64> = funcs1.iter().map(|f| f.entry_point).collect();
+    let entries2: FxHashSet<u64> = funcs2.iter().map(|f| f.entry_point).collect();
+    let fn_ptrs1 = find_fn_ptr_sites(&pe1, &entries1)?;
+    let fn_ptrs2 = find_fn_ptr_sites(&pe2, &entries2)?;
+    tick(&format!(
+        "  fn-ptr sites: base={} ({} funcs) target={} ({} funcs)",
+        fn_ptrs1.len(),
+        fn_ptrs1.distinct_funcs(),
+        fn_ptrs2.len(),
+        fn_ptrs2.distinct_funcs(),
+    ));
+    let fn_ptrs1 = Some(&fn_ptrs1);
+    let fn_ptrs2 = Some(&fn_ptrs2);
+
     let need_pdb = args.validate || args.sweep || args.sweep_combos;
     let pdb_ctx: Option<PdbContext> = if need_pdb {
         tick("loading PDBs");
@@ -1985,6 +2505,8 @@ fn main() -> Result<()> {
             &funcs1,
             &pe2,
             &funcs2,
+            fn_ptrs1,
+            fn_ptrs2,
             pdb_ctx.as_ref().expect("sweep requires PDBs"),
         );
     }
@@ -1995,11 +2517,23 @@ fn main() -> Result<()> {
             &funcs1,
             &pe2,
             &funcs2,
+            fn_ptrs1,
+            fn_ptrs2,
             pdb_ctx.as_ref().expect("sweep-combos requires PDBs"),
         );
     }
 
-    let result = run_match(&args, &pe1, &funcs1, &pe2, &funcs2, pdb_ctx.as_ref(), false)?;
+    let result = run_match(
+        &args,
+        &pe1,
+        &funcs1,
+        &pe2,
+        &funcs2,
+        fn_ptrs1,
+        fn_ptrs2,
+        pdb_ctx.as_ref(),
+        false,
+    )?;
     tick("matching done");
 
     if let Some(path) = &args.emit_matches {
@@ -2052,8 +2586,23 @@ fn main() -> Result<()> {
             Some(&result.synth_b)
         };
         let feat_cfg = FeatureConfig::from_args(&args);
-        let ctx_a = BinaryCtx::new(&pe1, &funcs1, &pdb.names_a, synth_a_ref)?;
-        let ctx_b = BinaryCtx::new(&pe2, &funcs2, &pdb.names_b, synth_b_ref)?;
+        let ctx_a = BinaryCtx::new(&pe1, &funcs1, &pdb.names_a, synth_a_ref, fn_ptrs1)?;
+        let ctx_b = BinaryCtx::new(&pe2, &funcs2, &pdb.names_b, synth_b_ref, fn_ptrs2)?;
+        if args.measure_achievability {
+            measure_achievability(
+                &pe1,
+                &funcs1,
+                &pe2,
+                &funcs2,
+                fn_ptrs1,
+                fn_ptrs2,
+                pdb,
+                &result,
+                &feat_cfg,
+                args.anchor,
+                args.propagate,
+            )?;
+        }
         if args.inspect_samples > 0 {
             inspect_samples(
                 args.inspect_samples,
