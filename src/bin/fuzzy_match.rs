@@ -12,7 +12,7 @@ use binfold::pdb_writer::{self, extract_pdb_info};
 use binfold::pe_loader::{FunctionAnalysis, PeLoader};
 use binfold::warp::read_string_data;
 use clap::{Parser, ValueEnum};
-use grapnel::{Feature, Graph, MatcherConfig, UniversalMinHash};
+use grapnel::{Feature, Graph, MatcherConfig, Node, UniversalMinHash};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
 use pdb::{FallibleIterator, PDB, SymbolData};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -768,14 +768,17 @@ fn build_graph(
     cfg: &FeatureConfig,
 ) -> Result<Graph<u64>> {
     use rayon::prelude::*;
+    let t_total = std::time::Instant::now();
     let iat = pe.iat()?;
     let func_set: FxHashSet<u64> = funcs.iter().map(|f| f.entry_point).collect();
     // Used by the multi-hop SyntCallee BFS in extract_features to recurse
     // through the call graph.
     let funcs_by_ep: FxHashMap<u64, &FunctionAnalysis> =
         funcs.iter().map(|f| (f.entry_point, f)).collect();
+    let dt_setup = t_total.elapsed();
 
     // Per-function "own" features.
+    let t_extract = std::time::Instant::now();
     let own: FxHashMap<u64, FxHashSet<Feat>> = funcs
         .par_iter()
         .map(|f| {
@@ -785,9 +788,11 @@ fn build_graph(
             )
         })
         .collect();
+    let dt_extract = t_extract.elapsed();
 
     // Build adjacency lists in both directions, restricted to functions in
     // our set.
+    let t_adj = std::time::Instant::now();
     let mut callees: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     let mut callers: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     for func in funcs {
@@ -804,6 +809,7 @@ fn build_graph(
             }
         }
     }
+    let dt_adj = t_adj.elapsed();
 
     let dirs: &[&FxHashMap<u64, Vec<u64>>] = match cfg.bundle_dir {
         BundleDir::Callees => &[&callees],
@@ -815,6 +821,7 @@ fn build_graph(
     // stay as Feat::Bigram/Import/etc. Neighbor features are wrapped in
     // Feat::Nbr { depth, hash } so they live in a separate feature space —
     // matching on neighborhood is signal but doesn't masquerade as identity.
+    let t_bundle = std::time::Instant::now();
     let bundled: Vec<(u64, FxHashSet<Feat>)> = funcs
         .par_iter()
         .map(|f| {
@@ -870,6 +877,7 @@ fn build_graph(
             (start, feats)
         })
         .collect();
+    let dt_bundle = t_bundle.elapsed();
 
     let mut counts: Vec<usize> = bundled.iter().map(|(_, s)| s.len()).collect();
     counts.sort_unstable();
@@ -886,6 +894,7 @@ fn build_graph(
     // Wrap each Feat in WeightedFeat at the grapnel boundary. Keeps the
     // emission pipeline above (extract_features, bundling) in terms of
     // plain Feat — weights apply only at MinHash signature time.
+    let t_wrap = std::time::Instant::now();
     let bundled: Vec<(u64, Vec<WeightedFeat>)> = bundled
         .into_iter()
         .map(|(addr, feats)| {
@@ -896,8 +905,12 @@ fn build_graph(
             (addr, weighted)
         })
         .collect();
+    let dt_wrap = t_wrap.elapsed();
+    let t_sigs = std::time::Instant::now();
     let mut g = Graph::default();
     g.add_nodes_par(bundled, hasher);
+    let dt_sigs = t_sigs.elapsed();
+    let t_edges = std::time::Instant::now();
     for func in funcs {
         for call in &func.calls {
             if call.target != func.entry_point && func_set.contains(&call.target) {
@@ -905,7 +918,486 @@ fn build_graph(
             }
         }
     }
+    let dt_edges = t_edges.elapsed();
+    eprintln!(
+        "  build_graph: setup={:.2}s extract={:.2}s adj={:.2}s bundle={:.2}s wrap={:.2}s sigs={:.2}s edges={:.2}s total={:.2}s",
+        dt_setup.as_secs_f64(),
+        dt_extract.as_secs_f64(),
+        dt_adj.as_secs_f64(),
+        dt_bundle.as_secs_f64(),
+        dt_wrap.as_secs_f64(),
+        dt_sigs.as_secs_f64(),
+        dt_edges.as_secs_f64(),
+        t_total.elapsed().as_secs_f64(),
+    );
     Ok(g)
+}
+
+// --- Cached per-binary graph state for incremental MinHash across passes ---
+//
+// `build_graph` computes everything from scratch on each call: stable own
+// features, bundling BFS, MinHash signatures, LSH-ready node list, edges.
+// Across the iteration loop (default 5 passes), most of that work is
+// duplicated — stable own features depend only on the PE bytes, and under
+// the default `--bundle-features import,string,const` so do the bundled
+// neighbor features. Only the SyntCallee / FnPtrPeer additions change per
+// pass as `synth_map` evolves.
+//
+// `GraphCache` holds the stable per-function state computed once:
+//   - mins_stable[K] — MinHash signature of (stable own ∪ stable Nbr)
+//   - total_weight_stable
+//   - synt_refs : Vec<(depth, callee_addr)> — what the SyntCallee BFS will
+//     emit features for, given a synth_map
+//   - peer_refs : Vec<(offset, peer_addr)>  — same for FnPtrPeer
+// Plus edges + adjacency for graph reconstruction.
+//
+// Per pass, `build_graph_from_cache` clones each function's mins_stable and
+// `update_signature`s in the dynamic features under the current synth_map.
+// `min` is commutative+associative so this is bit-identical to a full
+// rebuild — verified by the equivalence test in grapnel/min_hash.rs.
+
+/// Per-function state cached across iteration passes. See module-level
+/// docs for the invariant.
+struct FunctionTemplate {
+    addr: u64,
+    /// MinHash signature of `stable own ∪ stable Nbr` features. Cloned
+    /// once per pass as the starting point for dynamic-feature updates.
+    mins_stable: Vec<u64>,
+    /// Sum of stable feature weights.
+    total_weight_stable: u32,
+    /// `(depth, callee_addr)` tuples that produce `Feat::SyntCallee` at
+    /// runtime when `synth_map.get(&callee_addr)` is `Some(_)`. Captured
+    /// once via BFS at cache-build time.
+    synt_refs: Vec<(u8, u64)>,
+    /// `(offset, peer_addr)` tuples that produce `Feat::FnPtrPeer` at
+    /// runtime when `synth_map.get(&peer_addr)` is `Some(_)`. Dedup'd.
+    peer_refs: Vec<(i8, u64)>,
+}
+
+/// Per-binary cache for the iteration loop. Built once via `build_cache`,
+/// then `build_graph_from_cache` produces a fresh `Graph<u64>` per pass
+/// at the cost of dynamic-feature updates only.
+struct GraphCache {
+    templates: Vec<FunctionTemplate>,
+    /// Direct internal-call edges `(from, to)`. Inserted verbatim into the
+    /// per-pass `Graph::add_edge`. Built once.
+    edges: Vec<(u64, u64)>,
+}
+
+/// True if the bundle filter only references categories that are STABLE
+/// across iteration passes (i.e., excludes any synth/peer/Nbr categories).
+/// Under default CLI (`--bundle-features import,string,const`) this is
+/// always true. If the user removes the filter (`None` = all categories
+/// propagate), bundling would also pull in dynamic Synt/FnPtr features
+/// from neighbors and the cache is invalid — fall back to `build_graph`.
+fn bundle_filter_is_stable(cfg: &FeatureConfig) -> bool {
+    // The user-supplied subset can only contain stable categories
+    // (Bigram/Import/String/Const/BlkCount/CallCount) because Synt/FnPtr/
+    // Nbr are `#[value(skip)]` in `FeatureCategory`. So Some(_) ⇒ stable.
+    cfg.bundle_filter.is_some()
+}
+
+/// Stable subset of `extract_features`: everything except the synth-map-
+/// dependent SyntCallee BFS body and the FnPtrPeer inner-radius loop.
+/// FnPtrRefBucket is stable (depends only on the PE-built fn_ptrs index)
+/// and stays.
+fn extract_stable_features(
+    pe: &PeLoader,
+    func: &FunctionAnalysis,
+    iat: &HashMap<u64, String>,
+    fn_ptrs: Option<&FnPtrIndex>,
+    cfg: &FeatureConfig,
+) -> FxHashSet<Feat> {
+    let mut feats: FxHashSet<Feat> = FxHashSet::default();
+    let bytes = match pe.read_at_va(func.entry_point, func.size) {
+        Ok(b) => b,
+        Err(_) => return feats,
+    };
+    let base = func.entry_point;
+
+    for (&start, &end) in &func.basic_blocks {
+        let off = (start - base) as usize;
+        let end_off = (end - base) as usize;
+        if end_off > bytes.len() || off >= end_off {
+            continue;
+        }
+        let block = &bytes[off..end_off];
+        let mut decoder = Decoder::with_ip(pe.bitness(), block, start, DecoderOptions::NONE);
+        let mut prev: Option<(Mnemonic, [Option<OpKind>; 5])> = None;
+        while decoder.can_decode() {
+            let insn = decoder.decode();
+            let mut ops: [Option<OpKind>; 5] = [None; 5];
+            for (i, slot) in ops.iter_mut().enumerate().take(insn.op_count() as usize) {
+                *slot = Some(insn.op_kind(i as u32));
+            }
+            let cur = (insn.mnemonic(), ops);
+            if cfg.use_bigrams
+                && let Some(p) = prev
+            {
+                feats.insert(Feat::Bigram(fxhash((p, cur))));
+            }
+            prev = Some(cur);
+            for i in 0..insn.op_count() {
+                let v: Option<i64> = match insn.op_kind(i) {
+                    OpKind::Immediate8 => Some(insn.immediate8() as i8 as i64),
+                    OpKind::Immediate8_2nd => Some(insn.immediate8_2nd() as i8 as i64),
+                    OpKind::Immediate16 => Some(insn.immediate16() as i16 as i64),
+                    OpKind::Immediate32 => Some(insn.immediate32() as i32 as i64),
+                    OpKind::Immediate64 => Some(insn.immediate64() as i64),
+                    OpKind::Immediate8to16 => Some(insn.immediate8to16() as i64),
+                    OpKind::Immediate8to32 => Some(insn.immediate8to32() as i64),
+                    OpKind::Immediate8to64 => Some(insn.immediate8to64()),
+                    OpKind::Immediate32to64 => Some(insn.immediate32to64()),
+                    _ => None,
+                };
+                if let Some(v) = v
+                    && v.unsigned_abs() as i64 > CONST_NOISE_THRESHOLD
+                {
+                    feats.insert(Feat::Const(v));
+                }
+            }
+        }
+    }
+
+    let mut call_count: u32 = 0;
+    for call in &func.calls {
+        call_count += 1;
+        if let Some(name) = iat.get(&call.target) {
+            feats.insert(Feat::Import(fxhash(name)));
+        } else if let Some(name) = pe.thunk_import(call.target, iat) {
+            feats.insert(Feat::Import(fxhash(&name)));
+        }
+    }
+
+    for dref in &func.data_refs {
+        if dref.is_readonly
+            && dref.estimated_size.is_none()
+            && let Some(s) = read_string_data(pe, dref.target)
+        {
+            feats.insert(Feat::StringLit(fxhash(&s)));
+        }
+    }
+
+    feats.insert(Feat::BlockCountBucket(
+        (func.basic_blocks.len() as u32).max(1).ilog2(),
+    ));
+    feats.insert(Feat::CallCountBucket((call_count + 1).ilog2()));
+
+    if cfg.use_fn_ptr
+        && let Some(idx) = fn_ptrs
+    {
+        let sites = idx.sites_of(func.entry_point);
+        if !sites.is_empty() {
+            feats.insert(Feat::FnPtrRefBucket((sites.len() as u32).ilog2()));
+        }
+    }
+
+    feats
+}
+
+/// Walk the SyntCallee BFS without consulting `synth_map` — collect the
+/// `(depth, addr)` tuples that *would* produce features given a synth_map.
+/// Identical traversal to the body inside `extract_features` so dynamic
+/// emission is bit-identical to the non-cached path.
+fn enumerate_synt_refs(
+    func: &FunctionAnalysis,
+    funcs_by_ep: &FxHashMap<u64, &FunctionAnalysis>,
+    iat: &HashMap<u64, String>,
+    pe: &PeLoader,
+    cfg: &FeatureConfig,
+) -> Vec<(u8, u64)> {
+    if cfg.synt_depth == 0 {
+        return Vec::new();
+    }
+    let mut refs: Vec<(u8, u64)> = Vec::new();
+    let mut visited: FxHashSet<u64> = FxHashSet::default();
+    visited.insert(func.entry_point);
+    let mut queue: VecDeque<(u64, u8)> = VecDeque::new();
+    for call in &func.calls {
+        if iat.contains_key(&call.target) || pe.thunk_import(call.target, iat).is_some() {
+            continue;
+        }
+        if visited.insert(call.target) {
+            queue.push_back((call.target, 1));
+        }
+    }
+    while let Some((node, depth)) = queue.pop_front() {
+        refs.push((depth, node));
+        if depth < cfg.synt_depth
+            && let Some(callee_func) = funcs_by_ep.get(&node)
+        {
+            if callee_func.calls.len() > cfg.hub_degree {
+                continue;
+            }
+            for c in &callee_func.calls {
+                if iat.contains_key(&c.target) {
+                    continue;
+                }
+                if visited.insert(c.target) {
+                    queue.push_back((c.target, depth + 1));
+                }
+            }
+        }
+    }
+    refs
+}
+
+/// Enumerate `(offset, peer_addr)` tuples that *would* produce FnPtrPeer
+/// features given a synth_map. Same site walk as `extract_features`, with
+/// `FxHashSet` dedup matching the original (multiple sites for one F can
+/// reference the same peer).
+fn enumerate_peer_refs(
+    func: &FunctionAnalysis,
+    fn_ptrs: Option<&FnPtrIndex>,
+    cfg: &FeatureConfig,
+) -> Vec<(i8, u64)> {
+    if !cfg.use_fn_ptr {
+        return Vec::new();
+    }
+    let Some(idx) = fn_ptrs else {
+        return Vec::new();
+    };
+    let sites = idx.sites_of(func.entry_point);
+    if sites.is_empty() {
+        return Vec::new();
+    }
+    let mut refs: FxHashSet<(i8, u64)> = FxHashSet::default();
+    let radius = cfg.fn_ptr_peer_radius as i32;
+    for &site_idx in sites {
+        let site = idx.site(site_idx);
+        for delta in 1..=radius {
+            for signed in [-delta, delta] {
+                if let Some(peer) = idx.grid_neighbor(site, signed) {
+                    refs.insert((signed as i8, peer.func));
+                }
+            }
+        }
+    }
+    refs.into_iter().collect()
+}
+
+/// Build the per-binary cache once: stable own features + stable bundled
+/// Nbr features → cached MinHash signature; plus per-function synt_refs /
+/// peer_refs templates used at pass-time.
+fn build_cache(
+    pe: &PeLoader,
+    funcs: &[FunctionAnalysis],
+    hasher: &UniversalMinHash,
+    fn_ptrs: Option<&FnPtrIndex>,
+    cfg: &FeatureConfig,
+) -> Result<GraphCache> {
+    use rayon::prelude::*;
+    let t_total = std::time::Instant::now();
+    let iat = pe.iat()?;
+    let func_set: FxHashSet<u64> = funcs.iter().map(|f| f.entry_point).collect();
+    let funcs_by_ep: FxHashMap<u64, &FunctionAnalysis> =
+        funcs.iter().map(|f| (f.entry_point, f)).collect();
+    let dt_setup = t_total.elapsed();
+
+    // Stable own features per function, in parallel.
+    let t_stable = std::time::Instant::now();
+    let stable_own: FxHashMap<u64, FxHashSet<Feat>> = funcs
+        .par_iter()
+        .map(|f| {
+            (
+                f.entry_point,
+                extract_stable_features(pe, f, &iat, fn_ptrs, cfg),
+            )
+        })
+        .collect();
+    let dt_stable = t_stable.elapsed();
+
+    // Adjacency for both bundling and edges.
+    let t_adj = std::time::Instant::now();
+    let mut callees: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+    let mut callers: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+    let mut edges: Vec<(u64, u64)> = Vec::with_capacity(funcs.len() * 4);
+    for func in funcs {
+        for call in &func.calls {
+            if call.target != func.entry_point && func_set.contains(&call.target) {
+                callees
+                    .entry(func.entry_point)
+                    .or_default()
+                    .push(call.target);
+                callers
+                    .entry(call.target)
+                    .or_default()
+                    .push(func.entry_point);
+                edges.push((func.entry_point, call.target));
+            }
+        }
+    }
+    let dt_adj = t_adj.elapsed();
+
+    let dirs: &[&FxHashMap<u64, Vec<u64>>] = match cfg.bundle_dir {
+        BundleDir::Callees => &[&callees],
+        BundleDir::Callers => &[&callers],
+        BundleDir::Both => &[&callees, &callers],
+    };
+
+    // Bundle stable Nbr features in parallel — identical BFS to
+    // `build_graph` but reading only `stable_own` (which excludes
+    // Synt/FnPtrPeer), so the resulting feature set is stable.
+    let t_bundle = std::time::Instant::now();
+    let bundled: Vec<(u64, FxHashSet<Feat>)> = funcs
+        .par_iter()
+        .map(|f| {
+            let start = f.entry_point;
+            let mut feats: FxHashSet<Feat> = FxHashSet::default();
+            if let Some(nf) = stable_own.get(&start) {
+                feats.extend(nf.iter().copied());
+            }
+            if cfg.hops == 0 {
+                return (start, feats);
+            }
+            let mut visited: FxHashSet<u64> = FxHashSet::default();
+            let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
+            visited.insert(start);
+            queue.push_back((start, 0));
+            while let Some((node, depth)) = queue.pop_front() {
+                if depth > 0
+                    && let Some(nf) = stable_own.get(&node)
+                {
+                    for nbr_feat in nf {
+                        if let Some(allowed) = cfg.bundle_filter.as_ref()
+                            && !allowed.contains(&feat_category(nbr_feat))
+                        {
+                            continue;
+                        }
+                        feats.insert(Feat::Nbr {
+                            depth: depth as u8,
+                            hash: fxhash(nbr_feat),
+                        });
+                    }
+                }
+                if depth >= cfg.hops {
+                    continue;
+                }
+                for adj in dirs {
+                    if let Some(neighbors) = adj.get(&node) {
+                        if node != start && neighbors.len() > cfg.hub_degree {
+                            continue;
+                        }
+                        for &n in neighbors {
+                            if visited.insert(n) {
+                                queue.push_back((n, depth + 1));
+                            }
+                        }
+                    }
+                }
+            }
+            (start, feats)
+        })
+        .collect();
+    let dt_bundle = t_bundle.elapsed();
+
+    // Compute mins_stable per function (parallel). Also produce synt_refs
+    // and peer_refs in the same pass to amortise per-function startup.
+    let t_sigs = std::time::Instant::now();
+    let templates: Vec<FunctionTemplate> = funcs
+        .par_iter()
+        .zip(bundled.par_iter())
+        .map(|(f, (addr, stable_set))| {
+            debug_assert_eq!(f.entry_point, *addr);
+            let synt_refs = enumerate_synt_refs(f, &funcs_by_ep, &iat, pe, cfg);
+            let peer_refs = enumerate_peer_refs(f, fn_ptrs, cfg);
+            let stable_weighted: Vec<WeightedFeat> = stable_set
+                .iter()
+                .map(|feat| WeightedFeat::new(*feat, &cfg.weights))
+                .collect();
+            let (mins_stable, total_weight_stable) = hasher.generate_signature(stable_weighted);
+            FunctionTemplate {
+                addr: f.entry_point,
+                mins_stable,
+                total_weight_stable,
+                synt_refs,
+                peer_refs,
+            }
+        })
+        .collect();
+    let dt_sigs = t_sigs.elapsed();
+
+    eprintln!(
+        "  build_cache: setup={:.2}s stable_own={:.2}s adj={:.2}s bundle_stable={:.2}s sigs_stable+refs={:.2}s total={:.2}s",
+        dt_setup.as_secs_f64(),
+        dt_stable.as_secs_f64(),
+        dt_adj.as_secs_f64(),
+        dt_bundle.as_secs_f64(),
+        dt_sigs.as_secs_f64(),
+        t_total.elapsed().as_secs_f64(),
+    );
+
+    Ok(GraphCache { templates, edges })
+}
+
+/// Per-pass Graph build from a `GraphCache`. For each function, start
+/// from cached `mins_stable` and `min` in the pass's dynamic features
+/// (SyntCallee from synt_refs ∩ synth_map; FnPtrPeer from peer_refs ∩
+/// synth_map). Bit-identical signatures to a full rebuild via
+/// `build_graph` — see `test_update_signature_equivalent_to_full_generate`
+/// in grapnel.
+fn build_graph_from_cache(
+    cache: &GraphCache,
+    hasher: &UniversalMinHash,
+    synth_map: Option<&FxHashMap<u64, u64>>,
+    cfg: &FeatureConfig,
+) -> Graph<u64> {
+    use rayon::prelude::*;
+    let t_total = std::time::Instant::now();
+    let t_sigs = std::time::Instant::now();
+    let signed: Vec<(u64, Node)> = cache
+        .templates
+        .par_iter()
+        .map(|t| {
+            let mut mins = t.mins_stable.clone();
+            let mut total_weight = t.total_weight_stable;
+            if let Some(map) = synth_map {
+                // Build a small vec of dynamic WeightedFeats for this
+                // function and update_signature once. Two passes through
+                // the inner update_signature loop (synt + peer) avoid
+                // intermediate allocations for empty cases.
+                let mut buf: Vec<WeightedFeat> =
+                    Vec::with_capacity(t.synt_refs.len() + t.peer_refs.len());
+                for &(depth, addr) in &t.synt_refs {
+                    if let Some(&s) = map.get(&addr) {
+                        buf.push(WeightedFeat::new(
+                            Feat::SyntCallee { depth, hash: s },
+                            &cfg.weights,
+                        ));
+                    }
+                }
+                for &(offset, addr) in &t.peer_refs {
+                    if let Some(&s) = map.get(&addr) {
+                        buf.push(WeightedFeat::new(
+                            Feat::FnPtrPeer { offset, hash: s },
+                            &cfg.weights,
+                        ));
+                    }
+                }
+                let w_dyn = hasher.update_signature(&mut mins, buf);
+                total_weight = total_weight.saturating_add(w_dyn);
+            }
+            (t.addr, Node::from_signature(mins, total_weight))
+        })
+        .collect();
+    let dt_sigs = t_sigs.elapsed();
+
+    let t_build = std::time::Instant::now();
+    let mut g = Graph::default();
+    g.insert_nodes(signed);
+    for &(from, to) in &cache.edges {
+        g.add_edge(from, to);
+    }
+    let dt_build = t_build.elapsed();
+
+    eprintln!(
+        "  build_graph_from_cache: sigs={:.2}s assemble={:.2}s total={:.2}s",
+        dt_sigs.as_secs_f64(),
+        dt_build.as_secs_f64(),
+        t_total.elapsed().as_secs_f64(),
+    );
+
+    g
 }
 
 /// Load all function names from the PDB next to the given .exe. Each
@@ -1057,6 +1549,46 @@ fn run_match(
     let mut last_valid = 0usize;
     let mut last_tp = 0usize;
 
+    // Build the per-binary cache (stable own + stable Nbr → mins_stable,
+    // plus synt_refs / peer_refs templates) once. Per-pass graph builds
+    // then `update_signature` in the dynamic features only. Requires the
+    // bundle filter to reference only stable feature categories — which
+    // is guaranteed by the CLI surface (Synt/FnPtr are `#[value(skip)]`),
+    // but we double-check in case the API surface evolves.
+    let use_cache = bundle_filter_is_stable(&feat_cfg);
+    if !use_cache && !quiet {
+        eprintln!(
+            "  (bundle_filter={:?} is not stable-only — falling back to non-cached build_graph)",
+            feat_cfg.bundle_filter,
+        );
+    }
+    let cache_a: Option<GraphCache> = if use_cache {
+        if !quiet {
+            eprintln!("building per-binary cache (base)");
+        }
+        let t = std::time::Instant::now();
+        let c = build_cache(pe1, funcs1, &hasher, fn_ptrs1, &feat_cfg)?;
+        if !quiet {
+            eprintln!("  cache_a built in {:.2}s", t.elapsed().as_secs_f64());
+        }
+        Some(c)
+    } else {
+        None
+    };
+    let cache_b: Option<GraphCache> = if use_cache {
+        if !quiet {
+            eprintln!("building per-binary cache (target)");
+        }
+        let t = std::time::Instant::now();
+        let c = build_cache(pe2, funcs2, &hasher, fn_ptrs2, &feat_cfg)?;
+        if !quiet {
+            eprintln!("  cache_b built in {:.2}s", t.elapsed().as_secs_f64());
+        }
+        Some(c)
+    } else {
+        None
+    };
+
     let total_passes = args.iterations.max(1);
     for pass in 0..total_passes {
         // Derive per-pass synth maps from the canonical confirmed state.
@@ -1086,14 +1618,42 @@ fn run_match(
                 synth_a.len(),
             );
         }
-        let g1 = build_graph(pe1, funcs1, &hasher, synth_a_ref, fn_ptrs1, &feat_cfg)?;
-        let g2 = build_graph(pe2, funcs2, &hasher, synth_b_ref, fn_ptrs2, &feat_cfg)?;
+        let t_g1 = std::time::Instant::now();
+        let g1 = if let Some(c) = &cache_a {
+            build_graph_from_cache(c, &hasher, synth_a_ref, &feat_cfg)
+        } else {
+            build_graph(pe1, funcs1, &hasher, synth_a_ref, fn_ptrs1, &feat_cfg)?
+        };
+        let dt_g1 = t_g1.elapsed();
+        let t_g2 = std::time::Instant::now();
+        let g2 = if let Some(c) = &cache_b {
+            build_graph_from_cache(c, &hasher, synth_b_ref, &feat_cfg)
+        } else {
+            build_graph(pe2, funcs2, &hasher, synth_b_ref, fn_ptrs2, &feat_cfg)?
+        };
+        let dt_g2 = t_g2.elapsed();
 
         if !quiet {
-            eprintln!("pass {}/{}: matching", pass + 1, total_passes);
+            eprintln!(
+                "pass {}/{}: matching (g1 {:.2}s + g2 {:.2}s)",
+                pass + 1,
+                total_passes,
+                dt_g1.as_secs_f64(),
+                dt_g2.as_secs_f64(),
+            );
         }
+        let t_match = std::time::Instant::now();
         let (new_matches, mstats) = config.run_traced(&g1, &g2);
+        let dt_match = t_match.elapsed();
         if !quiet {
+            eprintln!(
+                "  pass {} timing: build_g1={:.2}s build_g2={:.2}s match={:.2}s (total {:.2}s)",
+                pass + 1,
+                dt_g1.as_secs_f64(),
+                dt_g2.as_secs_f64(),
+                dt_match.as_secs_f64(),
+                (dt_g1 + dt_g2 + dt_match).as_secs_f64(),
+            );
             eprintln!(
                 "  pass {} stats: lsh_cands={} above_anchor={} | p3 confirmed={} skip_a={} skip_b={} | p4 propose={} hub={} size={} below_thr={} skip_a={} skip_b={} confirmed={}",
                 pass + 1,
