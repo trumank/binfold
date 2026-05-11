@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::hash::Hash;
-use std::ops::AddAssign;
 
 use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -101,41 +100,6 @@ pub struct MatchStats {
     pub phase2: Phase2Stats,
     pub phase3: Phase3Stats,
     pub phase4: Phase4Stats,
-}
-
-impl AddAssign<&Phase2Stats> for Phase2Stats {
-    fn add_assign(&mut self, rhs: &Self) {
-        self.lsh_candidates += rhs.lsh_candidates;
-        self.above_anchor += rhs.above_anchor;
-    }
-}
-
-impl AddAssign<&Phase3Stats> for Phase3Stats {
-    fn add_assign(&mut self, rhs: &Self) {
-        self.confirmed += rhs.confirmed;
-        self.skip_a_taken += rhs.skip_a_taken;
-        self.skip_b_taken += rhs.skip_b_taken;
-    }
-}
-
-impl AddAssign<&Phase4Stats> for Phase4Stats {
-    fn add_assign(&mut self, rhs: &Self) {
-        self.propose += rhs.propose;
-        self.blocked_hub += rhs.blocked_hub;
-        self.blocked_size += rhs.blocked_size;
-        self.below_threshold += rhs.below_threshold;
-        self.skip_a_taken += rhs.skip_a_taken;
-        self.skip_b_taken += rhs.skip_b_taken;
-        self.confirmed += rhs.confirmed;
-    }
-}
-
-impl AddAssign<&MatchStats> for MatchStats {
-    fn add_assign(&mut self, rhs: &Self) {
-        self.phase2 += &rhs.phase2;
-        self.phase3 += &rhs.phase3;
-        self.phase4 += &rhs.phase4;
-    }
 }
 
 impl MatcherConfig {

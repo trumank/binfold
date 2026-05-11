@@ -19,7 +19,14 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 /// collisions, the strict-singleton variant is a strict Pareto win on both
 /// precision and recall vs. wider bucket caps.
 pub struct LshIndex<Id> {
-    bands: Vec<FxHashMap<u64, Id>>,
+    /// Per-band singleton map. `Some(id)` = unique owner of this band-hash;
+    /// `None` = was claimed and then collided, kept as a tombstone so the
+    /// second-collider check during build is one HashMap probe instead of a
+    /// post-build filter+rebuild pass. Empty (no entry) = no node ever hashed
+    /// to this slot. Niche optimization makes `Option<&u64>` an 8-byte value
+    /// (None = null pointer), so the tombstone is free vs. a rebuilt
+    /// `FxHashMap<u64, Id>`.
+    bands: Vec<FxHashMap<u64, Option<Id>>>,
 }
 
 impl<Id> LshIndex<Id> {
@@ -39,12 +46,25 @@ impl<Id> LshIndex<Id> {
         } else {
             entries[0].1.len() / lsh_bands
         };
+        // K < bands gives rows_per_band == 0 via integer truncation. Every
+        // band would then hash the empty slice to the same constant, the
+        // singleton filter drops every band, and matching silently returns
+        // zero hits. Surface the configuration error loudly.
+        if !entries.is_empty() && lsh_bands > 0 {
+            assert!(
+                rows_per_band > 0,
+                "lsh_bands ({}) exceeds signature length ({}); pick bands ≤ K",
+                lsh_bands,
+                entries[0].1.len(),
+            );
+        }
 
         // Per-band parallel build. Each thread scans every entry against its
-        // band; `Some(id)` = single owner so far, `None` = collided/dropped.
-        // After the sweep, filter out `None` slots and unwrap to produce the
-        // final unique-fingerprint map.
-        let bands: Vec<FxHashMap<u64, Id>> = (0..lsh_bands)
+        // band: first owner takes the slot as `Some(id)`; any subsequent
+        // collider writes `None` as a tombstone. Empty entries mean "no node
+        // ever hashed here." Query treats both empty-entry and `None`-entry
+        // as "no candidate" — no post-build filter+rebuild needed.
+        let bands: Vec<FxHashMap<u64, Option<Id>>> = (0..lsh_bands)
             .into_par_iter()
             .map(|band_idx| {
                 let mut tmp: FxHashMap<u64, Option<Id>> =
@@ -56,9 +76,7 @@ impl<Id> LshIndex<Id> {
                         .and_modify(|slot| *slot = None)
                         .or_insert_with(|| Some(key.clone()));
                 }
-                tmp.into_iter()
-                    .filter_map(|(k, v)| v.map(|id| (k, id)))
-                    .collect()
+                tmp
             })
             .collect();
 
@@ -82,7 +100,7 @@ impl<Id> LshIndex<Id> {
         for band_idx in 0..self.bands.len() {
             let start = band_idx * lsh_rows;
             let bucket_hash = FxBuildHasher.hash_one(&signature[start..start + lsh_rows]);
-            if let Some(id) = self.bands[band_idx].get(&bucket_hash) {
+            if let Some(Some(id)) = self.bands[band_idx].get(&bucket_hash) {
                 candidates.push(id.clone());
             }
         }

@@ -120,23 +120,63 @@ impl UniversalMinHash {
             "mins.len() must equal k_permutations"
         );
         let mut total_weight = 0;
+        let k = self.k_permutations;
 
         for feature in features {
             let weight = feature.weight();
             total_weight += weight;
-
             let base_hash = FxBuildHasher.hash_one(&feature);
-            for w in 0..weight {
-                let w_hash = (w as u64).wrapping_mul(FIBONACCI_HASH_MULTIPLIER);
-                let x = base_hash ^ w_hash;
 
-                // Tight K-loop — LLVM auto-vectorises this to AVX-512
-                // `vpmullq` + `vpaddq` + `vpcmpltuq` + masked store on
-                // `target-cpu=native` (no Mersenne reduction = no 64x64→128
-                // multiply = no GP→ZMM repacking). The previous Carter–
-                // Wegman version had ~50 instructions per 8 K-lanes; this
-                // is ~6.
-                for (i, min_val) in mins.iter_mut().enumerate().take(self.k_permutations) {
+            // Manual 4-way unroll on the W-loop. Amortizes a[i]/b[i]/mins[i]
+            // loads across 4 W iterations: each K-loop pass computes four
+            // (a_i * x + b_i) values for different x's, min-reduces them
+            // first, then does one conditional store to mins[i] (vs four
+            // stores in the unrolled-K-only baseline).
+            //
+            // LLVM auto-vectorizes the K-loop with this body to a 4-way
+            // ZMM-unrolled pattern: 4 `vpmullq` (reuses the same broadcast
+            // `x`) + 4 `vpaddq` (loading b chunks) + 3 `vpminuq` (tree
+            // reduce) + 1 `vpcmpltuq` + 1 masked `vmovdqu64` per 8 K-lanes,
+            // 4 such blocks per outer K iteration → 32 K-positions per pass.
+            //
+            // Compiler-friendly alternatives (loop tiling, loop swap,
+            // iterator chains, const-generic helper function,
+            // `--enable-loopinterchange`) all regressed: LLVM doesn't
+            // compose loop-interchange + outer-unroll + retain-inner-SIMD
+            // for this nest. The optimization is algorithm-specific
+            // ("amortize redundant a/b loads across multiple x values")
+            // and HPC literature calls it "outer-loop register tiling" —
+            // it's not part of LLVM's standard pass pipeline. See the
+            // perf-tuning change-log entry for details.
+            //
+            // 4 is the empirical sweet spot: 8-way spills SIMD registers
+            // (94s user vs 75s for 4-way); 2-way leaves perf on the table.
+            let chunks = (weight / 4) as usize;
+            for chunk in 0..chunks {
+                let w0 = (chunk * 4) as u64;
+                let xs = [
+                    base_hash ^ w0.wrapping_mul(FIBONACCI_HASH_MULTIPLIER),
+                    base_hash ^ (w0 + 1).wrapping_mul(FIBONACCI_HASH_MULTIPLIER),
+                    base_hash ^ (w0 + 2).wrapping_mul(FIBONACCI_HASH_MULTIPLIER),
+                    base_hash ^ (w0 + 3).wrapping_mul(FIBONACCI_HASH_MULTIPLIER),
+                ];
+                for (i, min_val) in mins.iter_mut().enumerate().take(k) {
+                    let a_i = self.a[i];
+                    let b_i = self.b[i];
+                    let v0 = a_i.wrapping_mul(xs[0]).wrapping_add(b_i);
+                    let v1 = a_i.wrapping_mul(xs[1]).wrapping_add(b_i);
+                    let v2 = a_i.wrapping_mul(xs[2]).wrapping_add(b_i);
+                    let v3 = a_i.wrapping_mul(xs[3]).wrapping_add(b_i);
+                    let m = v0.min(v1).min(v2.min(v3));
+                    if m < *min_val {
+                        *min_val = m;
+                    }
+                }
+            }
+            // Tail: 0..3 leftover W iterations.
+            for w in (chunks as u32 * 4)..weight {
+                let x = base_hash ^ (w as u64).wrapping_mul(FIBONACCI_HASH_MULTIPLIER);
+                for (i, min_val) in mins.iter_mut().enumerate().take(k) {
                     let val = self.a[i].wrapping_mul(x).wrapping_add(self.b[i]);
                     if val < *min_val {
                         *min_val = val;
