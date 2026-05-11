@@ -229,7 +229,8 @@ where
                 let Some(node2) = graph2.nodes.get(node_id2) else {
                     continue;
                 };
-                let sim = node1.exact_weighted_jaccard(node2);
+                let intersection = node1.signature_intersection(node2);
+                let sim = intersection as f64 / config.k_permutations as f64;
                 if sim >= config.anchor_threshold {
                     out.push((sim, node_id1, node_id2));
                 }
@@ -330,7 +331,8 @@ where
                             continue;
                         }
 
-                        let sim = node1_ref.exact_weighted_jaccard(node2_ref);
+                        let intersection = node1_ref.signature_intersection(node2_ref);
+                        let sim = intersection as f64 / config.k_permutations as f64;
 
                         // Optimal Match Selection: Find the highest similarity sibling
                         if sim >= config.propagation_threshold && sim > best_sim {

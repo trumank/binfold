@@ -1,9 +1,7 @@
-use std::cmp::Ordering;
 use std::hash::Hash;
 
 use rayon::prelude::*;
-use rustc_hash::{FxBuildHasher, FxHashMap};
-use std::hash::BuildHasher;
+use rustc_hash::FxHashMap;
 
 use super::min_hash::{Feature, UniversalMinHash};
 
@@ -23,14 +21,9 @@ pub struct Graph<Id> {
 }
 
 impl<Id> Graph<Id> {
-    /// Inserts a new node into the graph.
-    ///
-    /// Sign many nodes in parallel. Each feature iterator is consumed twice:
-    /// once collected into a vec to feed both MinHash signing and the
-    /// `(hash, weight)` capture for the exact-Jaccard feature array. Signing
-    /// is the dominant cost of building a graph (K permutations per feature
-    /// weight unit), and each node is independent — fan it out across cores,
-    /// then insert serially.
+    /// Sign many nodes in parallel. Signing is the dominant cost of building
+    /// a graph (K hash permutations per feature weight unit), and each node
+    /// is independent — fan it out across cores, then insert serially.
     pub fn add_nodes_par<I, FB>(&mut self, items: I, minhasher: &UniversalMinHash)
     where
         Id: Eq + Hash + Send,
@@ -41,27 +34,12 @@ impl<Id> Graph<Id> {
         let signed: Vec<(Id, Node)> = items
             .into_par_iter()
             .map(|(key, features)| {
-                let collected: Vec<_> = features.into_iter().collect();
-                let mut pairs: Vec<(u64, u32)> = collected
-                    .iter()
-                    .map(|f| (FxBuildHasher.hash_one(f), f.weight()))
-                    .collect();
-                pairs.sort_unstable_by_key(|(h, _)| *h);
-                pairs.dedup_by(|a, b| {
-                    if a.0 == b.0 {
-                        b.1 = b.1.max(a.1);
-                        true
-                    } else {
-                        false
-                    }
-                });
-                let (signature, total_weight) = minhasher.generate_signature(collected);
+                let (signature, total_weight) = minhasher.generate_signature(features);
                 (
                     key,
                     Node {
                         signature,
                         total_weight,
-                        features: pairs.into_boxed_slice(),
                     },
                 )
             })
@@ -101,99 +79,40 @@ impl<Id> Graph<Id> {
     }
 }
 
-/// Represents a node within a graph.
-///
-/// Carries two complementary representations of the node's feature set:
-///
-/// - `signature`: the MinHash signature, used only by `LshIndex` to build the
-///   band-fingerprint retrieval index. Each band slice is a u64 chunk of this
-///   vector. No longer used for similarity scoring.
-/// - `features`: the underlying `(feature_hash, weight)` pairs, sorted by
-///   hash and deduplicated. Used for exact weighted Jaccard scoring in Phase
-///   2 (anchor filtering) and Phase 4 (propagation sibling selection). The
-///   exact computation has zero estimator variance — eliminating the
-///   ±0.05-at-J=0.5 noise band that the MinHash estimator (K=800) inflicted
-///   on every anchor-threshold decision.
+/// Represents a node within a graph. Holds the K-length MinHash signature
+/// (used both as the source of LSH band fingerprints and for the
+/// `signature_intersection / K` Jaccard estimate) plus the total feature
+/// weight (gates LSH indexing via `min_features_for_lsh`).
 #[derive(Debug)]
 pub struct Node {
     pub(super) signature: Vec<u64>,
     pub(super) total_weight: u32,
-    /// `(feature_hash, weight)` pairs sorted ascending by hash, deduplicated.
-    /// Memory footprint is the dominant cost of carrying this — sweep your
-    /// caller's feature-counts before assuming the trade is favourable.
-    pub(super) features: Box<[(u64, u32)]>,
 }
 
 impl Node {
-    /// Construct a `Node` from a pre-computed signature and the matching
-    /// `(hash, weight)` feature pairs. The caller must supply `features` already
-    /// sorted ascending by hash and deduplicated — `exact_weighted_jaccard`
-    /// assumes that invariant. Used by callers that maintain incremental
-    /// signatures across iterations (cached stable baseline + per-pass dynamic
-    /// `update_signature` calls).
+    /// Construct a `Node` from a pre-computed MinHash signature and weight
+    /// sum. Used by callers that maintain incremental signatures across
+    /// iterations (cached stable baseline + per-pass dynamic
+    /// `update_signature` calls) and want to insert pre-signed nodes via
+    /// [`Graph::insert_nodes`].
     #[inline]
-    pub fn from_signature(
-        signature: Vec<u64>,
-        total_weight: u32,
-        features: Box<[(u64, u32)]>,
-    ) -> Self {
-        debug_assert!(
-            features.windows(2).all(|w| w[0].0 < w[1].0),
-            "features must be sorted ascending by hash and deduplicated",
-        );
+    pub fn from_signature(signature: Vec<u64>, total_weight: u32) -> Self {
         Self {
             signature,
             total_weight,
-            features,
         }
     }
 
-    /// Exact weighted Jaccard similarity between two nodes.
-    ///
-    /// Sorted merge over the two `(hash, weight)` arrays. Returns
-    /// `intersect_weight / union_weight` with min/max accumulation per feature
-    /// (the canonical weighted-Jaccard definition; reduces to "shared weight /
-    /// union weight" when the same feature has the same weight on both sides,
-    /// which is the case for callers whose weight is a pure function of the
-    /// feature variant).
-    ///
-    /// Returns `0.0` when both sides have empty feature sets.
+    /// Number of positions where two K-length MinHash signatures agree.
+    /// `intersection / K` is an unbiased estimator of weighted Jaccard with
+    /// std-dev ≈ √(J(1−J)/K). LLVM auto-vectorises this to AVX-512
+    /// `vpcmpeqq` + reduce on `target-cpu=native`.
     #[inline]
-    pub fn exact_weighted_jaccard(&self, other: &Node) -> f64 {
-        let (a, b) = (&self.features, &other.features);
-        let (mut i, mut j) = (0usize, 0usize);
-        let (mut intersect, mut union) = (0u64, 0u64);
-        while i < a.len() && j < b.len() {
-            match a[i].0.cmp(&b[j].0) {
-                Ordering::Less => {
-                    union += a[i].1 as u64;
-                    i += 1;
-                }
-                Ordering::Greater => {
-                    union += b[j].1 as u64;
-                    j += 1;
-                }
-                Ordering::Equal => {
-                    let (wa, wb) = (a[i].1 as u64, b[j].1 as u64);
-                    intersect += wa.min(wb);
-                    union += wa.max(wb);
-                    i += 1;
-                    j += 1;
-                }
-            }
-        }
-        while i < a.len() {
-            union += a[i].1 as u64;
-            i += 1;
-        }
-        while j < b.len() {
-            union += b[j].1 as u64;
-            j += 1;
-        }
-        if union == 0 {
-            0.0
-        } else {
-            intersect as f64 / union as f64
-        }
+    pub fn signature_intersection(&self, other: &Node) -> usize {
+        self.signature
+            .iter()
+            .zip(other.signature.iter())
+            .map(|(a, b)| (*a == *b) as usize)
+            .sum()
     }
 }

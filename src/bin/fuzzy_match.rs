@@ -15,9 +15,9 @@ use binfold::warp::read_string_data;
 use clap::{Parser, ValueEnum};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
 use pdb::{FallibleIterator, PDB, SymbolData};
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::collections::{HashMap, VecDeque};
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Clone)]
@@ -955,12 +955,6 @@ struct FunctionTemplate {
     mins_stable: Vec<u64>,
     /// Sum of stable feature weights.
     total_weight_stable: u32,
-    /// `(feature_hash, weight)` pairs for the stable feature set, sorted
-    /// ascending by hash and deduplicated. Per-pass `build_graph_from_cache`
-    /// merges this with the dynamic synt/peer pairs derived from the current
-    /// `synth_map` to produce the `Node::features` array Phase 2 / Phase 4
-    /// score against via exact weighted Jaccard.
-    stable_features: Box<[(u64, u32)]>,
     /// `(depth, callee_addr)` tuples that produce `Feat::SyntCallee` at
     /// runtime when `synth_map.get(&callee_addr)` is `Some(_)`. Captured
     /// once via BFS at cache-build time.
@@ -1301,21 +1295,11 @@ fn build_cache(
                 .iter()
                 .map(|feat| WeightedFeat::new(*feat, &cfg.weights))
                 .collect();
-            // Capture per-feature (hash, weight) pairs *before* feeding the
-            // vec into MinHash so we don't have to re-hash. The hash function
-            // is the same FxBuildHasher MinHash itself uses internally.
-            let mut stable_pairs: Vec<(u64, u32)> = stable_weighted
-                .iter()
-                .map(|wf| (FxBuildHasher.hash_one(wf), wf.weight))
-                .collect();
-            stable_pairs.sort_unstable_by_key(|(h, _)| *h);
-            stable_pairs.dedup_by_key(|(h, _)| *h);
             let (mins_stable, total_weight_stable) = hasher.generate_signature(stable_weighted);
             FunctionTemplate {
                 addr: f.entry_point,
                 mins_stable,
                 total_weight_stable,
-                stable_features: stable_pairs.into_boxed_slice(),
                 synt_refs,
                 peer_refs,
             }
@@ -1334,36 +1318,6 @@ fn build_cache(
     );
 
     Ok(GraphCache { templates, edges })
-}
-
-/// Merge two `(hash, weight)` arrays — both must already be sorted ascending
-/// by hash and individually deduplicated — into one sorted+dedup'd boxed
-/// slice. When the same hash appears in both inputs (shouldn't happen in
-/// practice because stable and dynamic feature variants have disjoint enum
-/// discriminants, hence disjoint hash spaces), the larger weight wins.
-fn merge_sorted_pairs(a: &[(u64, u32)], b: &[(u64, u32)]) -> Box<[(u64, u32)]> {
-    let mut out: Vec<(u64, u32)> = Vec::with_capacity(a.len() + b.len());
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < a.len() && j < b.len() {
-        match a[i].0.cmp(&b[j].0) {
-            std::cmp::Ordering::Less => {
-                out.push(a[i]);
-                i += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                out.push(b[j]);
-                j += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                out.push((a[i].0, a[i].1.max(b[j].1)));
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    out.extend_from_slice(&a[i..]);
-    out.extend_from_slice(&b[j..]);
-    out.into_boxed_slice()
 }
 
 /// Per-pass Graph build from a `GraphCache`. For each function, start
@@ -1387,11 +1341,6 @@ fn build_graph_from_cache(
         .map(|t| {
             let mut mins = t.mins_stable.clone();
             let mut total_weight = t.total_weight_stable;
-            // Stable features are already sorted+dedup'd at cache-build time.
-            // Dynamic features (synt + peer) are produced fresh per pass; we
-            // sort them and merge with stable into one sorted+dedup'd vector
-            // for Node::from_signature.
-            let mut dyn_pairs: Vec<(u64, u32)> = Vec::new();
             if let Some(map) = synth_map {
                 let mut buf: Vec<WeightedFeat> =
                     Vec::with_capacity(t.synt_refs.len() + t.peer_refs.len());
@@ -1411,17 +1360,10 @@ fn build_graph_from_cache(
                         ));
                     }
                 }
-                dyn_pairs.reserve(buf.len());
-                for wf in &buf {
-                    dyn_pairs.push((FxBuildHasher.hash_one(wf), wf.weight));
-                }
-                dyn_pairs.sort_unstable_by_key(|(h, _)| *h);
-                dyn_pairs.dedup_by_key(|(h, _)| *h);
                 let w_dyn = hasher.update_signature(&mut mins, buf);
                 total_weight = total_weight.saturating_add(w_dyn);
             }
-            let features = merge_sorted_pairs(&t.stable_features, &dyn_pairs);
-            (t.addr, Node::from_signature(mins, total_weight, features))
+            (t.addr, Node::from_signature(mins, total_weight))
         })
         .collect();
     let dt_sigs = t_sigs.elapsed();
