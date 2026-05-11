@@ -7,6 +7,8 @@
 use anyhow::Result;
 use binfold::fn_ptr_index::{FnPtrIndex, find_fn_ptr_sites};
 use binfold::mmap_source::MmapSource;
+use binfold::pdb_analyzer;
+use binfold::pdb_writer::{self, extract_pdb_info};
 use binfold::pe_loader::{FunctionAnalysis, PeLoader};
 use binfold::warp::read_string_data;
 use clap::{Parser, ValueEnum};
@@ -57,10 +59,6 @@ struct Args {
     max_degree: usize,
     #[arg(long, default_value_t = 42)]
     seed: u64,
-
-    /// Print at most this many matches.
-    #[arg(long, default_value_t = 50)]
-    limit: usize,
 
     /// Validate matches against `.pdb` files next to each `.exe` and report
     /// precision (fraction of matched pairs whose PDB symbol names agree).
@@ -125,7 +123,7 @@ struct Args {
     /// (default ON): metrics monotonically improve through iter=5+ — the
     /// pass-3 regression that capped this at 2 under the lock rule is gone.
     /// Use `--iterations 2` to match the prior lock-rule-era default.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 5)]
     iterations: usize,
 
     /// One-at-a-time perturbation sweep around the current args. Loads PE
@@ -160,6 +158,13 @@ struct Args {
     /// cycle — render graphs without re-running the 30s match each time.
     #[arg(long)]
     emit_matches: Option<PathBuf>,
+
+    /// Write a PDB for the target binary, populated with symbol names from
+    /// the base binary's PDB for each matched pair. Reads names from
+    /// `<base>.pdb` and emits a PDB whose debug GUID/age/timestamp match the
+    /// target binary so a debugger will load it automatically.
+    #[arg(long)]
+    generate_pdb: Option<PathBuf>,
 
     /// Multi-hop SyntCallee depth. **Default 2**: each pass BFS-walks up to
     /// 2 callee hops from each function and emits a depth-tagged synth
@@ -243,6 +248,59 @@ struct Args {
     /// adjacent unrelated vtables get treated as peers, polluting Jaccard.
     #[arg(long, default_value_t = 10)]
     fn_ptr_peer_radius: u8,
+
+    // --- per-feature weight overrides (None = use baked-in default) ---
+    /// Override weight for `Feat::Bigram` (default 1).
+    #[arg(long)]
+    w_bigram: Option<u32>,
+    /// Override weight for `Feat::Import` (default 8).
+    #[arg(long)]
+    w_import: Option<u32>,
+    /// Override weight for `Feat::StringLit` (default 8).
+    #[arg(long)]
+    w_string: Option<u32>,
+    /// Override weight for `Feat::Const` (default 8).
+    #[arg(long)]
+    w_const: Option<u32>,
+    /// Override weight for `Feat::BlockCountBucket` (default 4).
+    #[arg(long)]
+    w_block_count: Option<u32>,
+    /// Override weight for `Feat::CallCountBucket` (default 4).
+    #[arg(long)]
+    w_call_count: Option<u32>,
+    /// Override weight for `Feat::Nbr` at depth=1 (default 2).
+    #[arg(long)]
+    w_nbr_d1: Option<u32>,
+    /// Override weight for `Feat::Nbr` at depth>=2 (default 1).
+    #[arg(long)]
+    w_nbr_deep: Option<u32>,
+    /// Override weight for `Feat::SyntCallee` at depth=1 (default 16).
+    #[arg(long)]
+    w_synt_d1: Option<u32>,
+    /// Override weight for `Feat::SyntCallee` at depth=2 (default 8).
+    #[arg(long)]
+    w_synt_d2: Option<u32>,
+    /// Override weight for `Feat::SyntCallee` at depth=3 (default 4).
+    #[arg(long)]
+    w_synt_d3: Option<u32>,
+    /// Override weight for `Feat::SyntCallee` at depth>=4 (default 2).
+    #[arg(long)]
+    w_synt_deep: Option<u32>,
+    /// Override weight for `Feat::FnPtrRefBucket` (default 4).
+    #[arg(long)]
+    w_fnptr_ref: Option<u32>,
+    /// Override weight for `Feat::FnPtrPeer` at |offset|=1 (default 16).
+    #[arg(long)]
+    w_fnptr_peer_d1: Option<u32>,
+    /// Override weight for `Feat::FnPtrPeer` at |offset|=2 (default 8).
+    #[arg(long)]
+    w_fnptr_peer_d2: Option<u32>,
+    /// Override weight for `Feat::FnPtrPeer` at |offset|=3 (default 4).
+    #[arg(long)]
+    w_fnptr_peer_d3: Option<u32>,
+    /// Override weight for `Feat::FnPtrPeer` at |offset|>=4 (default 2).
+    #[arg(long)]
+    w_fnptr_peer_deep: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -308,6 +366,7 @@ struct FeatureConfig {
     synt_depth: u8,
     use_fn_ptr: bool,
     fn_ptr_peer_radius: u8,
+    weights: WeightConfig,
 }
 
 impl FeatureConfig {
@@ -324,6 +383,7 @@ impl FeatureConfig {
             synt_depth: args.synt_depth,
             use_fn_ptr: !args.no_fn_ptr,
             fn_ptr_peer_radius: args.fn_ptr_peer_radius,
+            weights: WeightConfig::from_args(args),
         }
     }
 }
@@ -378,52 +438,191 @@ enum Feat {
     FnPtrPeer { offset: i8, hash: u64 },
 }
 
-impl Feature for Feat {
-    fn weight(&self) -> u32 {
-        match self {
-            // Compiler-coupled identity signal. There are many bigrams per
-            // function (median 25-100), so even at weight=1 they dominate by
-            // count when no other features exist. Higher weight would let
-            // them outvote stable cross-compiler signal.
-            Feat::Bigram(_) => 1,
+/// Per-feature-category weight overrides. All weights configurable via
+/// CLI flags (defaults baked here). Plumbed through `extract_features` —
+/// no globals — so a sweep can run multiple configs in one process if
+/// needed.
+#[derive(Debug, Clone, Copy)]
+struct WeightConfig {
+    bigram: u32,
+    import: u32,
+    string_lit: u32,
+    const_: u32,
+    block_count: u32,
+    call_count: u32,
+    nbr_d1: u32,
+    nbr_deep: u32,
+    synt_d1: u32,
+    synt_d2: u32,
+    synt_d3: u32,
+    synt_deep: u32,
+    fnptr_ref: u32,
+    fnptr_peer_d1: u32,
+    fnptr_peer_d2: u32,
+    fnptr_peer_d3: u32,
+    fnptr_peer_deep: u32,
+}
+
+impl Default for WeightConfig {
+    fn default() -> Self {
+        Self {
+            // Compiler-coupled identity signal. Many bigrams per function
+            // (median 25-100), so even at weight=1 they dominate by count
+            // when no other features exist. Sweep showed weight≥2 hurts
+            // recall significantly (compiler-coupled noise compounds).
+            bigram: 1,
             // Compiler-stable identity. Few per function (often 0-3), so
             // weight them up so a single matching string/import/constant
             // can anchor a function whose bigrams have diverged.
-            Feat::Import(_) | Feat::StringLit(_) | Feat::Const(_) => 8,
-            // Coarse shape — always present, weakly distinctive. Mid-weight.
-            Feat::BlockCountBucket(_) | Feat::CallCountBucket(_) => 4,
+            //
+            // string_lit raised to 64 (was 16, originally 8). Sweep showed
+            // strings are the strongest cross-compiler-stable signal —
+            // bytewise-identical across compilers, low collision rate
+            // (most strings are unique). Successive bumps strict-Pareto-
+            // improved on 505S/505SC: 8→16 was +0.88pp recall +0.36pp
+            // prec; 16→64 added another +0.15pp recall +0.56pp prec.
+            // Beyond 64 saturates.
+            //
+            // const lowered to 4 (was 8). Constants collide on common
+            // values (powers of 2, struct sizes, hash multipliers), so
+            // overweighting them creates false-positive Jaccard signal.
+            // 8→4 was net positive (+0.30pp recall, neutral precision).
+            // 16 hurt recall by 2pp.
+            import: 8,
+            string_lit: 64,
+            const_: 4,
+            // Coarse shape — always present, weakly distinctive. Lowered
+            // from 4 to 1: empirical strict Pareto improvement (~0pp
+            // recall, +1.65pp precision) — the 4-weight was overweighting
+            // a feature most pairs share by chance, polluting Jaccard.
+            block_count: 1,
+            call_count: 1,
             // Neighborhood features decay with depth: 1-hop is more
-            // informative than 3-hop. Both are still topology hints, not
-            // identity.
-            Feat::Nbr { depth, .. } => match depth {
-                1 => 2,
-                _ => 1,
-            },
+            // informative than further hops.
+            nbr_d1: 2,
+            nbr_deep: 1,
             // Certified cross-binary identity from a previous match pass.
-            // Strongest signal at depth=1 (direct callee). Decays
-            // geometrically with depth: depth=2 callees-of-callees carry
-            // weaker evidence, etc. Each depth has its own feature space.
-            Feat::SyntCallee { depth, .. } => match depth {
-                1 => 16,
-                2 => 8,
-                3 => 4,
-                _ => 2,
+            // Strongest signal at depth=1 (direct callee), geometric decay.
+            // Doubling all weights (32/16/8/4) lifts recall by +1.49pp at
+            // -1.45pp precision — kept at the original schedule because
+            // the precision cost is too steep for the default; users who
+            // want max recall can override via --w-synt-d1 32 etc.
+            synt_d1: 16,
+            synt_d2: 8,
+            synt_d3: 4,
+            synt_deep: 2,
+            // Coarse shape — vtable reference count.
+            fnptr_ref: 4,
+            // Certified peer identity through vtable adjacency. Final
+            // schedule 256/64/16/4 was the empirical recall ceiling on
+            // 505S/505SC: pushing d1 from 32→128→256 lifted recall in
+            // +1.93pp + 0.48pp steps before saturating at 256. The sharp
+            // shape (steep decay vs gentle 256/128/64/32) wins because
+            // peers at radius 6+ increasingly cross vtable boundaries
+            // (encounter unrelated functions adjacent to the target's
+            // vtable in `.rdata`); high weight on those polluted distant
+            // peers hurts. Sharp decay correctly trusts close vtable
+            // adjacency strongly while ignoring noisy distant slots.
+            //
+            // Trade vs the prior 32/16/8/4 default: +2.41pp recall for
+            // -0.64pp precision when paired with iter=5 — recall-favoring
+            // but still net positive overall (recall ceiling 71%, this
+            // takes us to 51.77% = 72.9% of achievable). Users wanting
+            // precision-favored defaults can override back to 32/16/8/4.
+            fnptr_peer_d1: 256,
+            fnptr_peer_d2: 64,
+            fnptr_peer_d3: 16,
+            fnptr_peer_deep: 4,
+        }
+    }
+}
+
+impl WeightConfig {
+    fn from_args(args: &Args) -> Self {
+        let d = WeightConfig::default();
+        WeightConfig {
+            bigram: args.w_bigram.unwrap_or(d.bigram),
+            import: args.w_import.unwrap_or(d.import),
+            string_lit: args.w_string.unwrap_or(d.string_lit),
+            const_: args.w_const.unwrap_or(d.const_),
+            block_count: args.w_block_count.unwrap_or(d.block_count),
+            call_count: args.w_call_count.unwrap_or(d.call_count),
+            nbr_d1: args.w_nbr_d1.unwrap_or(d.nbr_d1),
+            nbr_deep: args.w_nbr_deep.unwrap_or(d.nbr_deep),
+            synt_d1: args.w_synt_d1.unwrap_or(d.synt_d1),
+            synt_d2: args.w_synt_d2.unwrap_or(d.synt_d2),
+            synt_d3: args.w_synt_d3.unwrap_or(d.synt_d3),
+            synt_deep: args.w_synt_deep.unwrap_or(d.synt_deep),
+            fnptr_ref: args.w_fnptr_ref.unwrap_or(d.fnptr_ref),
+            fnptr_peer_d1: args.w_fnptr_peer_d1.unwrap_or(d.fnptr_peer_d1),
+            fnptr_peer_d2: args.w_fnptr_peer_d2.unwrap_or(d.fnptr_peer_d2),
+            fnptr_peer_d3: args.w_fnptr_peer_d3.unwrap_or(d.fnptr_peer_d3),
+            fnptr_peer_deep: args.w_fnptr_peer_deep.unwrap_or(d.fnptr_peer_deep),
+        }
+    }
+
+    /// Compute the weight for a given Feat under this config. Pure
+    /// function — no I/O, no globals.
+    fn weight_for(&self, feat: &Feat) -> u32 {
+        match feat {
+            Feat::Bigram(_) => self.bigram,
+            Feat::Import(_) => self.import,
+            Feat::StringLit(_) => self.string_lit,
+            Feat::Const(_) => self.const_,
+            Feat::BlockCountBucket(_) => self.block_count,
+            Feat::CallCountBucket(_) => self.call_count,
+            Feat::Nbr { depth, .. } => match depth {
+                1 => self.nbr_d1,
+                _ => self.nbr_deep,
             },
-            // Coarse shape — counts of vtable references group classes
-            // by "how widely is this method overridden". Mid-weight, same
-            // bucket as the block/call-count shape features.
-            Feat::FnPtrRefBucket(_) => 4,
-            // Certified peer identity through vtable adjacency. Same
-            // weight scheme as SyntCallee, indexed by |offset|: an
-            // immediate neighbor (Δ=±1) is the strongest signal, with
-            // geometric decay further out.
+            Feat::SyntCallee { depth, .. } => match depth {
+                1 => self.synt_d1,
+                2 => self.synt_d2,
+                3 => self.synt_d3,
+                _ => self.synt_deep,
+            },
+            Feat::FnPtrRefBucket(_) => self.fnptr_ref,
             Feat::FnPtrPeer { offset, .. } => match offset.unsigned_abs() {
-                1 => 16,
-                2 => 8,
-                3 => 4,
-                _ => 2,
+                1 => self.fnptr_peer_d1,
+                2 => self.fnptr_peer_d2,
+                3 => self.fnptr_peer_d3,
+                _ => self.fnptr_peer_deep,
             },
         }
+    }
+}
+
+/// `Feat` paired with its weight at emission time. The wrapper carries the
+/// weight value so `Feature::weight()` can return a per-instance value
+/// without a global lookup. `Hash` and `PartialEq` ignore the weight so
+/// dedup in `FxHashSet<WeightedFeat>` matches `FxHashSet<Feat>` semantics.
+#[derive(Clone, Copy)]
+struct WeightedFeat {
+    feat: Feat,
+    weight: u32,
+}
+
+impl WeightedFeat {
+    fn new(feat: Feat, weights: &WeightConfig) -> Self {
+        let weight = weights.weight_for(&feat);
+        WeightedFeat { feat, weight }
+    }
+}
+
+impl PartialEq for WeightedFeat {
+    fn eq(&self, other: &Self) -> bool {
+        self.feat == other.feat
+    }
+}
+impl Eq for WeightedFeat {}
+impl Hash for WeightedFeat {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.feat.hash(state);
+    }
+}
+impl Feature for WeightedFeat {
+    fn weight(&self) -> u32 {
+        self.weight
     }
 }
 
@@ -741,6 +940,19 @@ fn build_graph(
         counts.last().copied().unwrap_or(0)
     );
 
+    // Wrap each Feat in WeightedFeat at the grapnel boundary. Keeps the
+    // emission pipeline above (extract_features, bundling) in terms of
+    // plain Feat — weights apply only at MinHash signature time.
+    let bundled: Vec<(u64, Vec<WeightedFeat>)> = bundled
+        .into_iter()
+        .map(|(addr, feats)| {
+            let weighted: Vec<WeightedFeat> = feats
+                .into_iter()
+                .map(|f| WeightedFeat::new(f, &cfg.weights))
+                .collect();
+            (addr, weighted)
+        })
+        .collect();
     let mut g = Graph::default();
     g.add_nodes_par(bundled, hasher);
     for func in funcs {
@@ -841,6 +1053,9 @@ struct BinaryCtx<'a> {
     /// RO-data function-pointer site index. `None` when fn-ptr features
     /// are disabled via `--no-fn-ptr`.
     fn_ptrs: Option<&'a FnPtrIndex>,
+    /// Per-feature-category weights, used by inspector reports for
+    /// weighted-Jaccard math.
+    weights: &'a WeightConfig,
 }
 
 impl<'a> BinaryCtx<'a> {
@@ -850,6 +1065,7 @@ impl<'a> BinaryCtx<'a> {
         names: &'a HashMap<u64, Vec<String>>,
         synth: Option<&'a FxHashMap<u64, u64>>,
         fn_ptrs: Option<&'a FnPtrIndex>,
+        weights: &'a WeightConfig,
     ) -> Result<Self> {
         let funcs_by_ep = funcs.iter().map(|f| (f.entry_point, f)).collect();
         let iat = pe.iat()?;
@@ -860,6 +1076,7 @@ impl<'a> BinaryCtx<'a> {
             names,
             synth,
             fn_ptrs,
+            weights,
         })
     }
 
@@ -890,6 +1107,7 @@ impl<'a> BinaryCtx<'a> {
             names: self.names,
             synth: self.synth,
             fn_ptrs: self.fn_ptrs,
+            weights: self.weights,
         }
     }
 }
@@ -904,6 +1122,7 @@ struct Side<'a> {
     names: &'a HashMap<u64, Vec<String>>,
     synth: Option<&'a FxHashMap<u64, u64>>,
     fn_ptrs: Option<&'a FnPtrIndex>,
+    weights: &'a WeightConfig,
 }
 
 /// Categorize a feature for per-bucket reporting and bundle-filter lookups.
@@ -1126,9 +1345,13 @@ fn report_pair(
     // This is what determines whether the pair clears the anchor threshold.
     // Note: this is OWN-only (no bundling); the matcher runs with bundling.
     // If hops>0 in the run, the actual matcher view is even richer than this.
-    let w_a: u32 = a.feats.iter().map(|f| f.weight()).sum();
-    let w_b: u32 = b.feats.iter().map(|f| f.weight()).sum();
-    let w_inter: u32 = a.feats.intersection(b.feats).map(|f| f.weight()).sum();
+    let w_a: u32 = a.feats.iter().map(|f| a.weights.weight_for(f)).sum();
+    let w_b: u32 = b.feats.iter().map(|f| b.weights.weight_for(f)).sum();
+    let w_inter: u32 = a
+        .feats
+        .intersection(b.feats)
+        .map(|f| a.weights.weight_for(f))
+        .sum();
     let w_union = w_a + w_b - w_inter;
     let w_jac = if w_union > 0 {
         w_inter as f64 / w_union as f64
@@ -1637,11 +1860,11 @@ fn run_match(
     })
 }
 
-/// Weighted Jaccard between two feature sets. Each Feat carries its own
-/// weight; intersection and union are summed via Feat::weight.
-fn weighted_jaccard(a: &FxHashSet<Feat>, b: &FxHashSet<Feat>) -> f64 {
-    let inter_w: u32 = a.intersection(b).map(|f| f.weight()).sum();
-    let union_w: u32 = a.union(b).map(|f| f.weight()).sum();
+/// Weighted Jaccard between two feature sets, scored under the given
+/// `WeightConfig`. Used by the achievability-analysis path.
+fn weighted_jaccard(a: &FxHashSet<Feat>, b: &FxHashSet<Feat>, w: &WeightConfig) -> f64 {
+    let inter_w: u32 = a.intersection(b).map(|f| w.weight_for(f)).sum();
+    let union_w: u32 = a.union(b).map(|f| w.weight_for(f)).sum();
     if union_w == 0 {
         0.0
     } else {
@@ -1779,7 +2002,7 @@ fn measure_achievability(
             continue;
         };
 
-        let j = weighted_jaccard(fa, fb);
+        let j = weighted_jaccard(fa, fb, &feat_cfg.weights);
         let bucket = ((j * 10.0) as usize).min(9);
         total_pairs += 1;
         bucket_total[bucket] += 1;
@@ -2541,6 +2764,59 @@ fn main() -> Result<()> {
         tick(&format!("wrote matches cache to {}", path.display()));
     }
 
+    if let Some(path) = &args.generate_pdb {
+        // Refuse to clobber a real PDB — but allow overwriting one we generated
+        // ourselves (detected via the EnvBlock canary baked in by pdb_writer).
+        if path.exists() && !pdb_analyzer::should_replace(path).unwrap_or(false) {
+            anyhow::bail!(
+                "refusing to overwrite existing PDB at {} (not generated by binfold)",
+                path.display()
+            );
+        }
+
+        // Reuse names_a from the validation PDB context if available, otherwise
+        // load the base PDB just for symbol names.
+        let names_a_owned;
+        let names_a: &HashMap<u64, Vec<String>> = if let Some(ctx) = &pdb_ctx {
+            &ctx.names_a
+        } else {
+            names_a_owned = load_pdb_names(&args.base, &pe1)?;
+            &names_a_owned
+        };
+
+        let sizes_b: FxHashMap<u64, usize> =
+            funcs2.iter().map(|f| (f.entry_point, f.size)).collect();
+
+        let mut pdb_functions: Vec<pdb_writer::FunctionInfo> = Vec::new();
+        let mut missing_names = 0usize;
+        let mut missing_sizes = 0usize;
+        for &(base_addr, target_addr) in &result.sorted {
+            let Some(name) = names_a.get(&base_addr).and_then(|v| v.first()) else {
+                missing_names += 1;
+                continue;
+            };
+            let Some(&size) = sizes_b.get(&target_addr) else {
+                missing_sizes += 1;
+                continue;
+            };
+            pdb_functions.push(pdb_writer::FunctionInfo {
+                address: target_addr,
+                size: size as u32,
+                name: name.clone(),
+            });
+        }
+
+        let pdb_info = extract_pdb_info(&pe2)?;
+        pdb_writer::generate_pdb(&pe2, &pdb_info, &pdb_functions, path)?;
+        tick(&format!(
+            "wrote PDB to {} ({} named, {} matches lacked base names, {} matches lacked target sizes)",
+            path.display(),
+            pdb_functions.len(),
+            missing_names,
+            missing_sizes,
+        ));
+    }
+
     println!(
         "# matched {} / {} base functions",
         result.matched,
@@ -2586,8 +2862,22 @@ fn main() -> Result<()> {
             Some(&result.synth_b)
         };
         let feat_cfg = FeatureConfig::from_args(&args);
-        let ctx_a = BinaryCtx::new(&pe1, &funcs1, &pdb.names_a, synth_a_ref, fn_ptrs1)?;
-        let ctx_b = BinaryCtx::new(&pe2, &funcs2, &pdb.names_b, synth_b_ref, fn_ptrs2)?;
+        let ctx_a = BinaryCtx::new(
+            &pe1,
+            &funcs1,
+            &pdb.names_a,
+            synth_a_ref,
+            fn_ptrs1,
+            &feat_cfg.weights,
+        )?;
+        let ctx_b = BinaryCtx::new(
+            &pe2,
+            &funcs2,
+            &pdb.names_b,
+            synth_b_ref,
+            fn_ptrs2,
+            &feat_cfg.weights,
+        )?;
         if args.measure_achievability {
             measure_achievability(
                 &pe1,
@@ -2625,14 +2915,6 @@ fn main() -> Result<()> {
                 &feat_cfg,
             )?;
         }
-    }
-
-    println!("# {:>16} -> {:>16}", "base", "target");
-    for (a, b) in result.sorted.iter().take(args.limit) {
-        println!("{:#018x} -> {:#018x}", a, b);
-    }
-    if result.sorted.len() > args.limit {
-        println!("... ({} more)", result.sorted.len() - args.limit);
     }
 
     Ok(())
