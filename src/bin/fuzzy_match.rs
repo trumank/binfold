@@ -34,13 +34,21 @@ struct Args {
     #[arg(long)]
     generate_pdb: bool,
 
-    /// MinHash permutations. Higher = sharper similarity estimates but more
-    /// work per node. K=800 was the diminishing-returns point in tuning.
-    #[arg(long, default_value_t = 800)]
+    /// MinHash permutations. Sweep on 505S/505SC showed K=200 / bands=100
+    /// (rows=2) strict-Pareto-beats K=800 / bands=100 (rows=8): +0.23pp
+    /// precision, +0.63pp recall, 31% faster wall. The previous K=800 default
+    /// was wildly over-provisioned once singleton-fingerprint retrieval
+    /// replaced bucket-based LSH — rows=2 band fingerprints (16 bytes) are
+    /// already near-unique across ~300K nodes, and more bands beats wider
+    /// bands within the rows=2 regime. Drop K below ~100 and recall craters
+    /// (not enough lottery tickets).
+    #[arg(long, default_value_t = 200)]
     k: usize,
-    /// Number of LSH bands. Should track K to keep rows-per-band ≈ 8
-    /// (effective LSH threshold around 0.5–0.7). K=200→25, K=400→50,
-    /// K=800→100.
+    /// Number of LSH bands. Must divide K cleanly (K / bands = rows per band);
+    /// rows=0 is a silent correctness failure (every band hashes the empty
+    /// slice). Sweep on 505S/505SC showed rows=2 is the precision sweet spot;
+    /// rows≥4 admits noisier retrieval candidates. Default 100 with K=200
+    /// gives rows=2. K=400→200, K=300→150, K=100→50 for rows=2.
     #[arg(long, default_value_t = 100)]
     bands: usize,
     /// Minimum total feature weight for a node to enter the LSH index. With
