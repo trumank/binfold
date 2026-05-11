@@ -127,6 +127,15 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     min_band_collisions: usize,
 
+    /// LSH max-bucket-size cap. Buckets larger than this are skipped during
+    /// query — these only arise when many functions share a degenerate
+    /// signature (sparse features collapse most signature positions to the
+    /// MERSENNE_PRIME placeholder). A query against such a bucket produces a
+    /// candidate explosion with ~zero useful matches. Default 1024 fits
+    /// low-millions-of-nodes graphs; lift for larger corpora.
+    #[arg(long, default_value_t = 1024)]
+    max_bucket_size: usize,
+
     /// Multi-hop SyntCallee depth. **Default 2**: each pass BFS-walks up to
     /// 2 callee hops from each function and emits a depth-tagged synth
     /// feature for any reached callee whose pair was confirmed in a prior
@@ -1529,6 +1538,7 @@ fn run_match(
         size_mismatch_ratio: args.size_mismatch_ratio,
         pre_match_on_identifiers: false,
         min_band_collisions: args.min_band_collisions,
+        max_bucket_size: args.max_bucket_size,
         asymmetric_hub_gate: args.asymmetric_hub_gate,
     };
     let hasher = config.hasher(args.seed);
@@ -1589,6 +1599,11 @@ fn run_match(
         None
     };
 
+    // Stage 2 (per-node dirty tracking with a persistent Graph) was
+    // prototyped here and reverted — dirty fractions ran 60–88% on this
+    // fixture, so it didn't beat fresh `build_graph_from_cache` per pass
+    // and cost +5 GB peak RSS. See PERF.md "Per-node dirty tracking".
+
     let total_passes = args.iterations.max(1);
     for pass in 0..total_passes {
         // Derive per-pass synth maps from the canonical confirmed state.
@@ -1643,7 +1658,7 @@ fn run_match(
             );
         }
         let t_match = std::time::Instant::now();
-        let (new_matches, mstats) = config.run_traced(&g1, &g2);
+        let (new_matches, mstats) = config.run(&g1, &g2);
         let dt_match = t_match.elapsed();
         if !quiet {
             eprintln!(
@@ -1657,18 +1672,18 @@ fn run_match(
             eprintln!(
                 "  pass {} stats: lsh_cands={} above_anchor={} | p3 confirmed={} skip_a={} skip_b={} | p4 propose={} hub={} size={} below_thr={} skip_a={} skip_b={} confirmed={}",
                 pass + 1,
-                mstats.phase2_lsh_candidates,
-                mstats.phase2_above_anchor,
-                mstats.phase3_confirmed,
-                mstats.phase3_skip_a_taken,
-                mstats.phase3_skip_b_taken,
-                mstats.phase4_propose,
-                mstats.phase4_blocked_hub,
-                mstats.phase4_blocked_size,
-                mstats.phase4_below_threshold,
-                mstats.phase4_skip_a_taken,
-                mstats.phase4_skip_b_taken,
-                mstats.phase4_confirmed,
+                mstats.phase2.lsh_candidates,
+                mstats.phase2.above_anchor,
+                mstats.phase3.confirmed,
+                mstats.phase3.skip_a_taken,
+                mstats.phase3.skip_b_taken,
+                mstats.phase4.propose,
+                mstats.phase4.blocked_hub,
+                mstats.phase4.blocked_size,
+                mstats.phase4.below_threshold,
+                mstats.phase4.skip_a_taken,
+                mstats.phase4.skip_b_taken,
+                mstats.phase4.confirmed,
             );
         }
 
@@ -1680,7 +1695,9 @@ fn run_match(
         let mut new_count = 0usize;
         let mut revised_count = 0usize;
         let mut blocked_count = 0usize;
-        for (&a, &(b, sim)) in &new_matches {
+        for (&a, m) in &new_matches {
+            let b = m.target;
+            let sim = m.similarity;
             let old_a_pair = confirmed.get(&a).copied();
             let old_b_base = target_to_base.get(&b).copied();
             let old_b_pair = old_b_base.and_then(|oa| confirmed.get(&oa).copied());
@@ -1743,7 +1760,8 @@ fn run_match(
             // each individual pass found (with its current synth context).
             let mut pass_named = 0usize;
             let mut pass_tp = 0usize;
-            for (a, (b, _)) in &new_matches {
+            for (a, m) in &new_matches {
+                let b = &m.target;
                 if let (Some(sa), Some(sb)) = (sets_a.get(a), sets_b.get(b)) {
                     if sa.is_empty() || sb.is_empty() {
                         continue;
