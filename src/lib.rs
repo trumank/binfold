@@ -16,6 +16,7 @@ pub mod mmap_source;
 
 pub mod db;
 pub mod fn_ptr_index;
+pub mod grapnel;
 pub mod hash;
 pub mod pdb_analyzer;
 pub mod pdb_writer;
