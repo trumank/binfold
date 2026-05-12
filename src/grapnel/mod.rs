@@ -1,16 +1,5 @@
-//! Graph-propagation matcher for binary diffing.
-//!
-//! Previously a separate `grapnel` workspace crate; inlined into `binfold`
-//! because the algorithm diverged enough from generic LSH+MinHash matching
-//! (singleton-fingerprint retrieval, exact weighted Jaccard scoring, the
-//! Phase 4 propagation gates) that maintaining a library boundary stopped
-//! paying for itself. See `GRAPNEL.md` for the design history.
+//! Thin re-export of the external [`grapnel`] crate. Kept as a module so
+//! existing `binfold::grapnel::X` import paths in binaries (notably
+//! `bin/fuzzy_match.rs`) keep working without changes.
 
-mod graph;
-mod lsh;
-mod matching;
-mod min_hash;
-
-pub use graph::{Graph, Node};
-pub use matching::MatcherConfig;
-pub use min_hash::{Feature, UniversalMinHash};
+pub use ::grapnel::{Feature, Graph, Match, MatcherConfig, Node, UniversalMinHash};

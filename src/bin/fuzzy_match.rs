@@ -1522,6 +1522,7 @@ fn run_match(
         max_propagation_degree: args.max_degree,
         size_mismatch_ratio: args.size_mismatch_ratio,
         asymmetric_hub_gate: args.asymmetric_hub_gate,
+        pre_match_on_identifiers: false,
     };
     let hasher = config.hasher(args.seed);
     let feat_cfg = FeatureConfig::from_args(args);
@@ -1640,7 +1641,7 @@ fn run_match(
             );
         }
         let t_match = std::time::Instant::now();
-        let (new_matches, mstats) = config.run(&g1, &g2);
+        let new_matches = config.run(&g1, &g2);
         let dt_match = t_match.elapsed();
         if !quiet {
             eprintln!(
@@ -1650,22 +1651,6 @@ fn run_match(
                 dt_g2.as_secs_f64(),
                 dt_match.as_secs_f64(),
                 (dt_g1 + dt_g2 + dt_match).as_secs_f64(),
-            );
-            eprintln!(
-                "  pass {} stats: lsh_cands={} above_anchor={} | p3 confirmed={} skip_a={} skip_b={} | p4 propose={} hub={} size={} below_thr={} skip_a={} skip_b={} confirmed={}",
-                pass + 1,
-                mstats.phase2.lsh_candidates,
-                mstats.phase2.above_anchor,
-                mstats.phase3.confirmed,
-                mstats.phase3.skip_a_taken,
-                mstats.phase3.skip_b_taken,
-                mstats.phase4.propose,
-                mstats.phase4.blocked_hub,
-                mstats.phase4.blocked_size,
-                mstats.phase4.below_threshold,
-                mstats.phase4.skip_a_taken,
-                mstats.phase4.skip_b_taken,
-                mstats.phase4.confirmed,
             );
         }
 
