@@ -52,6 +52,16 @@ struct CommandAnalyze {
     /// Generate PDB file with matched function names
     #[arg(long, requires = "database")]
     generate_pdb: bool,
+
+    /// Write matched functions to a symbol file. Format picked by extension:
+    /// * `.sym`: Breakpad symbol file (Crashpad / minidump-stackwalk /
+    ///   Crashlytics pipelines).
+    /// * `.debug` / `.dwarf`: DWARF in an ELF debug companion file, importable
+    ///   by BN ("Open with Options > Debug File"), gdb/lldb, IDA, and Ghidra.
+    /// * `.pdb`: PDB (Windows / Binary Ninja). Same output as `--generate-pdb`,
+    ///   but written to this exact path.
+    #[arg(long, requires = "database")]
+    output: Option<PathBuf>,
 }
 
 /// Dump function and constraint information from a database as JSON
@@ -157,10 +167,9 @@ fn command_analyze(
         exe: file,
         database,
         generate_pdb,
+        output,
     }: CommandAnalyze,
 ) -> Result<()> {
-    use binfold::pdb_analyzer;
-
     let progress_reporter = IndicatifProgressBar::new("Analyzing", None);
 
     let analyzer = if database.is_empty() {
@@ -187,37 +196,96 @@ fn command_analyze(
         println!("Matched {} functions with database symbols", matched_count);
     }
 
-    if generate_pdb {
-        // Get PDB filename from embedded debug info, falling back to exe name with .pdb extension
-        let pdb_path = analyzer
-            .pe_loader()
-            .pdb_info()
-            .ok()
-            .and_then(|info| {
-                let name = info.pdb_path.rsplit(['\\', '/']).next().unwrap();
-                (!name.is_empty()).then(|| file.with_file_name(name))
+    if output.is_some() || generate_pdb {
+        use binfold::export::{ExportContext, MatchedFunction, OutputFormat, pdb};
+        use std::io::{BufWriter, Write};
+
+        // Index function sizes once so the entry build avoids a per-function
+        // HashMap rebuild.
+        let size_by_addr: std::collections::HashMap<u64, u64> = result
+            .functions
+            .iter()
+            .map(|f| (f.address, f.size))
+            .collect();
+
+        // Address-sorted: conventional for `.sym`, and stable line order in
+        // the Python script makes diffs across re-runs readable. Shared by
+        // both the `--output` writer and the `--generate-pdb` path.
+        let mut entries: Vec<MatchedFunction> = result
+            .database_matches
+            .iter()
+            .filter_map(|(addr, m)| {
+                let name = m.symbol_name.as_deref()?;
+                let size = size_by_addr.get(addr).copied()?;
+                Some(MatchedFunction {
+                    address: *addr,
+                    size,
+                    name,
+                })
             })
-            .unwrap_or_else(|| file.with_extension("pdb"));
+            .collect();
+        entries.sort_by_key(|m| m.address);
 
-        if !pdb_path.exists() || pdb_analyzer::should_replace(&pdb_path).unwrap_or(false) {
-            analyzer.generate_pdb(&result, &pdb_path)?;
+        let module_name = file
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<unknown>".into());
+        let ctx = ExportContext {
+            bin: analyzer.binary(),
+            module_name: &module_name,
+        };
 
-            let pdb_function_count = result
-                .database_matches
-                .values()
-                .filter(|m| m.symbol_name.is_some())
-                .count();
-
-            println!("Generating PDB file at: {}", pdb_path.display());
+        if let Some(out_path) = &output {
+            let ext = out_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            // Resolve the format before creating the file so an unrecognized
+            // extension doesn't leave a 0-byte file on disk.
+            let Some(format) = OutputFormat::from_extension(ext) else {
+                anyhow::bail!(
+                    "unknown output extension {:?}; expected {}",
+                    ext,
+                    OutputFormat::SUPPORTED
+                );
+            };
+            let writer = format.writer();
+            let mut w = BufWriter::new(std::fs::File::create(out_path)?);
+            writer.write(&ctx, &entries, &mut w)?;
+            w.flush()?;
             println!(
-                "PDB file generated successfully with {} functions",
-                pdb_function_count
+                "\nWrote {} matched functions to {} ({})",
+                entries.len(),
+                out_path.display(),
+                writer.label()
             );
-        } else {
-            eprintln!(
-                "Error: Refusing to overwrite existing PDB file at: {}",
-                pdb_path.display()
-            );
+        }
+
+        if generate_pdb {
+            // PDB filename from embedded debug info, falling back to the exe
+            // name with a .pdb extension.
+            let pdb_path = analyzer
+                .binary()
+                .pdb_info()
+                .ok()
+                .and_then(|info| {
+                    let name = info.pdb_path.rsplit(['\\', '/']).next().unwrap();
+                    (!name.is_empty()).then(|| file.with_file_name(name))
+                })
+                .unwrap_or_else(|| file.with_extension("pdb"));
+
+            if !pdb_path.exists() || pdb::should_replace(&pdb_path).unwrap_or(false) {
+                let mut w = BufWriter::new(std::fs::File::create(&pdb_path)?);
+                OutputFormat::Pdb.writer().write(&ctx, &entries, &mut w)?;
+                w.flush()?;
+                println!("Generating PDB file at: {}", pdb_path.display());
+                println!(
+                    "PDB file generated successfully with {} functions",
+                    entries.len()
+                );
+            } else {
+                eprintln!(
+                    "Error: Refusing to overwrite existing PDB file at: {}",
+                    pdb_path.display()
+                );
+            }
         }
     }
 

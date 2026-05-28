@@ -14,12 +14,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 mod mmap_source;
 
+pub mod arch;
+pub mod binary;
+pub mod build_pipeline;
 pub mod db;
+pub mod export;
 pub mod hash;
-pub mod pdb_analyzer;
-pub mod pdb_writer;
-pub mod pe_loader;
 pub mod progress;
+pub mod symbols;
 pub mod warp;
 
 // Re-export key types for convenience
@@ -29,17 +31,15 @@ pub use uuid::Uuid;
 // Re-export progress types
 pub use progress::{NoOpProgressReporter, ProgressReporter, default_progress_style};
 
+use crate::binary::{AnalysisCache, Binary, LoadError};
 use crate::db::{
     BinaryGuid, ConstraintGuid, Db, DbHash, FunctionGuid, Layer, StringRef, SymbolGuid,
 };
-use crate::pdb_analyzer::PdbAnalyzer;
-use crate::pdb_writer::{extract_pdb_info, generate_pdb};
-use crate::pe_loader::{AnalysisCache, PeLoader};
 use crate::warp::{Constraint, compute_function_guid_with_contraints};
 
 /// High-level analyzer for binary function analysis
 pub struct BinfoldAnalyzer {
-    pe: PeLoader,
+    bin: Binary,
     db_mmaps: Vec<memmap2::Mmap>,
 }
 
@@ -93,9 +93,9 @@ pub struct MatchInfo {
 impl BinfoldAnalyzer {
     /// Create analyzer for the given executable
     pub fn new<P: AsRef<Path>>(exe_path: P) -> Result<Self> {
-        let pe = PeLoader::load(exe_path.as_ref())?;
+        let bin = Binary::load(exe_path.as_ref())?;
         Ok(Self {
-            pe,
+            bin,
             db_mmaps: Vec::new(),
         })
     }
@@ -110,7 +110,7 @@ impl BinfoldAnalyzer {
         P2: AsRef<Path>,
         I: IntoIterator<Item = P2>,
     {
-        let pe = PeLoader::load(exe_path.as_ref())?;
+        let bin = Binary::load(exe_path.as_ref())?;
         let mut db_mmaps = Vec::new();
         for path in db_paths {
             let path = path.as_ref();
@@ -121,7 +121,7 @@ impl BinfoldAnalyzer {
             Db::new(&mmap).with_context(|| format!("loading database {}", path.display()))?;
             db_mmaps.push(mmap);
         }
-        Ok(Self { pe, db_mmaps })
+        Ok(Self { bin, db_mmaps })
     }
 
     /// Analyze all functions in the binary with progress reporting
@@ -129,10 +129,10 @@ impl BinfoldAnalyzer {
         &self,
         progress_reporter: &P,
     ) -> Result<AnalysisResult> {
-        let pe_warnings: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let bin_warnings: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let functions = self
-            .pe
-            .find_all_functions(&|msg| pe_warnings.lock().unwrap().push(msg.to_string()))?;
+            .bin
+            .find_all_functions(&|msg| bin_warnings.lock().unwrap().push(msg.to_string()))?;
         let cache = AnalysisCache::new(functions.iter().cloned());
 
         let analyzed: HashSet<u64> = functions.iter().map(|f| f.entry_point).collect();
@@ -150,7 +150,7 @@ impl BinfoldAnalyzer {
             .map(|addr| {
                 let result = (
                     addr,
-                    compute_function_guid_with_contraints::<DbHash>(&self.pe, &cache, addr),
+                    compute_function_guid_with_contraints::<DbHash>(&self.bin, &cache, addr),
                 );
                 guid_progress.progress();
                 result
@@ -175,18 +175,15 @@ impl BinfoldAnalyzer {
         analyzed_functions.sort_by_key(|f| f.address);
 
         // Add parent call constraints
-        let mut callers: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
-        let mut functions_by_addr: HashMap<u64, FunctionGuid> = HashMap::new();
-
-        for func in &analyzed_functions {
-            functions_by_addr.insert(func.address, func.guid);
-            for call in &cache.get(func.address, &self.pe).unwrap().calls {
-                callers
-                    .entry(call.target)
-                    .or_default()
-                    .push((func.address, (call.address - func.address)));
-            }
-        }
+        let callers = build_pipeline::build_caller_map(
+            analyzed_functions.iter().map(|f| f.address),
+            &cache,
+            &self.bin,
+        );
+        let functions_by_addr: HashMap<u64, FunctionGuid> = analyzed_functions
+            .iter()
+            .map(|f| (f.address, f.guid))
+            .collect();
 
         // Add parent constraints to functions
         for func in &mut analyzed_functions {
@@ -218,7 +215,7 @@ impl BinfoldAnalyzer {
         Ok(AnalysisResult {
             functions: analyzed_functions,
             database_matches,
-            warnings: pe_warnings.into_inner().unwrap(),
+            warnings: bin_warnings.into_inner().unwrap(),
         })
     }
 
@@ -227,37 +224,9 @@ impl BinfoldAnalyzer {
         self.analyze_with_progress(&NoOpProgressReporter)
     }
 
-    /// Generate PDB file with matched symbols
-    pub fn generate_pdb<P: AsRef<Path>>(
-        &self,
-        result: &AnalysisResult,
-        output_path: P,
-    ) -> Result<()> {
-        let pdb_info = extract_pdb_info(&self.pe)?;
-
-        let pdb_functions: Vec<_> = result
-            .functions
-            .iter()
-            .filter_map(|f| {
-                result
-                    .database_matches
-                    .get(&f.address)
-                    .and_then(|m| m.symbol_name.as_ref())
-                    .map(|name| pdb_writer::FunctionInfo {
-                        address: f.address,
-                        size: f.size as u32,
-                        name: name.clone(),
-                    })
-            })
-            .collect();
-
-        generate_pdb(&self.pe, &pdb_info, &pdb_functions, output_path.as_ref())?;
-        Ok(())
-    }
-
-    /// Get the PE loader for direct access
-    pub fn pe_loader(&self) -> &PeLoader {
-        &self.pe
+    /// Get the loaded binary for direct access
+    pub fn binary(&self) -> &Binary {
+        &self.bin
     }
 
     // Private helper extracted from existing main.rs logic
@@ -295,19 +264,14 @@ impl BinfoldAnalyzer {
             .collect();
         load_progress.finish();
 
-        // Build callers map
-        let mut callers: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
-        let mut functions_by_addr: HashMap<u64, FunctionGuid> = HashMap::new();
-
-        for func in analyzed_functions {
-            functions_by_addr.insert(func.address, func.guid);
-            for call in &cache.get(func.address, &self.pe).unwrap().calls {
-                callers
-                    .entry(call.target)
-                    .or_default()
-                    .push((func.address, (call.address - func.address)));
-            }
-        }
+        // Reverse call graph for symbol-parent constraints (the matching loop
+        // keys parent edges by currently-matched names, so we only need the
+        // caller map here, not the addr->guid table).
+        let callers = build_pipeline::build_caller_map(
+            analyzed_functions.iter().map(|f| f.address),
+            cache,
+            &self.bin,
+        );
 
         let mut matched_functions: HashMap<u64, MatchInfo> = HashMap::new();
         let mut unmatched_functions: HashMap<u64, &AnalyzedFunction> =
@@ -325,7 +289,7 @@ impl BinfoldAnalyzer {
                 let mut constraints = func.constraints.clone();
 
                 // Check if any of our calls have been matched - add symbol constraints
-                for call in &cache.get(func.address, &self.pe).unwrap().calls {
+                for call in &cache.get(func.address, &self.bin).unwrap().calls {
                     if let Some(unique_name) = matched_functions
                         .get(&call.target)
                         .and_then(|m| m.symbol_name.as_deref())
@@ -483,15 +447,8 @@ impl DatabaseBuilder {
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            let path = entry.path();
-            if entry.file_type().is_file()
-                && let Some(ext) = path.extension()
-                && ext.eq_ignore_ascii_case("exe")
-            {
-                let pdb_path = path.with_extension("pdb");
-                if pdb_path.exists() {
-                    self.exe_paths.push(path.to_path_buf());
-                }
+            if entry.file_type().is_file() {
+                self.exe_paths.push(entry.path().to_path_buf());
             }
         }
         self
@@ -593,36 +550,60 @@ impl DatabaseBuilder {
         let worker_errors_ref = &worker_errors;
 
         let process = |exe_path: &PathBuf| {
-            let pdb_path_for_exe = exe_path.with_extension("pdb");
-
             let result = (|| -> Result<Option<BinaryGuid>> {
-                // Hash from the same mmap PdbAnalyzer will use - both the hash
-                // and PE parse share one disk read.
-                let pe = PeLoader::load(exe_path)?;
-                let guid = BinaryGuid::from_bytes(pe.raw_bytes());
+                let bin = match Binary::load(exe_path) {
+                    Ok(bin) => bin,
+                    // Not a binary at all: expected while sweeping a directory
+                    // tree full of non-binary assets, so ignore silently.
+                    Err(LoadError::NotObject) => return Ok(None),
+                    // A real binary we can't use (unsupported arch, malformed,
+                    // I/O): report it like any other processing error.
+                    Err(e) => return Err(e.into()),
+                };
+                let guid = BinaryGuid::from_bytes(bin.raw_bytes());
                 if known_binaries_ref.contains(&guid) {
                     return Ok(None);
                 }
-                let mut analyzer = PdbAnalyzer::from_pe_loader(pe, &pdb_path_for_exe)?;
                 let exe_name = exe_path
                     .file_name()
                     .map(|n| n.to_string_lossy())
                     .unwrap_or_else(|| "<unknown>".into());
                 let sub_progress = op_ref.sub_progress(format!("Processing {}", exe_name).into());
 
-                // Stream each FunctionInfo straight into the merge - never
-                // materializes a full Vec, so producer peak is just the
-                // analyzer's working HashMap.
-                analyzer.process_function_guids_with_progress(
+                // Stream each FunctionInfo straight into the merge: never
+                // materializes a full Vec, so producer peak is the
+                // analyzer's working HashMap plus the per-binary mmap.
+                let emit = |f: build_pipeline::FunctionInfo| {
+                    let name_id = intern_string(f.name);
+                    merge_func(
+                        f.guid,
+                        name_id,
+                        &mut f.constraints.into_iter().map(|c| c.guid),
+                    );
+                };
+
+                // Resolve a symbol source by availability (PDB companion on
+                // PE, the image's own tables on ELF) and harvest names. All
+                // per-format dispatch lives in `symbols::resolve_symbol_source`;
+                // the GUID/constraint pipeline below is format-neutral.
+                let source = symbols::resolve_symbol_source(&bin, exe_path)?;
+                let source_label = source.label().to_string();
+                let names: HashMap<u64, String> = source
+                    .function_symbols(&bin)?
+                    .into_iter()
+                    .map(|s| (s.address, s.name))
+                    .collect();
+                if names.is_empty() {
+                    anyhow::bail!(
+                        "{}: no function symbols ({source_label})",
+                        exe_path.display()
+                    );
+                }
+                build_pipeline::process_named_functions_streaming(
+                    &bin,
+                    &names,
                     Some(sub_progress),
-                    |f: pdb_analyzer::FunctionInfo| {
-                        let name_id = intern_string(f.name);
-                        merge_func(
-                            f.guid,
-                            name_id,
-                            &mut f.constraints.into_iter().map(|c| c.guid),
-                        );
-                    },
+                    emit,
                 )?;
                 Ok(Some(guid))
             })();

@@ -1,7 +1,7 @@
-use crate::pe_loader::{AnalysisCache, FunctionAnalysis, PeLoader};
+use crate::arch::BlockMasker;
+use crate::binary::{AnalysisCache, Arch, Binary, FunctionAnalysis};
 use anyhow::Result;
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
-use std::ops::Range;
+use iced_x86::{Decoder, DecoderOptions};
 use tracing::{debug, trace};
 
 pub use crate::hash::{
@@ -36,43 +36,50 @@ pub struct Constraint<H: HashAlgo> {
 }
 
 pub fn compute_function_guid<H: HashAlgo>(
-    pe: &PeLoader,
+    bin: &Binary,
     cache: &AnalysisCache,
     address: u64,
 ) -> Result<FunctionGuid<H>> {
-    let func = cache.get(address, pe)?;
+    let func = cache.get(address, bin)?;
     debug!(size = format!("0x{:x}", func.size), "Function size");
 
-    compute_warp_uuid::<H>(&func, pe)
+    compute_warp_uuid::<H>(&func, bin)
 }
 
 pub fn compute_function_guid_with_contraints<H: HashAlgo>(
-    pe: &PeLoader,
+    bin: &Binary,
     cache: &AnalysisCache,
     address: u64,
 ) -> Result<Function<H>> {
-    let func = cache.get(address, pe)?;
+    let func = cache.get(address, bin)?;
     debug!(size = format!("0x{:x}", func.size), "Function size");
 
-    let guid = compute_warp_uuid::<H>(&func, pe)?;
+    let guid = compute_warp_uuid::<H>(&func, bin)?;
 
     // Generate constraints from calls
+    // A direct call whose target lies outside any loaded segment (an import
+    // thunk, a runtime-resolved stub, or a load-time trampoline table, common
+    // in stripped/obfuscated Android `.so`s) cannot yield a child-call
+    // constraint. Skip it rather than aborting the whole function: dropping the
+    // single constraint is deterministic across DB-build and analysis, so
+    // matching stays consistent.
     let mut constraints: Vec<Constraint<H>> = func
         .calls
         .iter()
-        .map(|c| {
-            compute_function_guid::<H>(pe, cache, c.target).map(|guid| Constraint {
+        .filter_map(|c| {
+            let guid = compute_function_guid::<H>(bin, cache, c.target).ok()?;
+            Some(Constraint {
                 guid: ConstraintGuid::<H>::from_child_call(guid),
                 offset: Some((c.address - func.entry_point) as i64),
             })
         })
-        .collect::<Result<_>>()?;
+        .collect();
 
     // Add data reference constraints
     for data_ref in &func.data_refs {
         if data_ref.is_readonly && data_ref.estimated_size.is_none() {
             // For read-only data with no specific size (strings), try to read and hash the content
-            if let Some(data) = read_string_data(pe, data_ref.target) {
+            if let Some(data) = read_string_data(bin, data_ref.target) {
                 constraints.push(Constraint {
                     guid: ConstraintGuid::<H>::from_data_const(&data),
                     offset: Some((data_ref.address - func.entry_point) as i64),
@@ -91,24 +98,29 @@ pub fn compute_function_guid_with_contraints<H: HashAlgo>(
 
 pub fn compute_warp_uuid<H: HashAlgo>(
     func: &FunctionAnalysis,
-    pe: &PeLoader,
+    bin: &Binary,
 ) -> Result<FunctionGuid<H>> {
     debug!(blocks = func.basic_blocks.len(), "Identified basic blocks");
 
-    let raw_bytes = pe.read_at_va(func.entry_point, func.size)?;
+    let raw_bytes = bin.read_at_va(func.entry_point, func.size)?;
     let base = func.entry_point;
 
     // Create UUID for each basic block
     let mut block_uuids = Vec::new();
+    // One masker per function, iterating blocks in address order. Arm64's
+    // masker threads ADRP register-taint across blocks so a page set up in the
+    // prologue and consumed in a later block still gets its lo12 immediate
+    // masked; the x86 masker is stateless.
+    let mut masker: Box<dyn BlockMasker> = if matches!(bin.arch()?, Arch::Aarch64) {
+        Box::new(crate::arch::arm64::Arm64Masker::default())
+    } else {
+        Box::new(crate::arch::x86::X86Masker::new(bin.bitness()))
+    };
     for (&start_addr, &end_addr) in func.basic_blocks.iter() {
         // println!("{:x?}", (start_addr - base, end_addr - base, base));
         let block_bytes = &raw_bytes[(start_addr - base) as usize..(end_addr - base) as usize];
-        let uuid = create_basic_block_guid::<H>(
-            block_bytes,
-            start_addr,
-            base..(base + raw_bytes.len() as u64),
-            pe,
-        );
+        let bytes = masker.mask(block_bytes, start_addr, base..base + raw_bytes.len() as u64);
+        let uuid = BasicBlockGuid::<H>::from_bytes(&bytes);
         block_uuids.push((start_addr, uuid));
 
         debug!(
@@ -119,8 +131,12 @@ pub fn compute_warp_uuid<H: HashAlgo>(
         );
     }
 
-    // Print disassembly for each basic block if requested
-    if tracing::enabled!(target: "binfold::warp::blocks", tracing::Level::DEBUG) {
+    // Print disassembly for each basic block if requested. The pretty-print
+    // loop below decodes with iced-x86; skip on arm64 since iced would
+    // disassemble A64 bytes as garbage x86.
+    if tracing::enabled!(target: "binfold::warp::blocks", tracing::Level::DEBUG)
+        && !matches!(bin.arch().unwrap_or(Arch::X86_64), Arch::Aarch64)
+    {
         for (&start_addr, &end_addr) in &func.basic_blocks {
             debug!(
                 start = format!("0x{start_addr:x}"),
@@ -134,7 +150,7 @@ pub fn compute_warp_uuid<H: HashAlgo>(
             let block_bytes = &raw_bytes[block_start_offset..block_end_offset];
 
             let mut decoder =
-                Decoder::with_ip(pe.bitness(), block_bytes, start_addr, DecoderOptions::NONE);
+                Decoder::with_ip(bin.bitness(), block_bytes, start_addr, DecoderOptions::NONE);
             let mut output = String::new();
 
             while decoder.can_decode() {
@@ -170,179 +186,13 @@ pub fn compute_warp_uuid<H: HashAlgo>(
     Ok(function_uuid)
 }
 
-fn get_branch_target(instruction: &Instruction) -> Option<u64> {
-    match instruction.op_kind(0) {
-        OpKind::NearBranch16 => Some(instruction.near_branch16() as u64),
-        OpKind::NearBranch32 => Some(instruction.near_branch32() as u64),
-        OpKind::NearBranch64 => Some(instruction.near_branch64()),
-        _ => None,
-    }
-}
-
-fn create_basic_block_guid<H: HashAlgo>(
-    raw_bytes: &[u8],
-    base: u64,
-    function_bounds: Range<u64>,
-    pe: &PeLoader,
-) -> BasicBlockGuid<H> {
-    let mut bytes = Vec::new();
-
-    let mut decoder = Decoder::new(pe.bitness(), raw_bytes, DecoderOptions::NONE);
-    decoder.set_ip(base);
-
-    debug!(
-        target: "binfold::warp::guid",
-        "Starting instruction processing for GUID"
-    );
-
-    while decoder.can_decode() {
-        let start = (decoder.ip() - base) as usize;
-        let instruction = decoder.decode();
-        let end = (decoder.ip() - base) as usize;
-        let instr_bytes = &raw_bytes[start..end];
-
-        // Skip instructions that set a register to itself (if they're effectively NOPs)
-        if is_register_to_itself_nop(&instruction) {
-            trace!(
-                target: "binfold::warp::guid",
-                addr = format!("0x{:x}", instruction.ip()),
-                instruction = %instruction,
-                "Skipping register-to-itself NOP"
-            );
-            continue;
-        }
-
-        // Get instruction bytes, zeroing out relocatable instructions
-        if is_relocatable_instruction(&instruction, function_bounds.clone()) {
-            // Zero out relocatable instructions
-            bytes.extend(vec![0u8; instr_bytes.len()]);
-            trace!(
-                target: "binfold::warp::guid",
-                addr = format!("0x{:x}", instruction.ip()),
-                instruction = %instruction,
-                bytes = format!("{:02x?}", instr_bytes),
-                "Zeroing relocatable instruction"
-            );
-        } else {
-            // Use actual instruction bytes
-            bytes.extend_from_slice(instr_bytes);
-            trace!(
-                target: "binfold::warp::guid",
-                addr = format!("0x{:x}", instruction.ip()),
-                instruction = %instruction,
-                bytes = format!("{:02x?}", instr_bytes),
-                "Keeping instruction bytes"
-            );
-        }
-    }
-
-    BasicBlockGuid::from_bytes(&bytes)
-}
-
-fn is_register_to_itself_nop(instruction: &Instruction) -> bool {
-    if instruction.mnemonic() != Mnemonic::Mov {
-        return false;
-    }
-
-    if instruction.op_count() != 2 {
-        return false;
-    }
-
-    // Check if both operands are the same register
-    if let (OpKind::Register, OpKind::Register) = (instruction.op_kind(0), instruction.op_kind(1)) {
-        let reg0 = instruction.op_register(0);
-        let reg1 = instruction.op_register(1);
-
-        // For x86_64, mov edi, edi is NOT removed (implicit extension)
-        // For x86, it would be removed
-        if reg0 == reg1 && !has_implicit_extension(reg0) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn has_implicit_extension(reg: Register) -> bool {
-    // In x86_64, 32-bit register operations zero-extend to 64 bits
-    matches!(
-        reg,
-        Register::EAX
-            | Register::EBX
-            | Register::ECX
-            | Register::EDX
-            | Register::EDI
-            | Register::ESI
-            | Register::EBP
-            | Register::ESP
-            | Register::R8D
-            | Register::R9D
-            | Register::R10D
-            | Register::R11D
-            | Register::R12D
-            | Register::R13D
-            | Register::R14D
-            | Register::R15D
-    )
-}
-
-fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<u64>) -> bool {
-    // Check for direct calls - but only forward calls are relocatable
-    if instruction.mnemonic() == Mnemonic::Call && instruction.op_count() > 0 {
-        match instruction.op_kind(0) {
-            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-                // All direct calls are relocatable
-                return true;
-            }
-            _ => {}
-        }
-    }
-
-    // Check for tail call jumps (unconditional jumps that likely go to other functions)
-    if instruction.mnemonic() == Mnemonic::Jmp && instruction.op_count() > 0 {
-        match instruction.op_kind(0) {
-            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-                // Check if jump target is outside function bounds
-                if let Some(target) = get_branch_target(instruction)
-                    && !function_bounds.contains(&target)
-                {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Check other RIP-relative memory operands (for non-MOV/LEA instructions)
-    for i in 0..instruction.op_count() {
-        if instruction.op_kind(i) == OpKind::Memory {
-            // Check if it's RIP-relative (no base register, or RIP as base)
-            if instruction.memory_base() == Register::RIP {
-                return true;
-            }
-
-            // Also check for displacement-only addressing (no base, no index)
-            // BUT exclude segment-relative addressing (GS, FS, etc)
-            if instruction.memory_base() == Register::None
-                && instruction.memory_index() == Register::None
-                && instruction.memory_displacement64() != 0
-                && instruction.segment_prefix() == Register::None
-            {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 /// Try to read string data from the given address
 /// Returns the string bytes if it looks like a valid UTF-8 or UTF-16 string
-pub fn read_string_data(pe: &PeLoader, address: u64) -> Option<Vec<u8>> {
+pub fn read_string_data(bin: &Binary, address: u64) -> Option<Vec<u8>> {
     const MAX_STRING_LEN: usize = 4096;
 
     // Read first two bytes to determine string type
-    let initial_bytes = pe.read_at_va(address, 2).ok()?;
+    let initial_bytes = bin.read_at_va(address, 2).ok()?;
 
     // Simple heuristic: if second byte is 0, assume UTF-16 LE
     if initial_bytes[1] == 0 {
@@ -351,7 +201,7 @@ pub fn read_string_data(pe: &PeLoader, address: u64) -> Option<Vec<u8>> {
         let mut offset = 0;
 
         while offset < MAX_STRING_LEN {
-            match pe.read_at_va(address + offset as u64, 2) {
+            match bin.read_at_va(address + offset as u64, 2) {
                 Ok(bytes) => {
                     if bytes[0] == 0 && bytes[1] == 0 {
                         break;
@@ -381,7 +231,7 @@ pub fn read_string_data(pe: &PeLoader, address: u64) -> Option<Vec<u8>> {
         let mut offset = 0;
 
         while offset < MAX_STRING_LEN {
-            match pe.read_at_va(address + offset as u64, 1) {
+            match bin.read_at_va(address + offset as u64, 1) {
                 Ok(bytes) => {
                     if bytes[0] == 0 {
                         break;

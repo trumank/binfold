@@ -9,7 +9,7 @@ debug = true
 [dependencies]
 iced-x86 = "1.21"
 uuid = { version = "1.10", features = ["v5"] }
-object = { version = "0.36", features = ["read", "pe"] }
+object = { version = "0.36", features = ["read", "pe", "elf", "write_std"] }
 memmap2 = "0.9"
 byteorder = "1.5"
 clap = { version = "4.5", features = ["derive"] }
@@ -26,3 +26,5 @@ dashmap = "6.1"
 twox-hash = "2"
 rustc-hash = "2"
 walkdir = "2"
+disarm64 = "0.1.26"
+gimli = { version = "0.33.0", default-features = false, features = ["read", "write"] }

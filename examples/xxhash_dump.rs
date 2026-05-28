@@ -5,8 +5,8 @@
 use std::fmt;
 
 use anyhow::Result;
+use binfold::binary::{AnalysisCache, Binary};
 use binfold::hash::HashAlgo;
-use binfold::pe_loader::{AnalysisCache, PeLoader};
 use binfold::warp::{FunctionGuid, compute_function_guid};
 use rayon::prelude::*;
 
@@ -43,7 +43,7 @@ fn main() -> Result<()> {
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("usage: xxhash_dump <exe>"))?;
 
-    let pe = PeLoader::load(&path)?;
+    let pe = Binary::load(&path)?;
     let functions = pe.find_all_functions(&|msg| eprintln!("{msg}"))?;
     let cache = AnalysisCache::new(functions.iter().cloned());
 
