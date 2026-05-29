@@ -15,18 +15,37 @@ use tracing::{debug, trace};
 
 use super::BlockMasker;
 use crate::arch::{
-    BlockBound, DataReference, FunctionAnalysis, FunctionCall, InstructionSet, MemoryView,
+    BlockBound, DataReference, FunctionAnalysis, FunctionCall, InstructionSet, JumpTable,
+    MemoryView,
 };
 
 /// WARP byte masker for x86 / x86-64. `bitness` is what the iced-x86 decoder
 /// consumes (32 or 64).
 pub struct X86Masker {
     bitness: u32,
+    /// Section VA ranges, `Some` only for PE32. 32-bit x86 embeds *absolute*
+    /// (relocated) addresses as immediates and displacements rather than the
+    /// RIP-relative form the 64-bit path already masks; this drives the extra
+    /// masking. `None` for x86-64 and ELF-i386, where behaviour is unchanged.
+    pe32_sections: Option<std::sync::Arc<[Range<u64>]>>,
 }
 
 impl X86Masker {
     pub fn new(bitness: u32) -> Self {
-        Self { bitness }
+        Self {
+            bitness,
+            pe32_sections: None,
+        }
+    }
+
+    /// Masker for a PE32 image. `sections` are the image's section VA ranges
+    /// (see [`crate::binary::Binary::section_ranges`]); they let the masker
+    /// distinguish a relocated absolute address from a plain constant.
+    pub fn new_pe32(sections: std::sync::Arc<[Range<u64>]>) -> Self {
+        Self {
+            bitness: 32,
+            pe32_sections: Some(sections),
+        }
     }
 }
 
@@ -64,7 +83,11 @@ impl BlockMasker for X86Masker {
             }
 
             // Get instruction bytes, zeroing out relocatable instructions
-            if is_relocatable_instruction(&instruction, function_bounds.clone()) {
+            if is_relocatable_instruction(
+                &instruction,
+                function_bounds.clone(),
+                self.pe32_sections.as_deref(),
+            ) {
                 // Zero out relocatable instructions
                 bytes.extend(vec![0u8; instr_bytes.len()]);
                 trace!(
@@ -147,7 +170,16 @@ fn has_implicit_extension(reg: Register) -> bool {
     )
 }
 
-fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<u64>) -> bool {
+/// Decide whether an instruction's bytes must be zeroed for the WARP GUID.
+///
+/// `pe32_sections` is `Some` only for PE32 images; when present, the extra
+/// PE32-specific checks below run. For x86-64 and ELF-i386 it is `None` and
+/// this function behaves exactly as before (the emitted bytes are identical).
+fn is_relocatable_instruction(
+    instruction: &Instruction,
+    function_bounds: Range<u64>,
+    pe32_sections: Option<&[Range<u64>]>,
+) -> bool {
     // Check for direct calls - but only forward calls are relocatable
     if instruction.mnemonic() == Mnemonic::Call && instruction.op_count() > 0 {
         match instruction.op_kind(0) {
@@ -194,7 +226,38 @@ fn is_relocatable_instruction(instruction: &Instruction, function_bounds: Range<
         }
     }
 
+    // PE32-only: 32-bit x86 references absolute addresses the loader relocates,
+    // either as 32-bit immediates (`push offset X`, `mov reg, imm32`) or as
+    // displacements inside indexed memory operands (`mov eax, [esi*4 + table]`)
+    // that the displacement-only check above doesn't catch. Zero any operand
+    // whose value lands inside a mapped section so the GUID stays stable across
+    // relocations. Gated on `Some` so x86-64 / ELF-i386 are unaffected.
+    if let Some(sections) = pe32_sections {
+        for i in 0..instruction.op_count() {
+            match instruction.op_kind(i) {
+                OpKind::Immediate32 => {
+                    if in_section(sections, instruction.immediate32() as u64) {
+                        return true;
+                    }
+                }
+                OpKind::Memory => {
+                    if instruction.segment_prefix() == Register::None
+                        && in_section(sections, instruction.memory_displacement64())
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     false
+}
+
+/// True if `va` falls within any of the image's section VA ranges.
+fn in_section(sections: &[Range<u64>], va: u64) -> bool {
+    sections.iter().any(|r| r.contains(&va))
 }
 
 /// x86 / x86-64 recursive-descent function analyzer backend.
@@ -390,20 +453,40 @@ impl InstructionSet for X86Isa {
                         break;
                     }
                     FlowControl::IndirectBranch => {
-                        // Indirect jump (like jmp rax or jmp [rax])
-                        // We can't determine the target statically, but we should
-                        // at least handle known patterns
-                        trace!(
-                            target: "binfold::arch::size",
-                            address = format!("0x{ip:x}"),
-                            "Found indirect branch"
-                        );
+                        // Indirect jump (like jmp rax or jmp [rax]). For PE32 we
+                        // try to recognise the MSVC `jmp [idx*4 + table]` switch
+                        // pattern, read the absolute table, and follow its
+                        // targets so the switch arms become part of the function.
+                        // Other arches / x86-64 keep the conservative behaviour
+                        // (treat the indirect jump as an unfollowable block end).
+                        if mem.is_pe()
+                            && mem.bitness() == 32
+                            && let Some((table, targets)) = detect_jump_table(&instruction, mem)
+                        {
+                            trace!(
+                                target: "binfold::arch::size",
+                                address = format!("0x{ip:x}"),
+                                targets = targets.len(),
+                                "Found PE32 jump table"
+                            );
+                            for target in targets {
+                                if target >= va && target < va + scan_size as u64 {
+                                    queue.push_back((target, Some(ip)));
+                                    block_intervals.insert(BlockBound::Start(target));
+                                }
+                            }
+                            analysis.jump_tables.push(table);
+                        } else {
+                            trace!(
+                                target: "binfold::arch::size",
+                                address = format!("0x{ip:x}"),
+                                "Found indirect branch"
+                            );
+                        }
                         // The next instruction (if any) starts a new block
                         if next_ip < va + scan_size as u64 {
                             block_intervals.insert(BlockBound::End(next_ip));
                         }
-                        // For now, we can't follow indirect jumps
-                        // This is a limitation that might cause us to miss code
                         break;
                     }
                     _ => {
@@ -503,4 +586,87 @@ fn estimate_data_size_from_instruction(instruction: &Instruction) -> Option<u32>
     }
 
     None
+}
+
+/// Recognise the MSVC PE32 switch dispatch `jmp [index*4 + table_base]`, read
+/// the absolute jump table at `table_base`, and return its extent plus the
+/// target addresses. Returns `None` when the instruction isn't this pattern or
+/// the table doesn't validate. PE32-only; callers gate on bitness/format.
+fn detect_jump_table(
+    instruction: &Instruction,
+    mem: &dyn MemoryView,
+) -> Option<(JumpTable, Vec<u64>)> {
+    if instruction.mnemonic() != Mnemonic::Jmp || instruction.op_count() == 0 {
+        return None;
+    }
+    if instruction.op_kind(0) != OpKind::Memory {
+        return None;
+    }
+
+    // Pattern: jmp [reg*4 + table_address] with an absolute 32-bit displacement.
+    if instruction.memory_base() != Register::None
+        || instruction.memory_index() == Register::None
+        || instruction.memory_index_scale() != 4
+        || instruction.memory_displacement64() == 0
+    {
+        return None;
+    }
+
+    let table_address = instruction.memory_displacement64();
+    let targets = parse_jump_table(mem, table_address);
+    if targets.is_empty() {
+        return None;
+    }
+
+    let table = JumpTable {
+        start: table_address,
+        end: table_address + 4 * targets.len() as u64,
+    };
+    trace!(
+        target: "binfold::arch::size",
+        instruction = format!("0x{:x}", instruction.ip()),
+        table = format!("0x{table_address:x}"),
+        targets = targets.len(),
+        "Parsed PE32 jump table"
+    );
+    Some((table, targets))
+}
+
+/// Read consecutive 4-byte absolute entries at `table_address`, stopping at the
+/// first entry that isn't a plausible code pointer (zero, out of section, or
+/// not a decodable instruction).
+fn parse_jump_table(mem: &dyn MemoryView, table_address: u64) -> Vec<u64> {
+    let mut targets = Vec::new();
+    if !mem.is_address_in_section(table_address) {
+        return targets;
+    }
+
+    for i in 0u64.. {
+        let entry_address = table_address + i * 4;
+        let target = match mem.read_at_va(entry_address, 4) {
+            Ok(bytes) => u32::from_le_bytes(bytes.try_into().unwrap()) as u64,
+            Err(_) => break,
+        };
+
+        // End of table: null or non-section entry.
+        if target == 0 || !mem.is_address_in_section(target) {
+            break;
+        }
+
+        // Sanity-check that the target decodes as an instruction; a run of data
+        // that happens to look like an in-section pointer ends the table here.
+        match mem.read_at_va(target, 16) {
+            Ok(bytes) => {
+                let mut decoder =
+                    Decoder::with_ip(mem.bitness(), bytes, target, DecoderOptions::NONE);
+                if decoder.decode().mnemonic() == Mnemonic::INVALID {
+                    break;
+                }
+                targets.push(target);
+            }
+            Err(_) => break,
+        }
+    }
+
+    targets
 }

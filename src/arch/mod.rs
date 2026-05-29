@@ -77,6 +77,18 @@ pub struct FunctionCall {
     pub target: u64,
 }
 
+/// A jump table located during analysis: a contiguous run of code-address
+/// entries that an indirect `jmp` dispatches through. Recorded so the linear
+/// sweep can carve the table *data* out of the code interval map. Only the
+/// PE32 x86 backend populates these today; the field is empty everywhere else.
+#[derive(Debug, Clone)]
+pub struct JumpTable {
+    /// start address of the jump table
+    pub start: u64,
+    /// end address of the jump table (exclusive)
+    pub end: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct DataReference {
     /// instruction address
@@ -98,6 +110,9 @@ pub struct FunctionAnalysis {
     pub entry_point: u64,
     pub calls: Vec<FunctionCall>,
     pub data_refs: Vec<DataReference>,
+    /// Jump tables discovered while walking the function. Populated only by the
+    /// PE32 backend (see [`JumpTable`]); empty for x86-64, ELF-i386, and arm64.
+    pub jump_tables: Vec<JumpTable>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -163,6 +178,21 @@ pub trait MemoryView {
     /// tail-call over-scans into a neighbour. Defaults to `false` for
     /// loaders without function-boundary metadata.
     fn is_known_function_start(&self, _va: u64) -> bool {
+        false
+    }
+
+    /// True if `va` falls within any mapped section/segment of the image.
+    /// The PE32 backend uses this to decide whether an immediate or memory
+    /// displacement is a relocated section address (mask it) versus a plain
+    /// constant, and to validate jump-table entries. Defaults to `false` for
+    /// backends that don't need it.
+    fn is_address_in_section(&self, _va: u64) -> bool {
+        false
+    }
+
+    /// True for PE images. Gates PE32-only analysis (absolute-address masking,
+    /// jump-table recovery) so x86-64, ELF-i386, and arm64 paths are untouched.
+    fn is_pe(&self) -> bool {
         false
     }
 }

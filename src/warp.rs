@@ -111,10 +111,14 @@ pub fn compute_warp_uuid<H: HashAlgo>(
     // masker threads ADRP register-taint across blocks so a page set up in the
     // prologue and consumed in a later block still gets its lo12 immediate
     // masked; the x86 masker is stateless.
-    let mut masker: Box<dyn BlockMasker> = if matches!(bin.arch()?, Arch::Aarch64) {
-        Box::new(crate::arch::arm64::Arm64Masker::default())
-    } else {
-        Box::new(crate::arch::x86::X86Masker::new(bin.bitness()))
+    let mut masker: Box<dyn BlockMasker> = match bin.arch()? {
+        Arch::Aarch64 => Box::new(crate::arch::arm64::Arm64Masker::default()),
+        // PE32 needs absolute-address masking driven by the section table;
+        // x86-64 and ELF-i386 use the stateless masker (behaviour unchanged).
+        Arch::X86 if bin.is_pe() => {
+            Box::new(crate::arch::x86::X86Masker::new_pe32(bin.section_ranges()))
+        }
+        _ => Box::new(crate::arch::x86::X86Masker::new(bin.bitness())),
     };
     for (&start_addr, &end_addr) in func.basic_blocks.iter() {
         // println!("{:x?}", (start_addr - base, end_addr - base, base));

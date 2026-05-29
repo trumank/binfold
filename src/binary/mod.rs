@@ -24,6 +24,7 @@ pub use crate::arch::{
 
 mod elf;
 mod pe;
+mod sweep;
 
 // PE-only types live in `pe.rs`; re-exported here so the public API path
 // (`crate::binary::...`) is unchanged for the PE-specific callers.
@@ -332,6 +333,15 @@ impl Binary {
         self.file.borrow_dependent().build_id().ok().flatten()
     }
 
+    /// The `[start, end)` VA ranges of every mapped section/segment. Handed to
+    /// the PE32 WARP masker so it can recognise immediates and displacements
+    /// that point into the image (relocated absolute addresses) and zero them.
+    pub fn section_ranges(&self) -> std::sync::Arc<[std::ops::Range<u64>]> {
+        self.segments_with_perms()
+            .map(|s| s.va..s.va + s.size)
+            .collect()
+    }
+
     /// Check if a virtual address is in a writable segment.
     pub fn is_address_writable(&self, va: u64) -> Result<bool> {
         Ok(self
@@ -346,26 +356,50 @@ impl Binary {
         // `.eh_frame` (which the platform unwinder also relies on, so it's
         // present in stripped shipping binaries too). Recursive expansion
         // below follows direct calls past whatever the seed set misses.
-        let runtime_functions = if self.is_pe() {
-            self.find_all_functions_from_exception_directory(on_warning)?
+        //
+        // PE32 is the exception: it has no exception directory, so the seed set
+        // would be empty. There we fall back to a linear sweep, which returns
+        // functions already analyzed; those prime the result directly and the
+        // expansion below seeds from their call targets.
+        let mut visited: HashSet<u64> = Default::default();
+        let mut result = vec![];
+        let mut current_batch: Vec<u64> = Vec::new();
+
+        let seed_starts: Vec<u64> = if self.is_pe() {
+            let exception_functions =
+                self.find_all_functions_from_exception_directory(on_warning)?;
+            if exception_functions.is_empty() && self.bitness() == 32 {
+                on_warning("PE32: no exception directory; discovering functions via linear sweep");
+                for func in self.find_functions_linear_sweep(on_warning)? {
+                    if visited.insert(func.entry_point) {
+                        for call in &func.calls {
+                            if visited.insert(call.target) {
+                                current_batch.push(call.target);
+                            }
+                        }
+                        result.push(func);
+                    }
+                }
+                Vec::new()
+            } else {
+                exception_functions.into_iter().map(|f| f.start).collect()
+            }
         } else {
             self.find_all_functions_from_eh_frame(on_warning)
                 .unwrap_or_else(|e| {
                     on_warning(&format!(".eh_frame discovery failed: {e}"));
                     Vec::new()
                 })
-        };
-
-        let mut visited: HashSet<u64> = Default::default();
-        let mut result = vec![];
-
-        let mut current_batch: Vec<u64> = {
-            runtime_functions
                 .into_iter()
                 .map(|f| f.start)
-                .filter(|addr| visited.insert(*addr))
                 .collect()
         };
+
+        for addr in seed_starts {
+            if visited.insert(addr) {
+                current_batch.push(addr);
+            }
+        }
 
         while !current_batch.is_empty() {
             let batch_output: Vec<_> = current_batch
@@ -454,6 +488,15 @@ impl MemoryView for Binary {
 
     fn is_known_function_start(&self, va: u64) -> bool {
         self.fde_bounds().contains_key(&va)
+    }
+
+    fn is_address_in_section(&self, va: u64) -> bool {
+        self.segments_with_perms()
+            .any(|s| va >= s.va && va < s.va + s.size)
+    }
+
+    fn is_pe(&self) -> bool {
+        self.is_pe()
     }
 }
 
