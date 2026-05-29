@@ -29,7 +29,7 @@ struct CommandGenDb {
     exe: Vec<PathBuf>,
 
     /// Output path for database
-    #[arg(short = 'd', long = "database", required = true)]
+    #[arg(short, long, required = true)]
     database: PathBuf,
 
     /// Cap on binaries loaded into memory simultaneously.
@@ -46,7 +46,7 @@ struct CommandAnalyze {
 
     /// Database path(s) for GUID lookups and symbol names. Repeat the flag to
     /// query multiple databases as one combined dataset.
-    #[arg(long)]
+    #[arg(short, long)]
     database: Vec<PathBuf>,
 
     /// Generate PDB file with matched function names
