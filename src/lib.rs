@@ -32,9 +32,7 @@ pub use uuid::Uuid;
 pub use progress::{NoOpProgressReporter, ProgressReporter, default_progress_style};
 
 use crate::binary::{AnalysisCache, Binary, LoadError};
-use crate::db::{
-    BinaryGuid, ConstraintGuid, Db, DbHash, FunctionGuid, Layer, StringRef, SymbolGuid,
-};
+use crate::db::{BinaryGuid, ConstraintGuid, Db, DbHash, FunctionGuid, Layer, SymbolGuid};
 use crate::warp::{Constraint, compute_function_guid_with_contraints};
 
 /// High-level analyzer for binary function analysis
@@ -205,7 +203,6 @@ impl BinfoldAnalyzer {
                 &analyzed_functions,
                 &function_guids,
                 &cache,
-                &self.db_mmaps,
                 progress_reporter,
             )?
         } else {
@@ -235,34 +232,17 @@ impl BinfoldAnalyzer {
         analyzed_functions: &[AnalyzedFunction],
         function_guids: &HashSet<FunctionGuid>,
         cache: &AnalysisCache,
-        mmaps: &[memmap2::Mmap],
         progress_reporter: &P,
     ) -> Result<HashMap<u64, MatchInfo>> {
-        let buffers: Vec<&[u8]> = mmaps.iter().map(|m| m.as_ref()).collect();
+        let buffers: Vec<&[u8]> = self.db_mmaps.iter().map(|m| m.as_ref()).collect();
         let db = Db::from_buffers(&buffers)?;
 
-        // Build cache of unique constraints with parallel processing
-        let load_progress = progress_reporter.sub_progress("Loading database constraints".into());
-        load_progress.initialize(function_guids.len() as u64);
-
-        let cache_unique_constraints: HashMap<
-            FunctionGuid,
-            HashMap<ConstraintGuid, HashSet<StringRef>>,
-        > = function_guids
-            .par_iter()
-            .map(|guid| {
-                let mut by_constraint: HashMap<ConstraintGuid, HashSet<StringRef>> = HashMap::new();
-                for c in db.iter_constraints(guid) {
-                    by_constraint
-                        .entry(*c.guid())
-                        .or_default()
-                        .extend(c.iter_symbols());
-                }
-                load_progress.progress();
-                (*guid, by_constraint)
-            })
-            .collect();
-        load_progress.finish();
+        // Load constraints for all analyzed function GUIDs in one batched
+        // pass that sweeps each database section in file order, instead of
+        // random accesses all over the mapping.
+        let mut sorted_guids: Vec<FunctionGuid> = function_guids.iter().copied().collect();
+        sorted_guids.sort_unstable();
+        let batch = db::batch_query_constraints(&db, &sorted_guids, progress_reporter)?;
 
         // Reverse call graph for symbol-parent constraints (the matching loop
         // keys parent edges by currently-matched names, so we only need the
@@ -319,7 +299,7 @@ impl BinfoldAnalyzer {
                 }
 
                 // Try to match with constraints
-                let db_constraints = cache_unique_constraints.get(&func.guid).unwrap();
+                let db_constraints = batch.get(&func.guid);
 
                 let query_constraints: HashSet<ConstraintGuid> =
                     constraints.iter().map(|c| c.guid).collect();
@@ -331,7 +311,7 @@ impl BinfoldAnalyzer {
                         if let Some(matches) = db_constraints.get(c)
                             && matches.len() == 1
                         {
-                            matches.iter().next().copied()
+                            Some(matches[0])
                         } else {
                             None
                         }
@@ -340,28 +320,27 @@ impl BinfoldAnalyzer {
                 // Count how many constraints matched
                 let matched_count = query_constraints
                     .iter()
-                    .filter(|c| db_constraints.contains_key(c))
+                    .filter(|c| db_constraints.contains(c))
                     .count();
 
                 if unique_name.is_none() {
-                    let mut sorted_constraints: Vec<_> = query_constraints
+                    let mut sorted_constraints: Vec<&[u32]> = query_constraints
                         .iter()
                         .filter_map(|guid| db_constraints.get(guid))
                         .collect();
                     sorted_constraints.sort_by_key(|c| c.len());
 
-                    fn find_unique<'a>(
-                        first: &HashSet<StringRef<'a>>,
-                        rest: &[&HashSet<StringRef<'a>>],
-                    ) -> Option<StringRef<'a>> {
+                    // Symbol-id sets are sorted, deduplicated slices, so
+                    // membership is a binary search.
+                    fn find_unique(first: &[u32], rest: &[&[u32]]) -> Option<u32> {
                         let mut possible = None;
-                        for item in first {
-                            if rest.iter().all(|r| r.contains(item)) {
+                        for &item in first {
+                            if rest.iter().all(|r| r.binary_search(&item).is_ok()) {
                                 if possible.is_some() {
                                     possible = None;
                                     break;
                                 } else {
-                                    possible = Some(*item);
+                                    possible = Some(item);
                                 }
                             }
                         }
@@ -382,9 +361,7 @@ impl BinfoldAnalyzer {
                 matched_functions.insert(
                     func.address,
                     MatchInfo {
-                        symbol_name: unique_name
-                            .map(|n| n.as_str().map(|s| s.to_string()))
-                            .transpose()?,
+                        symbol_name: unique_name.map(|id| batch.symbols.get(id).to_string()),
                         matched_constraints: matched_count,
                         total_constraints: constraints.len(),
                     },

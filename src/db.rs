@@ -1,4 +1,5 @@
 use crate::hash::{HashAlgo, XxHash64};
+use crate::progress::ProgressReporter;
 use anyhow::{Result, bail};
 use byteorder::{LE, WriteBytesExt};
 use std::collections::HashMap;
@@ -229,26 +230,19 @@ impl<'a> LayerView<'a> {
         &'l self,
         function_guid: &FunctionGuid,
     ) -> ConstraintIterator<'l, 'a> {
-        let functions_start = self.sections.functions_offset as usize;
-        let num_functions = self.view.u32_at(functions_start) as usize;
+        let num_functions = self.function_count();
 
         let mut left = 0;
         let mut right = num_functions;
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let function_offset = functions_start + 4 + (mid * FUNCTION_SIZE);
-
-            let current_guid =
-                FunctionGuid::from_digest(self.view.digest_at::<DbHash>(function_offset));
+            let (current_guid, constraint_index, num_constraints) = self.function_entry(mid);
 
             match current_guid.cmp(function_guid) {
                 std::cmp::Ordering::Less => left = mid + 1,
                 std::cmp::Ordering::Greater => right = mid,
                 std::cmp::Ordering::Equal => {
-                    let constraint_index = self.view.u32_at(function_offset + DIGEST_SIZE) as usize;
-                    let num_constraints =
-                        self.view.u32_at(function_offset + DIGEST_SIZE + 4) as usize;
                     return ConstraintIterator {
                         layer: self,
                         constraint_index,
@@ -265,6 +259,44 @@ impl<'a> LayerView<'a> {
             current: 0,
             total: 0,
         }
+    }
+
+    /// The `i`th record in the GUID-sorted functions section:
+    /// (guid, first constraint-group index, constraint-group count).
+    fn function_entry(&self, i: usize) -> (FunctionGuid, usize, usize) {
+        let off = self.sections.functions_offset as usize + 4 + i * FUNCTION_SIZE;
+        (
+            FunctionGuid::from_digest(self.view.digest_at::<DbHash>(off)),
+            self.view.u32_at(off + DIGEST_SIZE) as usize,
+            self.view.u32_at(off + DIGEST_SIZE + 4) as usize,
+        )
+    }
+
+    /// The `i`th constraint-group record: (constraint index, string count,
+    /// first symbol-reference index).
+    fn constraint_group_entry(&self, i: usize) -> (usize, usize, usize) {
+        let off =
+            self.sections.function_constraints_offset as usize + 4 + i * FUNCTION_CONSTRAINTS_SIZE;
+        (
+            self.view.u32_at(off) as usize,
+            self.view.u32_at(off + 4) as usize,
+            self.view.u32_at(off + 8) as usize,
+        )
+    }
+
+    fn constraint_guid_at(&self, i: usize) -> ConstraintGuid {
+        ConstraintGuid::from_digest(
+            self.view.digest_at::<DbHash>(
+                self.sections.constraints_offset as usize + 4 + i * DIGEST_SIZE,
+            ),
+        )
+    }
+
+    /// The `i`th symbol reference: a byte offset into the strings section.
+    fn symbol_string_offset(&self, i: usize) -> u32 {
+        self.view.u32_at(
+            self.sections.constraint_strings_offset as usize + 4 + i * CONSTRAINT_STRINGS_SIZE,
+        )
     }
 
     fn string_ref_at_offset(&self, offset: u32) -> StringRef<'a> {
@@ -605,6 +637,269 @@ pub fn append_layer<F: Read + Write + Seek>(file: &mut F, layer: &Layer<'_>) -> 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Batched constraint loader
+// ---------------------------------------------------------------------------
+//
+// `Db`'s point queries are fine for a handful of lookups but pathological in
+// bulk: matching an executable queries hundreds of thousands of GUIDs, each
+// binary-searching the functions section and then chasing references all over
+// a multi-GB mapped file — random page faults with no readahead. The loader
+// below instead sorts the queries and walks each section of the mmap in
+// ascending offset order (a merge-join over the functions section, then
+// index-sorted sweeps of the constraints and strings sections), so faults are
+// sequential. Symbol strings are interned so equal names share one u32 id
+// across layers and files, and results are packed into flat arrays instead of
+// millions of small maps.
+
+/// Interned symbol strings. Ids are dense u32s; equal strings always map to
+/// the same id, so sets of ids can be compared without touching the text.
+#[derive(Default)]
+pub struct SymbolTable {
+    strings: Vec<String>,
+    by_hash: HashMap<u64, Vec<u32>>,
+}
+
+impl SymbolTable {
+    pub fn get(&self, id: u32) -> &str {
+        &self.strings[id as usize]
+    }
+
+    fn intern(&mut self, s: &str) -> u32 {
+        let hash = twox_hash::XxHash64::oneshot(0, s.as_bytes());
+        if let Some(ids) = self.by_hash.get(&hash) {
+            for &id in ids {
+                if self.strings[id as usize] == s {
+                    return id;
+                }
+            }
+        }
+        let id: u32 = self.strings.len().try_into().unwrap();
+        self.strings.push(s.to_string());
+        self.by_hash.entry(hash).or_default().push(id);
+        id
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ConstraintEntry {
+    guid: ConstraintGuid,
+    sym_start: u32,
+    sym_len: u32,
+}
+
+/// Result of a batched constraint query. All constraint entries and symbol-id
+/// sets live in two flat arrays; the per-function map stores a range into
+/// `entries`, which in turn store ranges into `symbol_ids`.
+pub struct BatchConstraints {
+    pub symbols: SymbolTable,
+    functions: HashMap<FunctionGuid, (u32, u32)>,
+    entries: Vec<ConstraintEntry>,
+    symbol_ids: Vec<u32>,
+}
+
+impl BatchConstraints {
+    /// Constraints for a function; GUIDs with no data yield an empty view.
+    pub fn get(&self, function: &FunctionGuid) -> FunctionConstraints<'_> {
+        let entries = match self.functions.get(function) {
+            Some(&(start, len)) => &self.entries[start as usize..][..len as usize],
+            None => &[],
+        };
+        FunctionConstraints {
+            entries,
+            symbol_ids: &self.symbol_ids,
+        }
+    }
+}
+
+/// View of one function's constraints. Constraint guids are sorted; each maps
+/// to a sorted, deduplicated slice of symbol ids.
+#[derive(Clone, Copy)]
+pub struct FunctionConstraints<'a> {
+    entries: &'a [ConstraintEntry],
+    symbol_ids: &'a [u32],
+}
+
+impl<'a> FunctionConstraints<'a> {
+    /// Symbol ids recorded for this constraint, or None if the constraint is
+    /// not present for this function.
+    pub fn get(&self, constraint: &ConstraintGuid) -> Option<&'a [u32]> {
+        let i = self
+            .entries
+            .binary_search_by(|e| e.guid.cmp(constraint))
+            .ok()?;
+        let e = &self.entries[i];
+        Some(&self.symbol_ids[e.sym_start as usize..][..e.sym_len as usize])
+    }
+
+    pub fn contains(&self, constraint: &ConstraintGuid) -> bool {
+        self.entries
+            .binary_search_by(|e| e.guid.cmp(constraint))
+            .is_ok()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (ConstraintGuid, &'a [u32])> + '_ {
+        self.entries.iter().map(|e| {
+            (
+                e.guid,
+                &self.symbol_ids[e.sym_start as usize..][..e.sym_len as usize],
+            )
+        })
+    }
+}
+
+/// Loads all constraints and symbol names for `sorted_guids` (which must be
+/// sorted and deduplicated), merging results from all layers.
+pub fn batch_query_constraints<P: ProgressReporter>(
+    db: &Db<'_>,
+    sorted_guids: &[FunctionGuid],
+    progress: &P,
+) -> Result<BatchConstraints> {
+    use rayon::prelude::*;
+
+    debug_assert!(sorted_guids.is_sorted());
+
+    let mut symbols = SymbolTable::default();
+    let mut triples: Vec<(FunctionGuid, ConstraintGuid, u32)> = Vec::new();
+    for layer in db.layers() {
+        load_layer(layer, sorted_guids, &mut symbols, &mut triples, progress)?;
+    }
+
+    // Merge layers/files: one global sort + dedup, then flatten into
+    // contiguous arrays grouped by (function, constraint).
+    triples.par_sort_unstable();
+    triples.dedup();
+
+    // The intern index is only needed while loading.
+    symbols.by_hash = HashMap::new();
+
+    let mut functions: HashMap<FunctionGuid, (u32, u32)> = HashMap::new();
+    let mut entries: Vec<ConstraintEntry> = Vec::new();
+    let mut symbol_ids: Vec<u32> = Vec::with_capacity(triples.len());
+    let mut i = 0;
+    while i < triples.len() {
+        let func = triples[i].0;
+        let func_entry_start = entries.len();
+        while i < triples.len() && triples[i].0 == func {
+            let constraint = triples[i].1;
+            let sym_start = symbol_ids.len();
+            while i < triples.len() && triples[i].0 == func && triples[i].1 == constraint {
+                symbol_ids.push(triples[i].2);
+                i += 1;
+            }
+            entries.push(ConstraintEntry {
+                guid: constraint,
+                sym_start: sym_start.try_into()?,
+                sym_len: (symbol_ids.len() - sym_start).try_into()?,
+            });
+        }
+        functions.insert(
+            func,
+            (
+                func_entry_start.try_into()?,
+                (entries.len() - func_entry_start).try_into()?,
+            ),
+        );
+    }
+
+    Ok(BatchConstraints {
+        symbols,
+        functions,
+        entries,
+        symbol_ids,
+    })
+}
+
+fn load_layer<P: ProgressReporter>(
+    layer: &LayerView<'_>,
+    sorted_guids: &[FunctionGuid],
+    symbols: &mut SymbolTable,
+    triples: &mut Vec<(FunctionGuid, ConstraintGuid, u32)>,
+    progress: &P,
+) -> Result<()> {
+    // Pass 1: merge-join the sorted queries against the GUID-sorted functions
+    // section, collecting each hit's constraint-group records and symbol
+    // references. Groups and references are stored in function order, so all
+    // three sections are swept forward in lockstep.
+    // Entries are (guid, constraint index, string count); `string_offsets`
+    // holds each entry's references contiguously in the same order.
+    let mut entries: Vec<(FunctionGuid, u32, u32)> = Vec::new();
+    let mut string_offsets: Vec<u32> = Vec::new();
+    {
+        let count = layer.function_count();
+        let bar = progress.sub_progress("Scanning functions".into());
+        bar.initialize(count as u64);
+        let mut qi = 0;
+        for i in 0..count {
+            bar.progress();
+            if qi >= sorted_guids.len() {
+                break;
+            }
+            let (guid, group_start, group_count) = layer.function_entry(i);
+            while qi < sorted_guids.len() && sorted_guids[qi] < guid {
+                qi += 1;
+            }
+            if qi < sorted_guids.len() && sorted_guids[qi] == guid {
+                for g in group_start..group_start + group_count {
+                    let (c_idx, n, s_idx) = layer.constraint_group_entry(g);
+                    entries.push((guid, c_idx.try_into()?, n.try_into()?));
+                    string_offsets
+                        .extend((s_idx..s_idx + n).map(|s| layer.symbol_string_offset(s)));
+                }
+            }
+        }
+        bar.finish();
+    }
+
+    // Pass 2: GUIDs of the referenced constraints, in index order.
+    let mut c_idxs: Vec<u32> = entries.iter().map(|e| e.1).collect();
+    c_idxs.sort_unstable();
+    c_idxs.dedup();
+    let c_guids: Vec<ConstraintGuid> = {
+        let bar = progress.sub_progress("Reading constraint GUIDs".into());
+        bar.initialize(c_idxs.len() as u64);
+        c_idxs
+            .iter()
+            .map(|&i| {
+                bar.progress();
+                layer.constraint_guid_at(i as usize)
+            })
+            .collect()
+    };
+
+    // Pass 3: intern the referenced strings, in offset order.
+    let mut u_offs: Vec<u32> = string_offsets.clone();
+    u_offs.sort_unstable();
+    u_offs.dedup();
+    let ids: Vec<u32> = {
+        let bar = progress.sub_progress("Reading symbol strings".into());
+        bar.initialize(u_offs.len() as u64);
+        u_offs
+            .iter()
+            .map(|&off| {
+                bar.progress();
+                Ok(symbols.intern(layer.string_ref_at_offset(off).as_str()?))
+            })
+            .collect::<Result<_>>()?
+    };
+
+    // Emit (function, constraint, symbol) triples; the caller merges across
+    // layers. Every group has at least one string (the writer derives groups
+    // from per-symbol triples), so no constraint is lost here.
+    triples.reserve(string_offsets.len());
+    let mut v = 0;
+    for &(guid, c_idx, n) in &entries {
+        let cguid = c_guids[c_idxs.binary_search(&c_idx).unwrap()];
+        for _ in 0..n {
+            let id = ids[u_offs.binary_search(&string_offsets[v]).unwrap()];
+            triples.push((guid, cguid, id));
+            v += 1;
+        }
+    }
+
+    Ok(())
+}
+
 pub struct ConstraintIterator<'l, 'a> {
     layer: &'l LayerView<'a>,
     constraint_index: usize,
@@ -650,21 +945,14 @@ impl<'l, 'a> Iterator for ConstraintIterator<'l, 'a> {
             return None;
         }
 
-        let constraints_start = self.layer.sections.function_constraints_offset as usize + 4;
-        let offset = constraints_start
-            + ((self.constraint_index + self.current) * FUNCTION_CONSTRAINTS_SIZE);
-
-        let constraint_index = self.layer.view.u32_at(offset) as usize;
-        let constraint_guid = ConstraintGuid::from_digest(self.layer.view.digest_at::<DbHash>(
-            self.layer.sections.constraints_offset as usize + 4 + constraint_index * DIGEST_SIZE,
-        ));
-        let string_count = self.layer.view.u32_at(offset + 4) as usize;
-        let string_index = self.layer.view.u32_at(offset + 8) as usize;
+        let (constraint_index, string_count, string_index) = self
+            .layer
+            .constraint_group_entry(self.constraint_index + self.current);
 
         self.current += 1;
 
         Some(ConstraintInfo {
-            guid: constraint_guid,
+            guid: self.layer.constraint_guid_at(constraint_index),
             symbol_count: string_count,
             string_index,
             layer: self.layer,
@@ -692,10 +980,9 @@ impl<'l, 'a> Iterator for SymbolIterator<'l, 'a> {
             return None;
         }
 
-        let constraint_strings_start = self.layer.sections.constraint_strings_offset as usize + 4;
-        let offset =
-            constraint_strings_start + (self.string_index + self.current) * CONSTRAINT_STRINGS_SIZE;
-        let string_offset = self.layer.view.u32_at(offset);
+        let string_offset = self
+            .layer
+            .symbol_string_offset(self.string_index + self.current);
 
         self.current += 1;
         Some(self.layer.string_ref_at_offset(string_offset))
@@ -884,6 +1171,98 @@ mod tests {
                     .collect()
             };
         assert_eq!(to_set(&appended), to_set(&combined));
+    }
+
+    /// Run the batch loader over a database buffer for `guids` and return
+    /// per-function constraint→symbol-name-set maps.
+    fn batch_query_from_bytes(
+        bytes: &[u8],
+        guids: &[FunctionGuid],
+    ) -> HashMap<FunctionGuid, HashMap<ConstraintGuid, HashSet<String>>> {
+        let db = Db::new(bytes).unwrap();
+        let mut sorted = guids.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let batch =
+            batch_query_constraints(&db, &sorted, &crate::progress::NoOpProgressReporter).unwrap();
+
+        sorted
+            .iter()
+            .map(|g| {
+                (
+                    *g,
+                    batch
+                        .get(g)
+                        .iter()
+                        .map(|(c, ids)| {
+                            (
+                                c,
+                                ids.iter()
+                                    .map(|&id| batch.symbols.get(id).to_string())
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_batch_query_matches_mmap_query() {
+        let func_guid = FunctionGuid::from_digest(0x4141_4141_4141_4141);
+        let missing = FunctionGuid::from_digest(0x9999_9999_9999_9999);
+        let buffer = sample_db();
+
+        let batch = batch_query_from_bytes(&buffer, &[func_guid, missing]);
+
+        // Every queried guid gets an entry; misses are empty.
+        assert_eq!(batch.len(), 2);
+        assert!(batch[&missing].is_empty());
+
+        // Same content as the buffer-based query path.
+        let db = Db::new(&buffer).unwrap();
+        let expected = db.query_constraints_for_function(&func_guid).unwrap();
+        assert_eq!(batch[&func_guid].len(), expected.len());
+        for (cguid, names) in &expected {
+            let batch_names = &batch[&func_guid][cguid];
+            assert_eq!(
+                batch_names,
+                &names.iter().map(|s| s.to_string()).collect::<HashSet<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_query_multi_layer_merge() {
+        // Reuse the append scenario: two layers contributing to the same
+        // function must merge, deduplicating symbols by content.
+        let g1 = FunctionGuid::from_digest(0x1111_1111_1111_1111);
+        let c1 = ConstraintGuid::from_digest(0x2222_2222_2222_2222);
+        let c2 = ConstraintGuid::from_digest(0x3333_3333_3333_3333);
+
+        let buffer_a = {
+            let strings = vec!["a".to_string()];
+            build_layer_buffer(&strings, &[c1], &[g1], &[(0, 0, 0)])
+        };
+        let mut file = std::io::Cursor::new(buffer_a);
+        let strings_b = vec!["a".to_string(), "b".to_string()];
+        let layer_b = Layer {
+            strings: &strings_b,
+            constraint_guids: &[c1, c2],
+            function_guids: &[g1],
+            triples: &[(0, 0, 0), (0, 0, 1), (0, 1, 1)],
+            binaries: &[],
+        };
+        append_layer(&mut file, &layer_b).unwrap();
+        let bytes = file.into_inner();
+
+        let batch = batch_query_from_bytes(&bytes, &[g1]);
+        let m = &batch[&g1];
+        assert_eq!(m.len(), 2);
+        // c1 has "a" from both layers (deduped) plus "b" from layer B.
+        assert_eq!(m[&c1], HashSet::from(["a".to_string(), "b".to_string()]));
+        assert_eq!(m[&c2], HashSet::from(["b".to_string()]));
     }
 
     #[test]
